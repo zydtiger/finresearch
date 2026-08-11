@@ -147,6 +147,30 @@ def test_parse_manifest_rejects_unknown_artifact_field(tmp_path: Path) -> None:
         parse_manifest(data, tmp_path / "case-v1")
 
 
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("retrieved_at", "2026-08-11T04:05:00+00:00", "RFC 3339 UTC"),
+        ("retrieved_at", "not-a-timeZ", "RFC 3339 UTC"),
+        ("row_count", -1, "must not be negative"),
+        ("row_count", True, "must be an integer"),
+    ],
+)
+def test_parse_manifest_rejects_invalid_artifact_provenance(
+    tmp_path: Path,
+    field: str,
+    value: object,
+    message: str,
+) -> None:
+    artifact = valid_artifact_data("market.prices", "data/raw/prices.parquet")
+    artifact[field] = value
+    data = valid_manifest_data()
+    data["artifacts"] = [artifact]
+
+    with pytest.raises(CaseContractError, match=message):
+        parse_manifest(data, tmp_path / "case-v1")
+
+
 def test_inspect_case_reports_missing_required_directory(tmp_path: Path) -> None:
     case_dir = initialize_case(tmp_path, "aapl")
     shutil.rmtree(case_dir / DEFAULT_PATHS["derived"])

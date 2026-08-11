@@ -82,12 +82,16 @@ schema_version = 1
 path = "data/normalized/prices.parquet"
 source = "provider-name"
 sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+retrieved_at = "2026-08-11T03:12:45.123456Z"
+row_count = 252
 ```
 
 Each artifact records its own positive `schema_version`; table contracts evolve
 independently. Artifact IDs and paths are unique within a case. Artifact paths
 must stay below a directory declared in `[paths]`. When present, `sha256` uses
-64 lowercase hexadecimal digits.
+64 lowercase hexadecimal digits. Network ingestions also record an RFC 3339 UTC
+`retrieved_at` timestamp and a non-negative `row_count`. These provenance fields
+remain optional for artifacts that are not row-oriented provider snapshots.
 
 ## Command behavior
 

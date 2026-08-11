@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import re
 import shutil
+import tempfile
 import tomllib
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from pathlib import Path, PurePosixPath
 from typing import Final
 
@@ -44,6 +46,8 @@ class Artifact:
     path: str
     source: str | None = None
     sha256: str | None = None
+    retrieved_at: str | None = None
+    row_count: int | None = None
 
 
 @dataclass(frozen=True)
@@ -147,7 +151,7 @@ def new_manifest(case_id: str, title: str) -> CaseManifest:
 
 
 def write_manifest(case_dir: Path, manifest: CaseManifest) -> None:
-    """Write a manifest in deterministic field order."""
+    """Atomically write a manifest in deterministic field order."""
     payload: dict[str, object] = {
         "manifest_version": manifest.manifest_version,
         "case_id": manifest.case_id,
@@ -157,7 +161,22 @@ def write_manifest(case_dir: Path, manifest: CaseManifest) -> None:
         "paths": dict(manifest.paths),
     }
     manifest_path = resolve_relative_path(case_dir, MANIFEST_FILENAME, "manifest")
-    manifest_path.write_text(tomli_w.dumps(payload), encoding="utf-8")
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        dir=case_dir,
+        prefix=".manifest.",
+        suffix=".tmp",
+        delete=False,
+    ) as file_handle:
+        temporary_path = Path(file_handle.name)
+        try:
+            file_handle.write(tomli_w.dumps(payload))
+            file_handle.flush()
+            temporary_path.replace(manifest_path)
+        except Exception:
+            temporary_path.unlink(missing_ok=True)
+            raise
 
 
 def artifact_to_dict(artifact: Artifact) -> dict[str, object]:
@@ -172,7 +191,29 @@ def artifact_to_dict(artifact: Artifact) -> dict[str, object]:
         data["source"] = artifact.source
     if artifact.sha256 is not None:
         data["sha256"] = artifact.sha256
+    if artifact.retrieved_at is not None:
+        data["retrieved_at"] = artifact.retrieved_at
+    if artifact.row_count is not None:
+        data["row_count"] = artifact.row_count
     return data
+
+
+def append_artifact(case_dir: Path, artifact: Artifact) -> CaseManifest:
+    """Validate and append one artifact without replacing existing entries."""
+    manifest = read_manifest(case_dir)
+    payload: dict[str, object] = {
+        "manifest_version": manifest.manifest_version,
+        "case_id": manifest.case_id,
+        "title": manifest.title,
+        "status": manifest.status,
+        "artifacts": [
+            artifact_to_dict(item) for item in (*manifest.artifacts, artifact)
+        ],
+        "paths": dict(manifest.paths),
+    }
+    updated = parse_manifest(payload, case_dir)
+    write_manifest(case_dir, updated)
+    return updated
 
 
 def read_manifest(case_dir: Path) -> CaseManifest:
@@ -296,7 +337,7 @@ def parse_artifacts(
         validate_table_keys(
             item,
             required={"id", "kind", "schema_version", "path"},
-            optional={"source", "sha256"},
+            optional={"source", "sha256", "retrieved_at", "row_count"},
             field=field,
         )
         artifact_id = require_named_string(item, "id", field)
@@ -327,6 +368,14 @@ def parse_artifacts(
         if sha256 is not None and SHA256_PATTERN.fullmatch(sha256) is None:
             raise CaseContractError(f"{field}.sha256 must be 64 lowercase hex digits")
 
+        retrieved_at = optional_named_string(item, "retrieved_at", field)
+        if retrieved_at is not None:
+            validate_utc_timestamp(retrieved_at, f"{field}.retrieved_at")
+
+        row_count = optional_named_integer(item, "row_count", field)
+        if row_count is not None and row_count < 0:
+            raise CaseContractError(f"{field}.row_count must not be negative")
+
         artifacts.append(
             Artifact(
                 artifact_id=artifact_id,
@@ -335,6 +384,8 @@ def parse_artifacts(
                 path=path,
                 source=source,
                 sha256=sha256,
+                retrieved_at=retrieved_at,
+                row_count=row_count,
             )
         )
         artifact_ids.add(artifact_id)
@@ -486,6 +537,30 @@ def optional_named_string(
     if not isinstance(value, str) or not value:
         raise CaseContractError(f"{field}.{key} must be a non-empty string")
     return value
+
+
+def optional_named_integer(
+    data: Mapping[str, object], key: str, field: str
+) -> int | None:
+    """Read an optional integer while rejecting booleans."""
+    value = data.get(key)
+    if value is None:
+        return None
+    if type(value) is not int:
+        raise CaseContractError(f"{field}.{key} must be an integer")
+    return value
+
+
+def validate_utc_timestamp(value: str, field: str) -> None:
+    """Require a parseable RFC 3339 timestamp explicitly expressed in UTC."""
+    if not value.endswith("Z"):
+        raise CaseContractError(f"{field} must be an RFC 3339 UTC timestamp")
+    try:
+        parsed = datetime.fromisoformat(value.removesuffix("Z") + "+00:00")
+    except ValueError as exc:
+        raise CaseContractError(f"{field} must be an RFC 3339 UTC timestamp") from exc
+    if parsed.utcoffset() != timedelta(0):
+        raise CaseContractError(f"{field} must be an RFC 3339 UTC timestamp")
 
 
 def require_named_integer(data: Mapping[str, object], key: str, field: str) -> int:

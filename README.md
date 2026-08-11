@@ -42,6 +42,20 @@ The case directory and `manifest.toml` contract are documented in
 [`docs/case-contract.md`](docs/case-contract.md). The same CLI is available
 through `uv run python -m finresearch`.
 
+Append an immutable raw daily-price snapshot from yfinance:
+
+```bash
+uv run finresearch \
+  --workspace /path/to/research-artifacts \
+  data ingest-yfinance-prices aapl-2026-08-11 AAPL \
+  --start 2025-01-01 \
+  --end 2026-01-01
+```
+
+Raw provider snapshots use versioned Polars schemas and Zstandard-compressed
+Parquet. See [`docs/data-ingestion.md`](docs/data-ingestion.md) for the raw-data
+contract and provider boundaries.
+
 ## Development
 
 ```bash

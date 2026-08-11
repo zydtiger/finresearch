@@ -1,8 +1,11 @@
+from datetime import UTC, date, datetime
 from pathlib import Path
 
+import pytest
 from typer.testing import CliRunner, Result
 
 from finresearch.cli import app
+from finresearch.ingestion import IngestionReceipt
 
 runner = CliRunner()
 
@@ -76,3 +79,62 @@ def test_case_status_rejects_file_as_workspace(tmp_path: Path) -> None:
 
     assert result.exit_code == 2
     assert "Directory" in result.output
+
+
+def test_yfinance_ingestion_command_reports_receipt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_ingestion(
+        workspace: Path,
+        case_id: str,
+        symbol: str,
+        start: date,
+        end: date,
+    ) -> IngestionReceipt:
+        assert workspace == tmp_path
+        assert (case_id, symbol) == ("aapl", "AAPL")
+        assert (start, end) == (date(2026, 1, 2), date(2026, 1, 3))
+        return IngestionReceipt(
+            artifact_id="raw.yfinance.daily-prices.aapl.snapshot",
+            path=tmp_path / "snapshot.parquet",
+            row_count=1,
+            sha256="a" * 64,
+            retrieved_at=datetime(2026, 8, 11, tzinfo=UTC),
+        )
+
+    monkeypatch.setattr("finresearch.cli.ingest_yfinance_daily_prices", fake_ingestion)
+
+    result = invoke(
+        tmp_path,
+        "data",
+        "ingest-yfinance-prices",
+        "aapl",
+        "AAPL",
+        "--start",
+        "2026-01-02",
+        "--end",
+        "2026-01-03",
+    )
+
+    assert result.exit_code == 0
+    assert "artifact: raw.yfinance.daily-prices.aapl.snapshot" in result.output
+    assert "rows: 1" in result.output
+    assert f"sha256: {'a' * 64}" in result.output
+
+
+def test_yfinance_ingestion_command_rejects_invalid_date(tmp_path: Path) -> None:
+    result = invoke(
+        tmp_path,
+        "data",
+        "ingest-yfinance-prices",
+        "aapl",
+        "AAPL",
+        "--start",
+        "01/02/2026",
+        "--end",
+        "2026-01-03",
+    )
+
+    assert result.exit_code == 1
+    assert "start must use YYYY-MM-DD format" in result.output

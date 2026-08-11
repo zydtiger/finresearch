@@ -18,6 +18,8 @@
 - `tests/`: automated tests matching package behavior.
 - `docs/case-contract.md`: normative versioned case and artifact contract;
   read it before changing manifest fields, paths, or case command semantics.
+- `docs/data-ingestion.md`: raw snapshot semantics, dataset contracts, and
+  provider ownership boundaries.
 - `README.md`: user-facing setup and command usage.
 - `pyproject.toml` and `uv.lock`: Python metadata and resolved dependencies;
   update them together through `uv`.
