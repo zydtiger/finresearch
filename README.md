@@ -17,17 +17,30 @@ uv sync --group dev
 
 ## Usage
 
-The initial `root` command validates and prints the explicit workspace path:
+Initialize a case with a stable ID:
 
 ```bash
-uv run finresearch --workspace /path/to/research-artifacts root
+uv run finresearch \
+  --workspace /path/to/research-artifacts \
+  case init aapl-2026-08-11 \
+  --title "Apple valuation update"
 ```
 
-Run the package directly with the same interface:
+Inspect or validate it:
 
 ```bash
-uv run python -m finresearch --workspace /path/to/research-artifacts root
+uv run finresearch \
+  --workspace /path/to/research-artifacts \
+  case status aapl-2026-08-11
+
+uv run finresearch \
+  --workspace /path/to/research-artifacts \
+  case validate aapl-2026-08-11
 ```
+
+The case directory and `manifest.toml` contract are documented in
+[`docs/case-contract.md`](docs/case-contract.md). The same CLI is available
+through `uv run python -m finresearch`.
 
 ## Development
 

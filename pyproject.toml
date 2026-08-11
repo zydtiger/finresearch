@@ -5,6 +5,7 @@ description = "Programmatic investment-research workflows"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "tomli-w>=1.2.0",
     "typer>=0.27.1",
 ]
 

@@ -1,0 +1,13 @@
+manifest_version = 1
+case_id = "case-v1"
+title = "Case contract fixture"
+status = "active"
+artifacts = []
+
+[paths]
+registers = "registers"
+raw = "data/raw"
+normalized = "data/normalized"
+derived = "data/derived"
+analysis = "analysis"
+reports = "reports"
