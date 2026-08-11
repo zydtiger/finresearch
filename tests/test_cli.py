@@ -6,6 +6,7 @@ from typer.testing import CliRunner, Result
 
 from finresearch.cli import app
 from finresearch.ingestion import IngestionReceipt
+from finresearch.providers.sec import SECProviderError
 
 runner = CliRunner()
 
@@ -138,3 +139,84 @@ def test_yfinance_ingestion_command_rejects_invalid_date(tmp_path: Path) -> None
 
     assert result.exit_code == 1
     assert "start must use YYYY-MM-DD format" in result.output
+
+
+@pytest.mark.parametrize(
+    ("command", "target"),
+    [
+        ("ingest-sec-submissions", "finresearch.cli.ingest_sec_submissions"),
+        ("ingest-sec-companyfacts", "finresearch.cli.ingest_sec_companyfacts"),
+    ],
+)
+def test_sec_ingestion_commands_report_receipt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    command: str,
+    target: str,
+) -> None:
+    def fake_ingestion(
+        workspace: Path,
+        case_id: str,
+        cik: str,
+        user_agent: str,
+    ) -> IngestionReceipt:
+        assert workspace == tmp_path
+        assert (case_id, cik) == ("aapl", "320193")
+        assert user_agent == "Finresearch user@example.com"
+        return IngestionReceipt(
+            artifact_id=f"raw.sec.{command}.snapshot",
+            path=tmp_path / "sec.parquet",
+            row_count=2,
+            sha256="b" * 64,
+            retrieved_at=datetime(2026, 8, 11, tzinfo=UTC),
+        )
+
+    monkeypatch.setattr(target, fake_ingestion)
+
+    result = invoke(
+        tmp_path,
+        "data",
+        command,
+        "aapl",
+        "320193",
+        "--user-agent",
+        "Finresearch user@example.com",
+    )
+
+    assert result.exit_code == 0
+    assert f"artifact: raw.sec.{command}.snapshot" in result.output
+    assert "rows: 2" in result.output
+
+
+def test_sec_schema_failure_is_printed_as_concise_cli_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_ingestion(
+        workspace: Path,
+        case_id: str,
+        cik: str,
+        user_agent: str,
+    ) -> IngestionReceipt:
+        raise SECProviderError("SEC data does not satisfy raw.sec.companyfacts.v1")
+
+    monkeypatch.setattr(
+        "finresearch.cli.ingest_sec_companyfacts",
+        fail_ingestion,
+    )
+
+    result = invoke(
+        tmp_path,
+        "data",
+        "ingest-sec-companyfacts",
+        "aapl",
+        "320193",
+        "--user-agent",
+        "Finresearch user@example.com",
+    )
+
+    assert result.exit_code == 1
+    assert (
+        result.output.strip()
+        == "error: SEC data does not satisfy raw.sec.companyfacts.v1"
+    )

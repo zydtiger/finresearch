@@ -1,0 +1,46 @@
+{
+  "cik": 320193,
+  "entityName": "Apple Inc.",
+  "facts": {
+    "us-gaap": {
+      "Revenues": {
+        "label": "Revenue",
+        "description": "Revenue from goods and services.",
+        "units": {
+          "USD": [
+            {
+              "start": "2025-09-28",
+              "end": "2026-06-27",
+              "val": 300000000000,
+              "accn": "0000320193-26-000001",
+              "fy": 2026,
+              "fp": "Q3",
+              "form": "10-Q",
+              "filed": "2026-08-01",
+              "frame": "CY2026Q2YTD"
+            }
+          ]
+        }
+      }
+    },
+    "dei": {
+      "EntityPublicFloat": {
+        "label": "Entity Public Float",
+        "description": "Aggregate market value held by non-affiliates.",
+        "units": {
+          "USD": [
+            {
+              "end": "2025-03-28",
+              "val": 2500000000000.5,
+              "accn": "0000320193-25-000003",
+              "fy": 2025,
+              "fp": "FY",
+              "form": "10-K",
+              "filed": "2025-10-31"
+            }
+          ]
+        }
+      }
+    }
+  }
+}

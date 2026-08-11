@@ -50,7 +50,11 @@ class DatasetContract:
                 f"{self.identifier} has nulls in required fields: {fields}"
             )
 
-        duplicates = frame.select(self.unique_key).is_duplicated().sum()
+        duplicates = (
+            frame.select(self.unique_key).is_duplicated().sum()
+            if self.unique_key
+            else 0
+        )
         if duplicates:
             fields = ", ".join(self.unique_key)
             raise DataContractError(
@@ -99,8 +103,106 @@ RAW_YFINANCE_DAILY_PRICES_V1: Final = DatasetContract(
     unique_key=("provider_symbol", "interval", "timestamp"),
 )
 
+RAW_SEC_SUBMISSIONS_FIELDS: Final[dict[str, pl.DataType | type[pl.DataType]]] = {
+    "schema_version": pl.UInt16,
+    "provider": pl.String,
+    "cik": pl.String,
+    "retrieved_at": pl.Datetime("us", "UTC"),
+    "source_url": pl.String,
+    "entity_name": pl.String,
+    "tickers": pl.List(pl.String),
+    "exchanges": pl.List(pl.String),
+    "sic": pl.String,
+    "sic_description": pl.String,
+    "accession_number": pl.String,
+    "filing_date": pl.Date,
+    "report_date": pl.Date,
+    "acceptance_datetime": pl.String,
+    "act": pl.String,
+    "form": pl.String,
+    "file_number": pl.String,
+    "film_number": pl.String,
+    "items": pl.String,
+    "size": pl.Int64,
+    "is_xbrl": pl.Boolean,
+    "is_inline_xbrl": pl.Boolean,
+    "primary_document": pl.String,
+    "primary_doc_description": pl.String,
+}
+
+RAW_SEC_SUBMISSIONS_V1: Final = DatasetContract(
+    name="raw.sec.submissions",
+    version=1,
+    schema=pl.Schema(RAW_SEC_SUBMISSIONS_FIELDS),
+    non_nullable=(
+        "schema_version",
+        "provider",
+        "cik",
+        "retrieved_at",
+        "source_url",
+        "entity_name",
+        "tickers",
+        "exchanges",
+        "accession_number",
+        "filing_date",
+        "form",
+    ),
+    unique_key=("cik", "accession_number"),
+)
+
+RAW_SEC_COMPANYFACTS_FIELDS: Final[dict[str, pl.DataType | type[pl.DataType]]] = {
+    "schema_version": pl.UInt16,
+    "provider": pl.String,
+    "cik": pl.String,
+    "retrieved_at": pl.Datetime("us", "UTC"),
+    "source_url": pl.String,
+    "entity_name": pl.String,
+    "taxonomy": pl.String,
+    "concept": pl.String,
+    "label": pl.String,
+    "description": pl.String,
+    "unit": pl.String,
+    "value_type": pl.String,
+    "value_text": pl.String,
+    "start_date": pl.Date,
+    "end_date": pl.Date,
+    "accession_number": pl.String,
+    "fiscal_year": pl.Int32,
+    "fiscal_period": pl.String,
+    "form": pl.String,
+    "filed_date": pl.Date,
+    "frame": pl.String,
+}
+
+RAW_SEC_COMPANYFACTS_V1: Final = DatasetContract(
+    name="raw.sec.companyfacts",
+    version=1,
+    schema=pl.Schema(RAW_SEC_COMPANYFACTS_FIELDS),
+    non_nullable=(
+        "schema_version",
+        "provider",
+        "cik",
+        "retrieved_at",
+        "source_url",
+        "entity_name",
+        "taxonomy",
+        "concept",
+        "unit",
+        "value_type",
+        "value_text",
+        "end_date",
+        "accession_number",
+        "form",
+        "filed_date",
+    ),
+    # SEC can publish duplicate-looking facts; raw ingestion must preserve them.
+    unique_key=(),
+)
+
 CONTRACTS: Final = {
     RAW_YFINANCE_DAILY_PRICES_V1.identifier: RAW_YFINANCE_DAILY_PRICES_V1,
+    RAW_SEC_SUBMISSIONS_V1.identifier: RAW_SEC_SUBMISSIONS_V1,
+    RAW_SEC_COMPANYFACTS_V1.identifier: RAW_SEC_COMPANYFACTS_V1,
 }
 
 

@@ -16,7 +16,13 @@ from finresearch.cases import (
     inspect_case,
 )
 from finresearch.data_contracts import DataContractError
-from finresearch.ingestion import IngestionError, ingest_yfinance_daily_prices
+from finresearch.ingestion import (
+    IngestionError,
+    IngestionReceipt,
+    ingest_sec_companyfacts,
+    ingest_sec_submissions,
+    ingest_yfinance_daily_prices,
+)
 from finresearch.providers import ProviderError
 
 app = typer.Typer(
@@ -60,6 +66,17 @@ StartOption = Annotated[
 EndOption = Annotated[
     str,
     typer.Option("--end", help="Exclusive end date in YYYY-MM-DD format."),
+]
+CikArgument = Annotated[
+    str,
+    typer.Argument(help="SEC Central Index Key, with or without leading zeros."),
+]
+SECUserAgentOption = Annotated[
+    str,
+    typer.Option(
+        "--user-agent",
+        help="SEC requester identity including a contact email.",
+    ),
 ]
 
 
@@ -163,10 +180,59 @@ def ingest_yfinance_prices_command(
         ProviderError,
     ) as exc:
         fail(str(exc))
-    typer.echo(f"artifact: {receipt.artifact_id}")
-    typer.echo(f"path: {receipt.path}")
-    typer.echo(f"rows: {receipt.row_count}")
-    typer.echo(f"sha256: {receipt.sha256}")
+    print_ingestion_receipt(receipt)
+
+
+@data_app.command("ingest-sec-submissions")
+def ingest_sec_submissions_command(
+    ctx: typer.Context,
+    case_id: CaseIdArgument,
+    cik: CikArgument,
+    user_agent: SECUserAgentOption,
+) -> None:
+    """Append one SEC recent-submissions raw snapshot."""
+    try:
+        receipt = ingest_sec_submissions(
+            state_from_context(ctx).workspace,
+            case_id,
+            cik,
+            user_agent,
+        )
+    except (
+        CaseContractError,
+        DataContractError,
+        IngestionError,
+        OSError,
+        ProviderError,
+    ) as exc:
+        fail(str(exc))
+    print_ingestion_receipt(receipt)
+
+
+@data_app.command("ingest-sec-companyfacts")
+def ingest_sec_companyfacts_command(
+    ctx: typer.Context,
+    case_id: CaseIdArgument,
+    cik: CikArgument,
+    user_agent: SECUserAgentOption,
+) -> None:
+    """Append one SEC companyfacts XBRL raw snapshot."""
+    try:
+        receipt = ingest_sec_companyfacts(
+            state_from_context(ctx).workspace,
+            case_id,
+            cik,
+            user_agent,
+        )
+    except (
+        CaseContractError,
+        DataContractError,
+        IngestionError,
+        OSError,
+        ProviderError,
+    ) as exc:
+        fail(str(exc))
+    print_ingestion_receipt(receipt)
 
 
 def get_case_status(ctx: typer.Context, case_id: str) -> CaseStatus:
@@ -181,6 +247,14 @@ def print_issues(status: CaseStatus) -> None:
     """Print validation issues in stable order."""
     for issue in status.issues:
         typer.echo(f"error [{issue.code}]: {issue.message}", err=True)
+
+
+def print_ingestion_receipt(receipt: IngestionReceipt) -> None:
+    """Print stable fields shared by raw ingestion commands."""
+    typer.echo(f"artifact: {receipt.artifact_id}")
+    typer.echo(f"path: {receipt.path}")
+    typer.echo(f"rows: {receipt.row_count}")
+    typer.echo(f"sha256: {receipt.sha256}")
 
 
 def fail(message: str) -> NoReturn:

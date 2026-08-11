@@ -174,7 +174,7 @@ def write_manifest(case_dir: Path, manifest: CaseManifest) -> None:
             file_handle.write(tomli_w.dumps(payload))
             file_handle.flush()
             temporary_path.replace(manifest_path)
-        except Exception:
+        except BaseException:
             temporary_path.unlink(missing_ok=True)
             raise
 

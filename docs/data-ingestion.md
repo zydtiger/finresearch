@@ -17,11 +17,14 @@ Ingestion, validation, and future inspection commands must import the same
 - Each network retrieval creates a new Parquet file and a new manifest artifact.
 - Existing raw snapshots are never overwritten by normal ingestion commands.
 - Parquet uses Zstandard compression and includes statistics.
-- Every snapshot records provider, source symbol, retrieval time, requested
-  period, interval, and an independent dataset schema version.
+- Every snapshot records provider-specific request identity and parameters,
+  retrieval time, and an independent dataset schema version. For example,
+  yfinance records symbol/period/interval while SEC records CIK and endpoint.
 - The manifest records artifact ID, kind, schema version, relative path,
   provider, retrieval time, row count, and SHA-256 checksum.
 - A failed Parquet write or manifest update removes only the new partial output.
+- Per-case file and process locks serialize snapshot publication with manifest
+  updates; the persistent `.finresearch.lock` file is internal workspace state.
 - Provider adapters may use pandas at their external boundary; internal
   contracts and storage use Polars.
 
@@ -33,6 +36,13 @@ data/raw/yfinance/daily-prices/<symbol-key>/<retrieved-at>.parquet
 
 The retrieval timestamp makes the path append-only. Provider symbols that are
 not portable path components receive a readable slug plus a short hash.
+
+SEC snapshots are stored below:
+
+```text
+data/raw/sec/submissions/<10-digit-cik>/<retrieved-at>.parquet
+data/raw/sec/companyfacts/<10-digit-cik>/<retrieved-at>.parquet
+```
 
 ## Raw yfinance daily-prices v1
 
@@ -72,6 +82,58 @@ finresearch --workspace PATH data ingest-yfinance-prices \
 The command requests unadjusted daily OHLC with actions enabled. The end date is
 exclusive, matching yfinance semantics.
 
+## Raw SEC submissions v1
+
+Contract identifier: `raw.sec.submissions.v1`
+
+The contract flattens the parallel arrays under `filings.recent` into one row
+per accession number. Each row preserves CIK, entity metadata, tickers,
+exchanges, accession number, filing and report dates, provider acceptance-time
+text, Act and form, file and film numbers, items, filing size, XBRL flags, and
+primary-document metadata. `(cik, accession_number)` is unique within a
+snapshot.
+
+The v1 command intentionally does not follow the supplemental historical files
+listed under `filings.files`. A later explicit history command can add that
+behavior with bounded requests and its own tests; ordinary ingestion must not
+silently fan out across the full EDGAR archive.
+
+## Raw SEC companyfacts v1
+
+Contract identifier: `raw.sec.companyfacts.v1`
+
+The contract flattens `facts.<taxonomy>.<concept>.units.<unit>` into one row per
+reported observation. It preserves taxonomy, concept, label, description,
+unit, start and end dates, accession number, fiscal year and period, form,
+filed date, frame, and retrieval provenance.
+
+Reported values remain lossless JSON-scalar text with an explicit
+`value_type`. Raw ingestion therefore does not force large integers, monetary
+values, shares, ratios, booleans, and textual DEI facts through one Float64
+column. A normalized fundamentals contract will parse values according to unit
+and concept semantics.
+
+SEC can publish duplicate-looking observations. Raw companyfacts ingestion
+preserves them; filing-aware deduplication belongs in normalization.
+
+## SEC commands and fair access
+
+```text
+finresearch --workspace PATH data ingest-sec-submissions \
+  CASE_ID CIK --user-agent "NAME EMAIL"
+
+finresearch --workspace PATH data ingest-sec-companyfacts \
+  CASE_ID CIK --user-agent "NAME EMAIL"
+```
+
+CIKs may be supplied with or without leading zeros and are stored in the SEC
+API's ten-digit form. `--user-agent` is required on every SEC command and must
+contain a contact email. The adapter sends the declared identity, requests
+JSON with compression, uses a finite timeout, rejects redirects, and surfaces
+HTTP or schema failures without writing a partial artifact. A host-shared file
+lock spaces request starts by at least 110 milliseconds across provider
+instances and CLI processes.
+
 ## Provider ownership
 
 `yfinance` is a convenient market-data adapter for personal research and
@@ -86,10 +148,9 @@ The minimum provider stack for auditable U.S. equity research is:
 
 1. **yfinance** for prototype prices, distributions, splits, and convenient
    market metadata.
-2. **SEC EDGAR** for filing metadata, primary filing documents, and reported
-   XBRL facts. SEC submissions and company facts are available through
-   `data.sec.gov`; clients must declare a user agent and respect the current
-   fair-access limit.
+2. **SEC EDGAR** for filing metadata and reported XBRL facts. The current
+   adapters ingest `filings.recent` and companyfacts from `data.sec.gov`;
+   clients must declare a user agent and respect the current fair-access limit.
 3. **FRED or U.S. Treasury** for macro series and risk-free-rate inputs. FRED is
    useful when vintage-aware ALFRED observations matter; Treasury is the direct
    source for daily Treasury curve data.
@@ -101,9 +162,9 @@ Official references:
 - <https://fred.stlouisfed.org/docs/api/fred/overview.html>
 - <https://home.treasury.gov/treasury-daily-interest-rate-xml-feed>
 
-SEC is required before treating reported fundamentals as research-grade.
-FRED/Treasury can wait until the first DCF or macro-sensitive workflow. Free
-consensus-estimate data has no equivalent authoritative source; any later
-estimate adapter must preserve provider, `estimate_as_of`, retrieval time, and
-licensing constraints rather than treating current yfinance estimates as
-point-in-time history.
+SEC is the authoritative input for the later normalized reported-fundamentals
+contract. FRED/Treasury can wait until the first DCF or macro-sensitive
+workflow. Free consensus-estimate data has no equivalent authoritative source;
+any later estimate adapter must preserve provider, `estimate_as_of`, retrieval
+time, and licensing constraints rather than treating current yfinance
+estimates as point-in-time history.

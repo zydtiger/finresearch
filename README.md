@@ -56,6 +56,21 @@ Raw provider snapshots use versioned Polars schemas and Zstandard-compressed
 Parquet. See [`docs/data-ingestion.md`](docs/data-ingestion.md) for the raw-data
 contract and provider boundaries.
 
+Append SEC filing metadata and reported XBRL facts using the requester identity
+required by SEC fair-access policy:
+
+```bash
+uv run finresearch \
+  --workspace /path/to/research-artifacts \
+  data ingest-sec-submissions aapl-2026-08-11 320193 \
+  --user-agent "Researcher Name researcher@example.com"
+
+uv run finresearch \
+  --workspace /path/to/research-artifacts \
+  data ingest-sec-companyfacts aapl-2026-08-11 320193 \
+  --user-agent "Researcher Name researcher@example.com"
+```
+
 ## Development
 
 ```bash
