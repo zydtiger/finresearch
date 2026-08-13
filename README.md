@@ -71,6 +71,19 @@ uv run finresearch \
   --user-agent "Researcher Name researcher@example.com"
 ```
 
+Deep-validate declared snapshots against their registered contracts, or
+inspect one artifact's file, schema, provenance, and preview:
+
+```bash
+uv run finresearch \
+  --workspace /path/to/research-artifacts \
+  data validate aapl-2026-08-11 [ARTIFACT_ID]
+
+uv run finresearch \
+  --workspace /path/to/research-artifacts \
+  data inspect aapl-2026-08-11 ARTIFACT_ID --limit 5
+```
+
 ## Development
 
 ```bash

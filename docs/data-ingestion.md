@@ -134,6 +134,41 @@ HTTP or schema failures without writing a partial artifact. A host-shared file
 lock spaces request starts by at least 110 milliseconds across provider
 instances and CLI processes.
 
+## Deep validation and inspection
+
+`case validate` only checks that the manifest is well-formed and that declared
+files exist. `data validate` re-reads each declared Parquet snapshot and
+verifies, per artifact:
+
+- the manifest SHA-256 matches the file bytes;
+- the manifest row count matches the Parquet height;
+- the artifact `kind` and `schema_version` resolve to a registered
+  `DatasetContract` in `data_contracts.py`;
+- the Parquet schema, required non-null fields, and unique key satisfy that
+  contract; and
+- the manifest `retrieved_at` matches the snapshot's own `retrieved_at`
+  provenance column.
+
+```text
+finresearch --workspace PATH data validate CASE_ID [ARTIFACT_ID]
+finresearch --workspace PATH data inspect CASE_ID ARTIFACT_ID [--limit N]
+```
+
+Without `ARTIFACT_ID`, `data validate` deep-checks every declared `.parquet`
+artifact and ignores declared non-Parquet outputs such as reports. Exact
+selection of a non-Parquet artifact fails as unsupported. `data inspect` runs
+the same deep validation first, then reports the contract identifier, relative
+path, size, SHA-256,
+row count, columns and dtypes, date and timestamp ranges, per-column null
+counts, unique-key violations, constant provenance fields (`provider`,
+`provider_symbol`, `cik`, and `source_url` when the snapshot declares them), and a
+deterministic JSON-record preview of the first `N` rows (default 5, maximum
+100). Invalid or unknown-contract artifacts are not inspected.
+
+Both commands share the `DatasetContract` registry so schema, validation, and
+inspection cannot drift; adding a new raw or normalized table means registering
+one contract.
+
 ## Provider ownership
 
 `yfinance` is a convenient market-data adapter for personal research and

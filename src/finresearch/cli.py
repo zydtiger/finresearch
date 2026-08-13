@@ -12,10 +12,18 @@ import typer
 from finresearch.cases import (
     CaseContractError,
     CaseStatus,
+    ValidationIssue,
     initialize_case,
     inspect_case,
 )
 from finresearch.data_contracts import DataContractError
+from finresearch.data_validation import (
+    MAX_PREVIEW_ROWS,
+    ArtifactInspection,
+    DataValidationError,
+    inspect_artifact,
+    validate_artifact,
+)
 from finresearch.ingestion import (
     IngestionError,
     IngestionReceipt,
@@ -70,6 +78,23 @@ EndOption = Annotated[
 CikArgument = Annotated[
     str,
     typer.Argument(help="SEC Central Index Key, with or without leading zeros."),
+]
+ArtifactIdArgument = Annotated[
+    str | None,
+    typer.Argument(help="Artifact id declared in the case manifest."),
+]
+RequiredArtifactIdArgument = Annotated[
+    str,
+    typer.Argument(help="Artifact id declared in the case manifest."),
+]
+LimitOption = Annotated[
+    int,
+    typer.Option(
+        "--limit",
+        min=0,
+        max=MAX_PREVIEW_ROWS,
+        help="Preview row limit for data inspect.",
+    ),
 ]
 SECUserAgentOption = Annotated[
     str,
@@ -141,7 +166,7 @@ def show_case_status(ctx: typer.Context, case_id: CaseIdArgument) -> None:
     )
     typer.echo(f"valid: {'yes' if status.valid else 'no'}")
     if not status.valid:
-        print_issues(status)
+        print_issues(status.issues)
         raise typer.Exit(1)
 
 
@@ -150,7 +175,7 @@ def validate_case_command(ctx: typer.Context, case_id: CaseIdArgument) -> None:
     """Validate a case against the complete v1 contract."""
     status = get_case_status(ctx, case_id)
     if not status.valid:
-        print_issues(status)
+        print_issues(status.issues)
         raise typer.Exit(1)
     typer.echo(f"valid case: {case_id}")
 
@@ -235,6 +260,41 @@ def ingest_sec_companyfacts_command(
     print_ingestion_receipt(receipt)
 
 
+@data_app.command("validate")
+def validate_data_command(
+    ctx: typer.Context,
+    case_id: CaseIdArgument,
+    artifact_id: ArtifactIdArgument = None,
+) -> None:
+    """Deep-validate declared snapshots against their dataset contracts."""
+    workspace = state_from_context(ctx).workspace
+    try:
+        issues = validate_artifact(workspace, case_id, artifact_id)
+    except (CaseContractError, DataValidationError, OSError) as exc:
+        fail(str(exc))
+    if issues:
+        print_issues(issues)
+        raise typer.Exit(1)
+    target = artifact_id or f"all declared artifacts of {case_id}"
+    typer.echo(f"valid: {target}")
+
+
+@data_app.command("inspect")
+def inspect_data_command(
+    ctx: typer.Context,
+    case_id: CaseIdArgument,
+    artifact_id: RequiredArtifactIdArgument,
+    limit: LimitOption = 5,
+) -> None:
+    """Report file, schema, provenance, and preview facts for one artifact."""
+    workspace = state_from_context(ctx).workspace
+    try:
+        inspection = inspect_artifact(workspace, case_id, artifact_id, limit)
+    except (CaseContractError, DataValidationError, OSError) as exc:
+        fail(str(exc))
+    print_artifact_inspection(inspection)
+
+
 def get_case_status(ctx: typer.Context, case_id: str) -> CaseStatus:
     """Inspect a case and convert identifier errors to CLI failures."""
     try:
@@ -243,9 +303,9 @@ def get_case_status(ctx: typer.Context, case_id: str) -> CaseStatus:
         fail(str(exc))
 
 
-def print_issues(status: CaseStatus) -> None:
+def print_issues(issues: tuple[ValidationIssue, ...]) -> None:
     """Print validation issues in stable order."""
-    for issue in status.issues:
+    for issue in issues:
         typer.echo(f"error [{issue.code}]: {issue.message}", err=True)
 
 
@@ -255,6 +315,44 @@ def print_ingestion_receipt(receipt: IngestionReceipt) -> None:
     typer.echo(f"path: {receipt.path}")
     typer.echo(f"rows: {receipt.row_count}")
     typer.echo(f"sha256: {receipt.sha256}")
+
+
+def print_artifact_inspection(inspection: ArtifactInspection) -> None:
+    """Print stable inspection facts in deterministic order."""
+    typer.echo(f"artifact: {inspection.artifact_id}")
+    typer.echo(f"contract: {inspection.contract_identifier}")
+    typer.echo(f"path: {inspection.path}")
+    typer.echo(f"size: {inspection.size} bytes")
+    typer.echo(f"sha256: {inspection.sha256}")
+    typer.echo(f"rows: {inspection.row_count}")
+    if inspection.provider is not None:
+        typer.echo(f"provider: {inspection.provider}")
+    if inspection.provider_symbol is not None:
+        typer.echo(f"provider_symbol: {inspection.provider_symbol}")
+    if inspection.cik is not None:
+        typer.echo(f"cik: {inspection.cik}")
+    if inspection.source_url is not None:
+        typer.echo(f"source_url: {inspection.source_url}")
+    typer.echo(f"columns ({len(inspection.columns)}):")
+    for column in inspection.columns:
+        typer.echo(f"  {column.name}: {column.dtype}")
+    if inspection.date_ranges:
+        typer.echo("date ranges:")
+        for item in inspection.date_ranges:
+            typer.echo(
+                f"  {item.name}: {item.minimum or 'n/a'} .. {item.maximum or 'n/a'}"
+            )
+    if inspection.nulls:
+        typer.echo("nulls:")
+        for null in inspection.nulls:
+            typer.echo(f"  {null.name}: {null.count}")
+    else:
+        typer.echo("nulls: none")
+    if inspection.duplicate_key_rows is not None:
+        typer.echo(f"duplicate key rows: {inspection.duplicate_key_rows}")
+    if inspection.preview_json is not None:
+        typer.echo("preview:")
+        typer.echo(inspection.preview_json)
 
 
 def fail(message: str) -> NoReturn:
