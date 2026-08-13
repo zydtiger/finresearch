@@ -99,7 +99,7 @@ def ingest_yfinance_daily_prices(
     if start >= end:
         raise IngestionError("start date must be earlier than exclusive end date")
 
-    case_dir, manifest, raw_root = _case_raw_context(workspace, case_id)
+    case_dir, manifest, _ = _case_raw_context(workspace, case_id)
 
     retrieval_time = _retrieval_time(retrieved_at)
     if provider is None:
@@ -126,12 +126,11 @@ def ingest_yfinance_daily_prices(
     return _persist_raw_snapshot(
         case_dir=case_dir,
         manifest=manifest,
-        raw_root=raw_root,
         frame=frame,
         contract=RAW_YFINANCE_DAILY_PRICES_V1,
         provider="yfinance",
-        path_parts=("yfinance", "daily-prices", _symbol_key(normalized_symbol)),
-        entity_key=_symbol_key(normalized_symbol),
+        path_parts=("yfinance", "daily-prices", symbol_key(normalized_symbol)),
+        entity_key=symbol_key(normalized_symbol),
         retrieved_at=retrieval_time,
     )
 
@@ -155,7 +154,7 @@ def ingest_sec_submissions(
 
     normalized_cik = normalize_cik(cik)
     declared_user_agent = validate_user_agent(user_agent)
-    case_dir, manifest, raw_root = _case_raw_context(workspace, case_id)
+    case_dir, manifest, _ = _case_raw_context(workspace, case_id)
     retrieval_time = _retrieval_time(retrieved_at)
     submissions_provider: SECSubmissionsProvider = provider or SECProvider()
     frame = submissions_provider.fetch_submissions(
@@ -177,7 +176,6 @@ def ingest_sec_submissions(
     return _persist_raw_snapshot(
         case_dir=case_dir,
         manifest=manifest,
-        raw_root=raw_root,
         frame=frame,
         contract=RAW_SEC_SUBMISSIONS_V1,
         provider="sec",
@@ -206,7 +204,7 @@ def ingest_sec_companyfacts(
 
     normalized_cik = normalize_cik(cik)
     declared_user_agent = validate_user_agent(user_agent)
-    case_dir, manifest, raw_root = _case_raw_context(workspace, case_id)
+    case_dir, manifest, _ = _case_raw_context(workspace, case_id)
     retrieval_time = _retrieval_time(retrieved_at)
     facts_provider: SECCompanyFactsProvider = provider or SECProvider()
     frame = facts_provider.fetch_companyfacts(
@@ -228,7 +226,6 @@ def ingest_sec_companyfacts(
     return _persist_raw_snapshot(
         case_dir=case_dir,
         manifest=manifest,
-        raw_root=raw_root,
         frame=frame,
         contract=RAW_SEC_COMPANYFACTS_V1,
         provider="sec",
@@ -253,7 +250,6 @@ def _persist_raw_snapshot(
     *,
     case_dir: Path,
     manifest: CaseManifest,
-    raw_root: Path,
     frame: pl.DataFrame,
     contract: DatasetContract,
     provider: str,
@@ -261,14 +257,51 @@ def _persist_raw_snapshot(
     entity_key: str,
     retrieved_at: datetime,
 ) -> IngestionReceipt:
+    """Persist one immutable snapshot below the manifest raw path role."""
+    return persist_snapshot(
+        case_dir=case_dir,
+        manifest=manifest,
+        path_role="raw",
+        frame=frame,
+        contract=contract,
+        provider=provider,
+        path_parts=path_parts,
+        entity_key=entity_key,
+        retrieved_at=retrieved_at,
+    )
+
+
+def persist_snapshot(
+    *,
+    case_dir: Path,
+    manifest: CaseManifest,
+    path_role: str,
+    frame: pl.DataFrame,
+    contract: DatasetContract,
+    provider: str,
+    path_parts: tuple[str, ...],
+    entity_key: str,
+    retrieved_at: datetime,
+    source: str | None = None,
+) -> IngestionReceipt:
+    """Atomically publish and register one immutable Parquet snapshot.
+
+    Raw snapshots record the provider as their manifest source; normalized
+    snapshots pass the raw artifact id as lineage through ``source``.
+    """
     contract.validate(frame)
     timestamp_key = retrieved_at.strftime("%Y%m%dT%H%M%S%fZ")
     relative_path = Path(
-        manifest.paths["raw"],
+        manifest.paths[path_role],
         *path_parts,
         f"{timestamp_key}.parquet",
     )
     artifact_id = f"{contract.name}.{entity_key}.{timestamp_key.lower()}"
+    root = resolve_relative_path(
+        case_dir,
+        manifest.paths[path_role],
+        f"paths.{path_role}",
+    )
     with _case_write_lock(case_dir):
         current_manifest = read_manifest(case_dir)
         if any(
@@ -320,7 +353,7 @@ def _persist_raw_snapshot(
                     kind=contract.name,
                     schema_version=contract.version,
                     path=relative_path.as_posix(),
-                    source=provider,
+                    source=source or provider,
                     sha256=sha256,
                     retrieved_at=_format_utc(retrieved_at),
                     row_count=frame.height,
@@ -339,7 +372,7 @@ def _persist_raw_snapshot(
                 relative_path.as_posix(),
             ):
                 output_path.unlink(missing_ok=True)
-                _remove_empty_parents(output_path.parent, raw_root)
+                _remove_empty_parents(output_path.parent, root)
             raise
 
     return IngestionReceipt(
@@ -410,6 +443,11 @@ def _validate_snapshot_metadata(
         "interval": "1d",
     }
     _validate_constant_metadata(frame, expected)
+    currency_values = frame.get_column("currency").unique().to_list()
+    if len(currency_values) != 1 or not isinstance(currency_values[0], str):
+        raise IngestionError(
+            f"provider snapshot has inconsistent currency: {currency_values!r}"
+        )
 
 
 def _validate_constant_metadata(
@@ -431,7 +469,7 @@ def _retrieval_time(value: datetime | None) -> datetime:
     return retrieval_time.astimezone(UTC)
 
 
-def _symbol_key(symbol: str) -> str:
+def symbol_key(symbol: str) -> str:
     lowered = symbol.lower()
     readable = re.sub(r"[^a-z0-9._-]+", "-", lowered).strip("-._")
     readable = readable[:48] or "symbol"

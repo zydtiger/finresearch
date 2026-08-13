@@ -53,6 +53,7 @@ def valid_price_frame(
                 "schema_version": 1,
                 "provider": "yfinance",
                 "provider_symbol": symbol,
+                "currency": "USD",
                 "retrieved_at": retrieval_time,
                 "requested_start": start,
                 "requested_end": end,

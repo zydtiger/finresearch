@@ -40,6 +40,7 @@ class CoordinatedPriceProvider:
                     "schema_version": 1,
                     "provider": "yfinance",
                     "provider_symbol": symbol,
+                    "currency": "USD",
                     "retrieved_at": retrieved_at,
                     "requested_start": start,
                     "requested_end": end,

@@ -31,12 +31,14 @@ def test_yfinance_boundary_preserves_session_and_converts_timestamp() -> None:
         start=date(2026, 1, 2),
         end=date(2026, 1, 3),
         retrieved_at=retrieved_at,
+        currency="USD",
     )
 
     assert frame.row(0, named=True) == {
         "schema_version": 1,
         "provider": "yfinance",
         "provider_symbol": "AAPL",
+        "currency": "USD",
         "retrieved_at": retrieved_at,
         "requested_start": date(2026, 1, 2),
         "requested_end": date(2026, 1, 3),
@@ -66,4 +68,5 @@ def test_yfinance_boundary_rejects_naive_timestamp() -> None:
             start=date(2026, 1, 2),
             end=date(2026, 1, 3),
             retrieved_at=datetime(2026, 8, 11, tzinfo=UTC),
+            currency="USD",
         )

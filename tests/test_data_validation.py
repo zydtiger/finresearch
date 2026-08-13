@@ -10,6 +10,7 @@ from typer.testing import CliRunner, Result
 from finresearch.cases import Artifact, append_artifact, initialize_case
 from finresearch.cli import app
 from finresearch.data_contracts import (
+    NORMALIZED_INSTRUMENT_MASTER_V1,
     RAW_SEC_SUBMISSIONS_V1,
     RAW_YFINANCE_DAILY_PRICES_V1,
 )
@@ -35,6 +36,7 @@ def price_frame(*, retrieved_at: datetime = RETRIEVED_AT) -> pl.DataFrame:
                 "schema_version": 1,
                 "provider": "yfinance",
                 "provider_symbol": "aapl",
+                "currency": "USD",
                 "retrieved_at": retrieved_at,
                 "requested_start": date(2026, 1, 1),
                 "requested_end": date(2026, 1, 8),
@@ -334,7 +336,7 @@ def test_inspect_reports_file_and_contract_facts(price_case: Path) -> None:
     assert "rows: 1" in result.output
     assert "provider: yfinance" in result.output
     assert "provider_symbol: aapl" in result.output
-    assert "columns (19):" in result.output
+    assert "columns (20):" in result.output
     assert "  timestamp: Datetime(us, UTC)" in result.output
     assert "date ranges:" in result.output
     assert "  session_date: 2026-01-02 .. 2026-01-02" in result.output
@@ -348,6 +350,7 @@ def test_inspect_reports_file_and_contract_facts(price_case: Path) -> None:
             "schema_version": 1,
             "provider": "yfinance",
             "provider_symbol": "aapl",
+            "currency": "USD",
             "retrieved_at": "2026-08-11T03:12:45.123456+00:00",
             "requested_start": "2026-01-01",
             "requested_end": "2026-01-08",
@@ -541,3 +544,58 @@ def test_inspect_unknown_artifact_id(price_case: Path) -> None:
 
     assert result.exit_code == 1
     assert "artifact not declared: not-declared" in result.output
+
+
+def master_frame(*, source_artifact_id: str) -> pl.DataFrame:
+    """Build one normalized instrument-master row with explicit lineage."""
+    return pl.DataFrame(
+        [
+            {
+                "schema_version": 1,
+                "provider": "yfinance",
+                "instrument_id": "aapl",
+                "provider_symbol": "aapl",
+                "currency": "USD",
+                "provider_timezone": "America/New_York",
+                "first_session_date": date(2026, 1, 2),
+                "last_session_date": date(2026, 1, 2),
+                "observation_count": 1,
+                "source_artifact_id": source_artifact_id,
+                "normalized_at": datetime(2026, 8, 11, 4, 0, tzinfo=UTC),
+            }
+        ],
+        schema=NORMALIZED_INSTRUMENT_MASTER_V1.schema,
+    )
+
+
+def test_validate_rejects_dangling_lineage(price_case: Path) -> None:
+    case_dir = price_case / "cases" / "aapl"
+    write_artifact(
+        case_dir,
+        master_frame(source_artifact_id="raw.yfinance.daily-prices.aapl.ghost"),
+        artifact_id="normalized.instrument-master.aapl.ghost",
+        kind="normalized.instrument-master",
+        path="data/normalized/normalized.instrument-master/aapl/ghost.parquet",
+    )
+
+    result = invoke(price_case, "data", "validate", "aapl")
+
+    assert result.exit_code == 1
+    assert "error [lineage_invalid]" in result.output
+    assert "undeclared source artifact" in result.output
+
+
+def test_validate_accepts_declared_lineage(price_case: Path) -> None:
+    case_dir = price_case / "cases" / "aapl"
+    write_artifact(
+        case_dir,
+        master_frame(source_artifact_id=PRICE_ARTIFACT_ID),
+        artifact_id="normalized.instrument-master.aapl.valid",
+        kind="normalized.instrument-master",
+        path="data/normalized/normalized.instrument-master/aapl/valid.parquet",
+    )
+
+    result = invoke(price_case, "data", "validate", "aapl")
+
+    assert result.exit_code == 0
+    assert "valid: all declared artifacts of aapl" in result.output

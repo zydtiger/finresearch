@@ -71,6 +71,16 @@ uv run finresearch \
   --user-agent "Researcher Name researcher@example.com"
 ```
 
+Derive deterministic normalized artifacts (instrument master and unadjusted
+daily price bars) from one raw yfinance snapshot, carrying the raw artifact id
+as lineage:
+
+```bash
+uv run finresearch \
+  --workspace /path/to/research-artifacts \
+  data normalize-daily-prices aapl-2026-08-11 AAPL [--raw-artifact-id ID]
+```
+
 Deep-validate declared snapshots against their registered contracts, or
 inspect one artifact's file, schema, provenance, and preview:
 

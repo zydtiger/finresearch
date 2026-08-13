@@ -31,6 +31,7 @@ from finresearch.ingestion import (
     ingest_sec_submissions,
     ingest_yfinance_daily_prices,
 )
+from finresearch.normalization import normalize_daily_prices
 from finresearch.providers import ProviderError
 
 app = typer.Typer(
@@ -101,6 +102,13 @@ SECUserAgentOption = Annotated[
     typer.Option(
         "--user-agent",
         help="SEC requester identity including a contact email.",
+    ),
+]
+RawArtifactOption = Annotated[
+    str | None,
+    typer.Option(
+        "--raw-artifact-id",
+        help="Raw snapshot to normalize when multiple exist for the symbol.",
     ),
 ]
 
@@ -293,6 +301,34 @@ def inspect_data_command(
     except (CaseContractError, DataValidationError, OSError) as exc:
         fail(str(exc))
     print_artifact_inspection(inspection)
+
+
+@data_app.command("normalize-daily-prices")
+def normalize_daily_prices_command(
+    ctx: typer.Context,
+    case_id: CaseIdArgument,
+    symbol: SymbolArgument,
+    raw_artifact_id: RawArtifactOption = None,
+) -> None:
+    """Derive instrument-master and daily-prices artifacts from one raw snapshot."""
+    try:
+        receipt = normalize_daily_prices(
+            state_from_context(ctx).workspace,
+            case_id,
+            symbol,
+            raw_artifact_id=raw_artifact_id,
+        )
+    except (
+        CaseContractError,
+        DataContractError,
+        IngestionError,
+        OSError,
+    ) as exc:
+        fail(str(exc))
+    typer.echo("normalized instrument-master:")
+    print_ingestion_receipt(receipt.instrument_master)
+    typer.echo("normalized daily-prices:")
+    print_ingestion_receipt(receipt.daily_prices)
 
 
 def get_case_status(ctx: typer.Context, case_id: str) -> CaseStatus:

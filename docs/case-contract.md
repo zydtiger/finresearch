@@ -92,6 +92,8 @@ must stay below a directory declared in `[paths]`. When present, `sha256` uses
 64 lowercase hexadecimal digits. Network ingestions also record an RFC 3339 UTC
 `retrieved_at` timestamp and a non-negative `row_count`. These provenance fields
 remain optional for artifacts that are not row-oriented provider snapshots.
+`source` names the provider for raw snapshots; normalized artifacts record the
+raw artifact id that produced them, making each row traceable to its input.
 
 ## Command behavior
 

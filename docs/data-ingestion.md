@@ -53,6 +53,7 @@ Contract identifier: `raw.yfinance.daily-prices.v1`
 | `schema_version` | `UInt16` | Independent dataset contract version |
 | `provider` | `String` | Always `yfinance` |
 | `provider_symbol` | `String` | Symbol sent to yfinance |
+| `currency` | `String` | Trading currency reported by yfinance, e.g. `USD`, `HKD` |
 | `retrieved_at` | `Datetime(us, UTC)` | Snapshot retrieval time |
 | `requested_start` | `Date` | Inclusive request start |
 | `requested_end` | `Date` | Exclusive request end |
@@ -67,10 +68,15 @@ Contract identifier: `raw.yfinance.daily-prices.v1`
 | `stock_splits` | `Float64` | Provider split ratio event value |
 | `capital_gains` | `Float64` | Provider capital-gain event when available |
 
-The metadata and timestamp fields are non-null. Numeric provider values remain
-nullable so raw storage can preserve an incomplete response for later quality
-assessment. `(provider_symbol, interval, timestamp)` is unique within one
-snapshot.
+The metadata, currency, and timestamp fields are non-null. Numeric provider
+values remain nullable so raw storage can preserve an incomplete response for
+later quality assessment. `(provider_symbol, interval, timestamp)` is unique
+within one snapshot.
+
+The adapter reads the trading currency from yfinance `fast_info` at retrieval
+time and stores it in the snapshot, so currency is a point-in-time provider
+observation rather than a later inference. A symbol whose currency cannot be
+reported fails ingestion instead of storing an unknown value.
 
 ## Command
 
@@ -168,6 +174,55 @@ deterministic JSON-record preview of the first `N` rows (default 5, maximum
 Both commands share the `DatasetContract` registry so schema, validation, and
 inspection cannot drift; adding a new raw or normalized table means registering
 one contract.
+
+## Normalized daily prices v1
+
+Normalization is a deterministic, offline transformation from one immutable raw
+yfinance snapshot. It never rewrites raw files and never fetches from the
+network; the same snapshot and code version always produce the same output.
+
+```text
+finresearch --workspace PATH data normalize-daily-prices \
+  CASE_ID SYMBOL [--raw-artifact-id ARTIFACT_ID]
+```
+
+The command writes two registered artifacts below `data/normalized/` and
+records each manifest `source` as the raw artifact id, so every normalized row
+can be traced to its exact raw snapshot. When a symbol has several raw
+snapshots, `--raw-artifact-id` selects one; otherwise normalization fails with
+the candidate ids.
+
+### normalized.instrument-master.v1
+
+One row per raw snapshot with the stable `instrument_id` (the portable symbol
+key), observed `provider_symbol`, trading `currency` captured at retrieval,
+provider timezone, first and last session dates, observation count, and
+lineage. The unique key is `(instrument_id, source_artifact_id)`: a
+current-state master that reconciles snapshots is a later workflow. Venue and
+asset class are not derivable from yfinance snapshots and are deliberately
+absent from v1.
+
+### normalized.daily-prices.v1
+
+One row per session date with UTC timestamps, session dates, unadjusted OHLCV,
+explicit `price_basis = "unadjusted"`, trading currency, provider timezone,
+lineage, and `normalized_at`. The unique key is `(instrument_id, session_date)`.
+Rules:
+
+- the raw snapshot must have interval `1d` and no duplicate session dates;
+- OHLC and volume must be present; a raw bar with missing prices fails
+  normalization with an actionable error instead of silently dropping it;
+- absent dividends and splits fill to an explicit `0.0`;
+- `adj_close` stays in raw; adjusted-price output is a future contract with its
+  own `price_basis`, keeping any single table single-basis.
+
+Re-running normalization appends a fresh immutable pair (no overwrite). The
+instrument master registers before the price bars; if the process is
+interrupted between the two writes, `case validate` flags the orphaned master
+and a re-run produces a complete pair.
+
+Both normalized tables share the same `DatasetContract` registry, so
+`data validate` and `data inspect` cover them without extra code.
 
 ## Provider ownership
 

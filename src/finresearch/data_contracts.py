@@ -66,6 +66,7 @@ RAW_YFINANCE_DAILY_PRICE_FIELDS: Final[dict[str, pl.DataType | type[pl.DataType]
     "schema_version": pl.UInt16,
     "provider": pl.String,
     "provider_symbol": pl.String,
+    "currency": pl.String,
     "retrieved_at": pl.Datetime("us", "UTC"),
     "requested_start": pl.Date,
     "requested_end": pl.Date,
@@ -92,6 +93,7 @@ RAW_YFINANCE_DAILY_PRICES_V1: Final = DatasetContract(
         "schema_version",
         "provider",
         "provider_symbol",
+        "currency",
         "retrieved_at",
         "requested_start",
         "requested_end",
@@ -199,10 +201,98 @@ RAW_SEC_COMPANYFACTS_V1: Final = DatasetContract(
     unique_key=(),
 )
 
+NORMALIZED_INSTRUMENT_MASTER_FIELDS: Final[
+    dict[str, pl.DataType | type[pl.DataType]]
+] = {
+    "schema_version": pl.UInt16,
+    "provider": pl.String,
+    "instrument_id": pl.String,
+    "provider_symbol": pl.String,
+    "currency": pl.String,
+    "provider_timezone": pl.String,
+    "first_session_date": pl.Date,
+    "last_session_date": pl.Date,
+    "observation_count": pl.Int64,
+    "source_artifact_id": pl.String,
+    "normalized_at": pl.Datetime("us", "UTC"),
+}
+
+NORMALIZED_INSTRUMENT_MASTER_V1: Final = DatasetContract(
+    name="normalized.instrument-master",
+    version=1,
+    schema=pl.Schema(NORMALIZED_INSTRUMENT_MASTER_FIELDS),
+    non_nullable=(
+        "schema_version",
+        "provider",
+        "instrument_id",
+        "provider_symbol",
+        "currency",
+        "provider_timezone",
+        "first_session_date",
+        "last_session_date",
+        "observation_count",
+        "source_artifact_id",
+        "normalized_at",
+    ),
+    # One row per raw snapshot: a current-state master registry is a later
+    # workflow that reconciles snapshots.
+    unique_key=("instrument_id", "source_artifact_id"),
+)
+
+NORMALIZED_DAILY_PRICES_FIELDS: Final[dict[str, pl.DataType | type[pl.DataType]]] = {
+    "schema_version": pl.UInt16,
+    "provider": pl.String,
+    "instrument_id": pl.String,
+    "provider_symbol": pl.String,
+    "currency": pl.String,
+    "price_basis": pl.String,
+    "provider_timezone": pl.String,
+    "session_date": pl.Date,
+    "timestamp": pl.Datetime("us", "UTC"),
+    "open": pl.Float64,
+    "high": pl.Float64,
+    "low": pl.Float64,
+    "close": pl.Float64,
+    "volume": pl.Int64,
+    "dividends": pl.Float64,
+    "stock_splits": pl.Float64,
+    "source_artifact_id": pl.String,
+    "normalized_at": pl.Datetime("us", "UTC"),
+}
+
+NORMALIZED_DAILY_PRICES_V1: Final = DatasetContract(
+    name="normalized.daily-prices",
+    version=1,
+    schema=pl.Schema(NORMALIZED_DAILY_PRICES_FIELDS),
+    non_nullable=(
+        "schema_version",
+        "provider",
+        "instrument_id",
+        "provider_symbol",
+        "currency",
+        "price_basis",
+        "provider_timezone",
+        "session_date",
+        "timestamp",
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+        "dividends",
+        "stock_splits",
+        "source_artifact_id",
+        "normalized_at",
+    ),
+    unique_key=("instrument_id", "session_date"),
+)
+
 CONTRACTS: Final = {
     RAW_YFINANCE_DAILY_PRICES_V1.identifier: RAW_YFINANCE_DAILY_PRICES_V1,
     RAW_SEC_SUBMISSIONS_V1.identifier: RAW_SEC_SUBMISSIONS_V1,
     RAW_SEC_COMPANYFACTS_V1.identifier: RAW_SEC_COMPANYFACTS_V1,
+    NORMALIZED_INSTRUMENT_MASTER_V1.identifier: NORMALIZED_INSTRUMENT_MASTER_V1,
+    NORMALIZED_DAILY_PRICES_V1.identifier: NORMALIZED_DAILY_PRICES_V1,
 }
 
 

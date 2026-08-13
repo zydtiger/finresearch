@@ -18,7 +18,7 @@ class YFinanceProviderError(ProviderError):
 
 
 class YFinancePriceProvider:
-    """Fetch daily prices from yfinance and convert only the storage boundary."""
+    """Fetch daily prices and trading currency from yfinance."""
 
     def fetch_daily_prices(
         self,
@@ -27,9 +27,10 @@ class YFinancePriceProvider:
         end: date,
         retrieved_at: datetime,
     ) -> pl.DataFrame:
-        """Fetch an unadjusted daily history with actions included."""
+        """Fetch an unadjusted daily history with actions and currency."""
         try:
-            history = yf.Ticker(symbol).history(
+            ticker = yf.Ticker(symbol)
+            history = ticker.history(
                 start=start.isoformat(),
                 end=end.isoformat(),
                 interval="1d",
@@ -39,15 +40,20 @@ class YFinancePriceProvider:
                 keepna=True,
                 raise_errors=True,
             )
+            currency = ticker.fast_info["currency"]
         except Exception as exc:
             raise YFinanceProviderError(
-                f"yfinance failed to fetch daily prices for {symbol}: {exc}"
+                f"yfinance failed to fetch daily prices or currency for {symbol}: {exc}"
             ) from exc
 
         if history.empty:
             raise YFinanceProviderError(
                 f"yfinance returned no daily prices for {symbol} "
                 f"between {start} and {end}"
+            )
+        if not isinstance(currency, str) or not currency.strip():
+            raise YFinanceProviderError(
+                f"yfinance reported no trading currency for {symbol}"
             )
 
         rows = history.reset_index().to_dict(orient="records")
@@ -57,6 +63,7 @@ class YFinancePriceProvider:
             start=start,
             end=end,
             retrieved_at=retrieved_at,
+            currency=currency.strip(),
         )
 
 
@@ -67,10 +74,13 @@ def yfinance_history_to_frame(
     start: date,
     end: date,
     retrieved_at: datetime,
+    currency: str,
 ) -> pl.DataFrame:
     """Convert yfinance boundary records to the exact raw storage schema."""
     if retrieved_at.tzinfo is None:
         raise YFinanceProviderError("retrieved_at must be timezone-aware")
+    if not currency.strip():
+        raise YFinanceProviderError("currency must not be empty")
     retrieved_utc = retrieved_at.astimezone(UTC)
 
     converted: list[dict[str, object]] = []
@@ -82,6 +92,7 @@ def yfinance_history_to_frame(
                 "schema_version": RAW_YFINANCE_DAILY_PRICES_V1.version,
                 "provider": "yfinance",
                 "provider_symbol": symbol,
+                "currency": currency.strip(),
                 "retrieved_at": retrieved_utc,
                 "requested_start": start,
                 "requested_end": end,

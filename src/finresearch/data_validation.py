@@ -81,9 +81,10 @@ def validate_artifact(
     """Deep-validate declared artifacts; return issues instead of raising."""
     case_dir = _case_directory(workspace, case_id)
     manifest = read_manifest(case_dir)
+    declared_ids = {artifact.artifact_id for artifact in manifest.artifacts}
     issues: list[ValidationIssue] = []
     for artifact in _select_artifacts(manifest, artifact_id):
-        issues.extend(_validate_artifact(case_dir, artifact))
+        issues.extend(_validate_artifact(case_dir, artifact, declared_ids))
     return tuple(issues)
 
 
@@ -138,7 +139,11 @@ def _select_artifacts(
     return tuple(selected)
 
 
-def _validate_artifact(case_dir: Path, artifact: Artifact) -> list[ValidationIssue]:
+def _validate_artifact(
+    case_dir: Path,
+    artifact: Artifact,
+    declared_ids: set[str],
+) -> list[ValidationIssue]:
     path = resolve_relative_path(
         case_dir,
         artifact.path,
@@ -221,6 +226,25 @@ def _validate_artifact(case_dir: Path, artifact: Artifact) -> list[ValidationIss
                     "provenance_mismatch",
                     f"artifact {artifact.artifact_id} manifest retrieved_at "
                     f"differs from the snapshot provenance column",
+                )
+            )
+
+    if contract_valid and "source_artifact_id" in frame.columns:
+        sources = frame.get_column("source_artifact_id").unique().to_list()
+        if len(sources) != 1 or not isinstance(sources[0], str):
+            issues.append(
+                ValidationIssue(
+                    "lineage_invalid",
+                    f"artifact {artifact.artifact_id} has inconsistent "
+                    f"source_artifact_id: {sources!r}",
+                )
+            )
+        elif sources[0] not in declared_ids:
+            issues.append(
+                ValidationIssue(
+                    "lineage_invalid",
+                    f"artifact {artifact.artifact_id} points at undeclared "
+                    f"source artifact {sources[0]!r}",
                 )
             )
     return issues
