@@ -265,6 +265,33 @@ Rules:
   explicit currency column is deferred until a mixed-unit normalization is
   needed.
 
+## Research registers
+
+Registers store the explicit judgments and open items of a research process in
+small CSV files under `<case>/registers/`; they are human-auditable and edited
+with ordinary CSV tooling, not through the CLI.
+
+```text
+finresearch --workspace PATH data registers status CASE_ID
+```
+
+Five versioned register contracts are validated and summarized:
+
+| File | Rows | Key rules |
+| --- | --- | --- |
+| `evidence.csv` | one claim per row | unique `id`; `source_type` is `filing`/`estimate`/`external`/`assumption`; `observed_at` date |
+| `assumptions.csv` | one analyst assumption per row | unique `id`; optional `source_evidence` must reference an existing evidence id |
+| `scenarios.csv` | one scenario parameter value per row | `scenario` is `bear`/`base`/`bull`; every parameter must define all three with pairwise-distinct values |
+| `catalysts.csv` | one event per row | unique `id`; `impact` is `positive`/`negative`/`neutral`; optional `expected_date` |
+| `open_questions.csv` | one open item per row | unique `id`; `importance` `high`/`medium`/`low`; `status` `open`/`answered` |
+
+Missing registers are not errors; a case may have none yet. The command
+reports per-register row counts and exits nonzero on any schema, enum, date,
+uniqueness, reference, or scenario-completeness violation. Reported facts,
+estimates, and analyst assumptions stay explicitly classified through
+`source_type` and the evidence reference, so every assumption can be traced
+to its support.
+
 ## Provider ownership
 
 `yfinance` is a convenient market-data adapter for personal research and

@@ -89,6 +89,15 @@ uv run finresearch \
   data normalize-fundamental-facts aapl-2026-08-11 320193 [--raw-artifact-id ID]
 ```
 
+Validate and summarize the human-edited research registers (evidence,
+assumptions, scenarios, catalysts, open questions):
+
+```bash
+uv run finresearch \
+  --workspace /path/to/research-artifacts \
+  data registers status aapl-2026-08-11
+```
+
 Deep-validate declared snapshots against their registered contracts, or
 inspect one artifact's file, schema, provenance, and preview:
 

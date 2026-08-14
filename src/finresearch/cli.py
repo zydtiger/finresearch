@@ -36,6 +36,7 @@ from finresearch.normalization import (
     normalize_fundamental_facts,
 )
 from finresearch.providers import ProviderError
+from finresearch.registers import REGISTER_FILES, inspect_registers
 
 app = typer.Typer(
     add_completion=False,
@@ -44,8 +45,10 @@ app = typer.Typer(
 )
 case_app = typer.Typer(help="Inspect and manage research cases.")
 data_app = typer.Typer(help="Ingest and inspect research data.")
+register_app = typer.Typer(help="Validate and summarize research registers.")
 app.add_typer(case_app, name="case")
 app.add_typer(data_app, name="data")
+data_app.add_typer(register_app, name="registers")
 
 WorkspaceOption = Annotated[
     Path,
@@ -358,6 +361,28 @@ def normalize_fundamental_facts_command(
         fail(str(exc))
     typer.echo("normalized fundamental-facts:")
     print_ingestion_receipt(receipt)
+
+
+@register_app.command("status")
+def show_registers_status(ctx: typer.Context, case_id: CaseIdArgument) -> None:
+    """Validate and summarize the case research registers."""
+    workspace = state_from_context(ctx).workspace
+    try:
+        status = inspect_registers(workspace, case_id)
+    except (CaseContractError, OSError) as exc:
+        fail(str(exc))
+    typer.echo(f"case: {status.case_id}")
+    typer.echo(
+        f"registers: {status.registers_present}/{status.registers_total} present"
+    )
+    for filename in REGISTER_FILES:
+        count = status.row_counts.get(filename, 0)
+        if count:
+            typer.echo(f"{filename}: {count} rows")
+    typer.echo(f"valid: {'yes' if status.valid else 'no'}")
+    if not status.valid:
+        print_issues(status.issues)
+        raise typer.Exit(1)
 
 
 def get_case_status(ctx: typer.Context, case_id: str) -> CaseStatus:
