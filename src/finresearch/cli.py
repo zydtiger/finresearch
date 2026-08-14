@@ -31,7 +31,10 @@ from finresearch.ingestion import (
     ingest_sec_submissions,
     ingest_yfinance_daily_prices,
 )
-from finresearch.normalization import normalize_daily_prices
+from finresearch.normalization import (
+    normalize_daily_prices,
+    normalize_fundamental_facts,
+)
 from finresearch.providers import ProviderError
 
 app = typer.Typer(
@@ -329,6 +332,32 @@ def normalize_daily_prices_command(
     print_ingestion_receipt(receipt.instrument_master)
     typer.echo("normalized daily-prices:")
     print_ingestion_receipt(receipt.daily_prices)
+
+
+@data_app.command("normalize-fundamental-facts")
+def normalize_fundamental_facts_command(
+    ctx: typer.Context,
+    case_id: CaseIdArgument,
+    cik: CikArgument,
+    raw_artifact_id: RawArtifactOption = None,
+) -> None:
+    """Derive parsed fundamental-facts from one raw SEC companyfacts snapshot."""
+    try:
+        receipt = normalize_fundamental_facts(
+            state_from_context(ctx).workspace,
+            case_id,
+            cik,
+            raw_artifact_id=raw_artifact_id,
+        )
+    except (
+        CaseContractError,
+        DataContractError,
+        IngestionError,
+        OSError,
+    ) as exc:
+        fail(str(exc))
+    typer.echo("normalized fundamental-facts:")
+    print_ingestion_receipt(receipt)
 
 
 def get_case_status(ctx: typer.Context, case_id: str) -> CaseStatus:

@@ -287,12 +287,64 @@ NORMALIZED_DAILY_PRICES_V1: Final = DatasetContract(
     unique_key=("instrument_id", "session_date"),
 )
 
+NORMALIZED_FUNDAMENTAL_FACTS_FIELDS: Final[
+    dict[str, pl.DataType | type[pl.DataType]]
+] = {
+    "schema_version": pl.UInt16,
+    "provider": pl.String,
+    "cik": pl.String,
+    "taxonomy": pl.String,
+    "concept": pl.String,
+    "label": pl.String,
+    "unit": pl.String,
+    "value_type": pl.String,
+    "value_text": pl.String,
+    "value": pl.Float64,
+    "period_type": pl.String,
+    "start_date": pl.Date,
+    "end_date": pl.Date,
+    "fiscal_year": pl.Int32,
+    "fiscal_period": pl.String,
+    "form": pl.String,
+    "filed_date": pl.Date,
+    "frame": pl.String,
+    "source_artifact_id": pl.String,
+    "normalized_at": pl.Datetime("us", "UTC"),
+}
+
+NORMALIZED_FUNDAMENTAL_FACTS_V1: Final = DatasetContract(
+    name="normalized.fundamental-facts",
+    version=1,
+    schema=pl.Schema(NORMALIZED_FUNDAMENTAL_FACTS_FIELDS),
+    non_nullable=(
+        "schema_version",
+        "provider",
+        "cik",
+        "taxonomy",
+        "concept",
+        "unit",
+        "value_type",
+        "value_text",
+        "period_type",
+        "end_date",
+        "form",
+        "filed_date",
+        "source_artifact_id",
+        "normalized_at",
+    ),
+    # Exact duplicate rows are removed during normalization; distinct
+    # restatements of the same fact remain for analyst judgment, so a
+    # unique key is intentionally not declared.
+    unique_key=(),
+)
+
 CONTRACTS: Final = {
     RAW_YFINANCE_DAILY_PRICES_V1.identifier: RAW_YFINANCE_DAILY_PRICES_V1,
     RAW_SEC_SUBMISSIONS_V1.identifier: RAW_SEC_SUBMISSIONS_V1,
     RAW_SEC_COMPANYFACTS_V1.identifier: RAW_SEC_COMPANYFACTS_V1,
     NORMALIZED_INSTRUMENT_MASTER_V1.identifier: NORMALIZED_INSTRUMENT_MASTER_V1,
     NORMALIZED_DAILY_PRICES_V1.identifier: NORMALIZED_DAILY_PRICES_V1,
+    NORMALIZED_FUNDAMENTAL_FACTS_V1.identifier: NORMALIZED_FUNDAMENTAL_FACTS_V1,
 }
 
 

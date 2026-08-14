@@ -224,6 +224,47 @@ and a re-run produces a complete pair.
 Both normalized tables share the same `DatasetContract` registry, so
 `data validate` and `data inspect` cover them without extra code.
 
+## Normalized fundamental-facts v1
+
+```text
+finresearch --workspace PATH data normalize-fundamental-facts \
+  CASE_ID CIK [--raw-artifact-id ARTIFACT_ID]
+```
+
+Parses one immutable raw SEC companyfacts snapshot into a long-form table with
+one row per reported observation. Like the other normalized tables it is a
+deterministic, offline transformation; the manifest `source` records the raw
+artifact id.
+
+Contract identifier: `normalized.fundamental-facts.v1`
+
+| Field | Meaning |
+| --- | --- |
+| `cik` | Ten-digit SEC CIK; the entity key until a cross-provider instrument registry exists |
+| `taxonomy`, `concept`, `label` | XBRL classification and human label |
+| `unit` | Reported unit, e.g. `USD`, `shares`, `USD/shares`, `pure` |
+| `value_type` | JSON scalar kind from raw (`integer`, `number`, `string`, `boolean`, `null`) |
+| `value_text` | Lossless original scalar text |
+| `value` | Parsed `Float64` for `integer`/`number` facts; NULL otherwise |
+| `period_type` | `duration` when `start_date` is present, else `instant` |
+| `start_date`, `end_date` | Reporting period bounds; instant facts have NULL start |
+| `fiscal_year`, `fiscal_period`, `form`, `filed_date`, `frame` | Filing context; `filed_date` is the point-in-time anchor; `fiscal_year`/`fiscal_period` are NULL for non-periodic filings such as DEF 14A |
+| `source_artifact_id`, `normalized_at` | Lineage and transformation time |
+
+Rules:
+
+- numeric values are parsed with exact string preservation in `value_text`;
+  `Float64` rounding for very large integers is a documented v1 precision
+  tradeoff;
+- an `integer`/`number` fact that cannot be parsed fails normalization
+  instead of silently producing NULL;
+- `string`/`boolean` facts stay unparsed with NULL `value`;
+- exact duplicate rows are removed; distinct restatements of the same fact
+  are preserved for analyst judgment, so the table declares no unique key;
+- currency is carried by the reported `unit` (`USD`, `USD/shares`); an
+  explicit currency column is deferred until a mixed-unit normalization is
+  needed.
+
 ## Provider ownership
 
 `yfinance` is a convenient market-data adapter for personal research and

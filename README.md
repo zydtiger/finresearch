@@ -81,6 +81,14 @@ uv run finresearch \
   data normalize-daily-prices aapl-2026-08-11 AAPL [--raw-artifact-id ID]
 ```
 
+Parse one raw SEC companyfacts snapshot into structured fundamental facts:
+
+```bash
+uv run finresearch \
+  --workspace /path/to/research-artifacts \
+  data normalize-fundamental-facts aapl-2026-08-11 320193 [--raw-artifact-id ID]
+```
+
 Deep-validate declared snapshots against their registered contracts, or
 inspect one artifact's file, schema, provenance, and preview:
 
