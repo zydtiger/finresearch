@@ -101,9 +101,10 @@ Run targeted tests during development with
   Do not publish to PyPI or another package index without an explicit policy
   change. Keep version history in GitHub Release notes rather than a parallel
   changelog.
-- Before creating the first release tag, protect `refs/tags/v*` with an active
-  GitHub tag ruleset that blocks deletion, updates, and non-fast-forward changes
-  without a routine bypass. Treat every published release tag as immutable.
+- The active GitHub ruleset `Protect release tags` protects `refs/tags/v*`
+  against deletion, updates, and non-fast-forward changes. It has no bypass
+  actors, and the current maintainer cannot bypass it. Treat every published
+  release tag as immutable.
 - Prepare a release from a clean `main` synchronized with `origin/main`. Require
   successful CI, `uv build --no-sources`, compatible wheel metadata, and an
   isolated wheel installation before presenting the exact version, target
