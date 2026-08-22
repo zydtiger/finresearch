@@ -204,8 +204,17 @@ uv run finresearch \
 ## Development
 
 ```bash
-uv run ruff check .
-uv run ruff format --check .
-uv run mypy src tests
-uv run pytest
+uv sync --group dev
+uv tool install prek
+prek install
+prek run --all-files --stage pre-commit
+prek run --all-files --stage pre-push
 ```
+
+The committed hook configuration is the authoritative definition of validation
+and its scope. `prek` is installed once per development machine and is not a
+project dependency.
+
+## License
+
+This project is licensed under the [MIT License](LICENSE).

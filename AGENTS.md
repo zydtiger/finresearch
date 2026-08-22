@@ -32,18 +32,25 @@ Run setup with:
 uv sync --group dev
 ```
 
-Run the complete validation suite with:
+Install the hook runner once per machine, then install the repository's
+configured `pre-commit` and `pre-push` hooks:
 
 ```bash
-uv run ruff check .
-uv run ruff format --check .
-uv run mypy src tests
-uv run pytest
+uv tool install prek
+prek install
 ```
 
-Run targeted tests with `uv run pytest <path-or-node-id>`. Documentation-only
-changes require `uv run ruff format --check .` and `git diff --check` when no
-Python source changed.
+`.pre-commit-config.yaml` is the authoritative definition of mechanically
+checkable validation and its scope. Run both configured stages outside Git
+with:
+
+```bash
+prek run --all-files --stage pre-commit
+prek run --all-files --stage pre-push
+```
+
+Run targeted tests during development with
+`uv run pytest <path-or-node-id>`.
 
 ## Git policy
 
