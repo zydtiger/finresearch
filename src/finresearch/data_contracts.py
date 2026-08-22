@@ -898,6 +898,531 @@ DERIVED_INSTRUMENT_MASTER_CURRENT_V1: Final = DatasetContract(
     semantic_validator=_validate_reconciled_instrument_master_v1,
 )
 
+# Analytical model artifacts.  These contracts intentionally retain source and
+# run identity on every row so a Parquet file can be audited without a CLI log.
+_DCF_SCENARIOS: Final = frozenset({"bear", "base", "bull"})
+
+
+def _validate_finite_model_values(frame: pl.DataFrame, contract: str) -> None:
+    for column, dtype in frame.schema.items():
+        if dtype == pl.Float64 and any(
+            not math.isfinite(cast_value)
+            for cast_value in frame[column].to_list()
+            if cast_value is not None
+        ):
+            raise _semantic_error(contract, f"{column} must be finite")
+
+
+def _amount_units(currency: str) -> set[str]:
+    return {currency, f"{currency}k", f"{currency}m", f"{currency}b"}
+
+
+def _validate_dcf_inputs_v1(frame: pl.DataFrame) -> None:
+    _validate_finite_model_values(frame, "model.dcf-inputs.v1")
+    for row in frame.iter_rows(named=True):
+        if row["scenario"] not in _DCF_SCENARIOS:
+            raise _semantic_error("model.dcf-inputs.v1", "scenario is not controlled")
+        currency = row["currency"]
+        if currency not in CURRENCY_CODES:
+            raise _semantic_error("model.dcf-inputs.v1", "currency is not controlled")
+        if row["unit"] not in (
+            _amount_units(currency)
+            | {"shares", "shares_k", "shares_m", "shares_b", "ratio", "multiple"}
+        ):
+            raise _semantic_error("model.dcf-inputs.v1", "unit is not controlled")
+        if row["source_kind"] not in {"evidence", "assumption"}:
+            raise _semantic_error(
+                "model.dcf-inputs.v1", "source_kind is not controlled"
+            )
+
+
+def _validate_dcf_cashflows_v1(frame: pl.DataFrame) -> None:
+    _validate_finite_model_values(frame, "model.dcf-cashflows.v1")
+    for row in frame.iter_rows(named=True):
+        if row["scenario"] not in _DCF_SCENARIOS:
+            raise _semantic_error(
+                "model.dcf-cashflows.v1", "scenario is not controlled"
+            )
+        if row["currency"] not in CURRENCY_CODES:
+            raise _semantic_error(
+                "model.dcf-cashflows.v1", "currency is not controlled"
+            )
+        if row["unit"] not in _amount_units(row["currency"]):
+            raise _semantic_error(
+                "model.dcf-cashflows.v1", "unit must be a currency amount scale"
+            )
+        if row["discount_factor"] <= 0:
+            raise _semantic_error(
+                "model.dcf-cashflows.v1", "discount_factor must be positive"
+            )
+
+
+def _validate_dcf_results_v1(frame: pl.DataFrame) -> None:
+    _validate_finite_model_values(frame, "model.dcf-results.v1")
+    for row in frame.iter_rows(named=True):
+        if row["scenario"] not in _DCF_SCENARIOS:
+            raise _semantic_error("model.dcf-results.v1", "scenario is not controlled")
+        currency = row["currency"]
+        if currency not in CURRENCY_CODES:
+            raise _semantic_error("model.dcf-results.v1", "currency is not controlled")
+        if row["value_unit"] not in _amount_units(currency):
+            raise _semantic_error(
+                "model.dcf-results.v1", "value_unit is not controlled"
+            )
+        if row["share_unit"] not in {"shares", "shares_k", "shares_m", "shares_b"}:
+            raise _semantic_error(
+                "model.dcf-results.v1", "share_unit is not controlled"
+            )
+        if row["per_share_unit"] != f"{currency}/share":
+            raise _semantic_error(
+                "model.dcf-results.v1", "per_share_unit is incompatible"
+            )
+        if row["discount_convention"] not in {"year_end", "mid_year"}:
+            raise _semantic_error(
+                "model.dcf-results.v1", "discount_convention is not controlled"
+            )
+        if row["terminal_method"] not in {"gordon_growth", "exit_multiple"}:
+            raise _semantic_error(
+                "model.dcf-results.v1", "terminal_method is not controlled"
+            )
+
+
+def _validate_dcf_sensitivity_v1(frame: pl.DataFrame) -> None:
+    _validate_finite_model_values(frame, "model.dcf-sensitivity.v1")
+    for row in frame.iter_rows(named=True):
+        if row["scenario"] not in _DCF_SCENARIOS:
+            raise _semantic_error(
+                "model.dcf-sensitivity.v1", "scenario is not controlled"
+            )
+        if row["currency"] not in CURRENCY_CODES:
+            raise _semantic_error(
+                "model.dcf-sensitivity.v1", "currency is not controlled"
+            )
+        if row["share_unit"] not in {"shares", "shares_k", "shares_m", "shares_b"}:
+            raise _semantic_error(
+                "model.dcf-sensitivity.v1", "share_unit is not controlled"
+            )
+        if row["per_share_unit"] != f"{row['currency']}/share":
+            raise _semantic_error(
+                "model.dcf-sensitivity.v1", "per_share_unit is incompatible"
+            )
+        if (
+            row["wacc"] <= 0
+            or row["terminal_growth"] <= -1
+            or row["terminal_growth"] >= row["wacc"]
+        ):
+            raise _semantic_error(
+                "model.dcf-sensitivity.v1", "invalid WACC/growth pair"
+            )
+
+
+def _validate_reconciliation_v1(frame: pl.DataFrame) -> None:
+    _validate_finite_model_values(frame, "model reconciliation")
+    for row in frame.iter_rows(named=True):
+        if row["status"] not in {"passed", "failed", "excluded"}:
+            raise _semantic_error("model reconciliation", "status is not controlled")
+        unit = row["unit"]
+        controlled_units = {"x"}
+        for currency in CURRENCY_CODES:
+            controlled_units |= _amount_units(currency) | {f"{currency}/share"}
+        if unit not in controlled_units:
+            raise _semantic_error("model reconciliation", "unit is not controlled")
+        tolerance = 1e-9 * max(1.0, abs(row["expected"]))
+        if abs(row["difference"] - (row["actual"] - row["expected"])) > tolerance:
+            raise _semantic_error(
+                "model reconciliation",
+                "difference does not reconcile actual and expected",
+            )
+        expected_pass = abs(row["difference"]) <= tolerance
+        if row["status"] in {"passed", "failed"} and row["passed"] != expected_pass:
+            raise _semantic_error(
+                "model reconciliation", "passed does not match tolerance"
+            )
+        if row["status"] == "passed" and not expected_pass:
+            raise _semantic_error(
+                "model reconciliation", "passed status exceeds tolerance"
+            )
+        if row["status"] == "failed" and expected_pass:
+            raise _semantic_error(
+                "model reconciliation", "failed status meets tolerance"
+            )
+        if row["status"] == "excluded" and row["passed"]:
+            raise _semantic_error(
+                "model reconciliation", "excluded check must not pass"
+            )
+
+
+def _validate_dcf_reconciliation_v1(frame: pl.DataFrame) -> None:
+    _validate_reconciliation_v1(frame)
+    if any(value not in _DCF_SCENARIOS for value in frame["scenario"].to_list()):
+        raise _semantic_error(
+            "model.dcf-reconciliation.v1", "scenario is not controlled"
+        )
+
+
+MODEL_DCF_INPUTS_V1_FIELDS: Final = {
+    "schema_version": pl.UInt16,
+    "run_id": pl.String,
+    "scenario": pl.String,
+    "field": pl.String,
+    "period_end": pl.Date,
+    "value": pl.Float64,
+    "unit": pl.String,
+    "currency": pl.String,
+    "source_id": pl.String,
+    "source_kind": pl.String,
+}
+MODEL_DCF_INPUTS_V1: Final = DatasetContract(
+    name="model.dcf-inputs",
+    version=1,
+    schema=pl.Schema(MODEL_DCF_INPUTS_V1_FIELDS),
+    non_nullable=tuple(
+        name for name in MODEL_DCF_INPUTS_V1_FIELDS if name != "period_end"
+    ),
+    unique_key=("run_id", "scenario", "field", "period_end", "source_id"),
+    sort_key=("scenario", "field", "source_id"),
+    semantic_validator=_validate_dcf_inputs_v1,
+)
+
+MODEL_DCF_CASHFLOWS_V1_FIELDS: Final = {
+    "schema_version": pl.UInt16,
+    "run_id": pl.String,
+    "scenario": pl.String,
+    "period_end": pl.Date,
+    "year_fraction": pl.Float64,
+    "free_cash_flow": pl.Float64,
+    "discount_factor": pl.Float64,
+    "present_value": pl.Float64,
+    "currency": pl.String,
+    "unit": pl.String,
+}
+MODEL_DCF_CASHFLOWS_V1: Final = DatasetContract(
+    name="model.dcf-cashflows",
+    version=1,
+    schema=pl.Schema(MODEL_DCF_CASHFLOWS_V1_FIELDS),
+    non_nullable=tuple(MODEL_DCF_CASHFLOWS_V1_FIELDS),
+    unique_key=("run_id", "scenario", "period_end"),
+    sort_key=("scenario", "period_end"),
+    semantic_validator=_validate_dcf_cashflows_v1,
+)
+
+MODEL_DCF_RESULTS_V1_FIELDS: Final = {
+    "schema_version": pl.UInt16,
+    "run_id": pl.String,
+    "scenario": pl.String,
+    "terminal_value": pl.Float64,
+    "terminal_pv": pl.Float64,
+    "enterprise_value": pl.Float64,
+    "equity_value": pl.Float64,
+    "per_share_value": pl.Float64,
+    "currency": pl.String,
+    "value_unit": pl.String,
+    "share_unit": pl.String,
+    "per_share_unit": pl.String,
+    "wacc": pl.Float64,
+    "discount_convention": pl.String,
+    "terminal_method": pl.String,
+    "terminal_ev_share": pl.Float64,
+}
+MODEL_DCF_RESULTS_V1: Final = DatasetContract(
+    name="model.dcf-results",
+    version=1,
+    schema=pl.Schema(MODEL_DCF_RESULTS_V1_FIELDS),
+    non_nullable=tuple(MODEL_DCF_RESULTS_V1_FIELDS),
+    unique_key=("run_id", "scenario"),
+    sort_key=("scenario",),
+    semantic_validator=_validate_dcf_results_v1,
+)
+
+MODEL_DCF_SENSITIVITY_V1_FIELDS: Final = {
+    "schema_version": pl.UInt16,
+    "run_id": pl.String,
+    "scenario": pl.String,
+    "wacc": pl.Float64,
+    "terminal_growth": pl.Float64,
+    "per_share_value": pl.Float64,
+    "currency": pl.String,
+    "share_unit": pl.String,
+    "per_share_unit": pl.String,
+}
+MODEL_DCF_SENSITIVITY_V1: Final = DatasetContract(
+    name="model.dcf-sensitivity",
+    version=1,
+    schema=pl.Schema(MODEL_DCF_SENSITIVITY_V1_FIELDS),
+    non_nullable=tuple(MODEL_DCF_SENSITIVITY_V1_FIELDS),
+    unique_key=("run_id", "scenario", "wacc", "terminal_growth"),
+    sort_key=("scenario", "terminal_growth", "wacc"),
+    semantic_validator=_validate_dcf_sensitivity_v1,
+)
+
+MODEL_RECONCILIATION_V1_FIELDS: Final = {
+    "schema_version": pl.UInt16,
+    "run_id": pl.String,
+    "scenario": pl.String,
+    "check": pl.String,
+    "actual": pl.Float64,
+    "expected": pl.Float64,
+    "difference": pl.Float64,
+    "passed": pl.Boolean,
+    "status": pl.String,
+    "unit": pl.String,
+}
+MODEL_DCF_RECONCILIATION_V1: Final = DatasetContract(
+    name="model.dcf-reconciliation",
+    version=1,
+    schema=pl.Schema(MODEL_RECONCILIATION_V1_FIELDS),
+    non_nullable=tuple(MODEL_RECONCILIATION_V1_FIELDS),
+    unique_key=("run_id", "scenario", "check"),
+    sort_key=("scenario", "check"),
+    semantic_validator=_validate_dcf_reconciliation_v1,
+)
+
+MODEL_COMPS_OBSERVATIONS_V1_FIELDS: Final[
+    dict[str, pl.DataType | type[pl.DataType]]
+] = {
+    "schema_version": pl.UInt16,
+    "provider": pl.String,
+    "company_id": pl.String,
+    "company_name": pl.String,
+    "role": pl.String,
+    "metric": pl.String,
+    "period_basis": pl.String,
+    "period_end": pl.Date,
+    "knowledge_date": pl.Date,
+    "as_of": pl.Date,
+    "value": pl.Float64,
+    "unit": pl.String,
+    "currency": pl.String,
+    "source_id": pl.String,
+    "source_artifact_id": pl.String,
+    "normalized_at": pl.Datetime("us", "UTC"),
+}
+
+
+def _validate_comps_observations_v1(frame: pl.DataFrame) -> None:
+    allowed_metrics = {
+        "market_cap",
+        "net_debt",
+        "revenue",
+        "ebitda",
+        "ebit",
+        "eps",
+        "share_price",
+        "diluted_shares",
+    }
+    for row in frame.iter_rows(named=True):
+        if row["role"] not in {"target", "peer"}:
+            raise _semantic_error(
+                "model.comps-observations.v1", "role must be target or peer"
+            )
+        if row["metric"] not in allowed_metrics:
+            raise _semantic_error(
+                "model.comps-observations.v1", "metric is not controlled"
+            )
+        if row["period_basis"] not in {"current", "LTM", "NTM"}:
+            raise _semantic_error(
+                "model.comps-observations.v1", "period_basis is not controlled"
+            )
+        if row["knowledge_date"] > row["as_of"]:
+            raise _semantic_error(
+                "model.comps-observations.v1", "knowledge_date must not be after as_of"
+            )
+        if row["currency"] not in CURRENCY_CODES:
+            raise _semantic_error(
+                "model.comps-observations.v1",
+                "currency must be controlled and non-null",
+            )
+        if not math.isfinite(row["value"]):
+            raise _semantic_error("model.comps-observations.v1", "value must be finite")
+        metric = row["metric"]
+        currency = row["currency"]
+        if metric in {"market_cap", "net_debt", "revenue", "ebitda", "ebit"}:
+            if row["unit"] not in _amount_units(currency):
+                raise _semantic_error(
+                    "model.comps-observations.v1",
+                    "amount metric unit must be a controlled currency amount scale",
+                )
+            if metric == "market_cap" and row["value"] <= 0:
+                raise _semantic_error(
+                    "model.comps-observations.v1", "market_cap must be positive"
+                )
+        elif metric in {"share_price", "eps"}:
+            if row["unit"] != f"{currency}/share":
+                raise _semantic_error(
+                    "model.comps-observations.v1",
+                    "share_price and eps unit must be CURRENCY/share",
+                )
+            if metric == "share_price" and row["value"] <= 0:
+                raise _semantic_error(
+                    "model.comps-observations.v1", "share_price must be positive"
+                )
+        elif metric == "diluted_shares" and row["unit"] not in {
+            "shares",
+            "shares_k",
+            "shares_m",
+            "shares_b",
+        }:
+            raise _semantic_error(
+                "model.comps-observations.v1",
+                "diluted_shares unit must be a controlled share scale",
+            )
+        elif metric == "diluted_shares" and row["value"] <= 0:
+            raise _semantic_error(
+                "model.comps-observations.v1", "diluted_shares must be positive"
+            )
+
+
+MODEL_COMPS_OBSERVATIONS_V1: Final = DatasetContract(
+    name="model.comps-observations",
+    version=1,
+    schema=pl.Schema(MODEL_COMPS_OBSERVATIONS_V1_FIELDS),
+    non_nullable=(
+        "schema_version",
+        "provider",
+        "company_id",
+        "company_name",
+        "role",
+        "metric",
+        "period_basis",
+        "period_end",
+        "knowledge_date",
+        "as_of",
+        "value",
+        "unit",
+        "currency",
+        "source_id",
+        "source_artifact_id",
+        "normalized_at",
+    ),
+    unique_key=(
+        "company_id",
+        "metric",
+        "period_basis",
+        "period_end",
+        "knowledge_date",
+        "as_of",
+        "source_id",
+    ),
+    sort_key=("company_id", "metric", "period_basis", "knowledge_date", "source_id"),
+    semantic_validator=_validate_comps_observations_v1,
+)
+MODEL_COMPS_INPUTS_V1: Final = DatasetContract(
+    name="model.comps-inputs",
+    version=1,
+    schema=pl.Schema(MODEL_COMPS_OBSERVATIONS_V1_FIELDS),
+    non_nullable=MODEL_COMPS_OBSERVATIONS_V1.non_nullable,
+    unique_key=MODEL_COMPS_OBSERVATIONS_V1.unique_key,
+    sort_key=MODEL_COMPS_OBSERVATIONS_V1.sort_key,
+    semantic_validator=_validate_comps_observations_v1,
+)
+
+
+def _validate_comps_outputs_v1(frame: pl.DataFrame, contract: str) -> None:
+    _validate_finite_model_values(frame, contract)
+    for row in frame.iter_rows(named=True):
+        if row["multiple"] not in {"ev_revenue", "ev_ebitda", "ev_ebit", "pe"}:
+            raise _semantic_error(contract, "multiple is not controlled")
+        if row["unit"] != "x":
+            raise _semantic_error(contract, "multiple unit must be x")
+        if row["currency"] not in CURRENCY_CODES:
+            raise _semantic_error(contract, "currency is not controlled")
+        if row["period_basis"] not in {"current", "LTM", "NTM"}:
+            raise _semantic_error(contract, "period_basis is not controlled")
+        if "role" in frame.columns and row["role"] not in {"target", "peer"}:
+            raise _semantic_error(contract, "role is not controlled")
+        if "statistic" in frame.columns and row["statistic"] not in {
+            "min",
+            "p25",
+            "median",
+            "mean",
+            "p75",
+            "max",
+        }:
+            raise _semantic_error(contract, "statistic is not controlled")
+        if "count" in frame.columns and row["count"] <= 0:
+            raise _semantic_error(contract, "count must be positive")
+
+
+MODEL_COMPS_RESULTS_V1_FIELDS: Final = {
+    "schema_version": pl.UInt16,
+    "run_id": pl.String,
+    "company_id": pl.String,
+    "role": pl.String,
+    "multiple": pl.String,
+    "value": pl.Float64,
+    "unit": pl.String,
+    "currency": pl.String,
+    "period_basis": pl.String,
+}
+MODEL_COMPS_RESULTS_V1: Final = DatasetContract(
+    name="model.comps-results",
+    version=1,
+    schema=pl.Schema(MODEL_COMPS_RESULTS_V1_FIELDS),
+    non_nullable=tuple(MODEL_COMPS_RESULTS_V1_FIELDS),
+    unique_key=("run_id", "company_id", "multiple"),
+    sort_key=("multiple", "company_id"),
+    semantic_validator=lambda frame: _validate_comps_outputs_v1(
+        frame, "model.comps-results.v1"
+    ),
+)
+MODEL_COMPS_SUMMARY_V1_FIELDS: Final = {
+    "schema_version": pl.UInt16,
+    "run_id": pl.String,
+    "multiple": pl.String,
+    "statistic": pl.String,
+    "value": pl.Float64,
+    "count": pl.Int64,
+    "unit": pl.String,
+    "currency": pl.String,
+    "period_basis": pl.String,
+}
+MODEL_COMPS_SUMMARY_V1: Final = DatasetContract(
+    name="model.comps-summary",
+    version=1,
+    schema=pl.Schema(MODEL_COMPS_SUMMARY_V1_FIELDS),
+    non_nullable=tuple(MODEL_COMPS_SUMMARY_V1_FIELDS),
+    unique_key=("run_id", "multiple", "statistic"),
+    sort_key=("multiple", "statistic"),
+    semantic_validator=lambda frame: _validate_comps_outputs_v1(
+        frame, "model.comps-summary.v1"
+    ),
+)
+MODEL_COMPS_RECONCILIATION_V1: Final = DatasetContract(
+    name="model.comps-reconciliation",
+    version=1,
+    schema=pl.Schema(MODEL_RECONCILIATION_V1_FIELDS),
+    non_nullable=tuple(MODEL_RECONCILIATION_V1_FIELDS),
+    unique_key=("run_id", "scenario", "check"),
+    sort_key=("scenario", "check"),
+    semantic_validator=_validate_reconciliation_v1,
+)
+
+MODEL_PROJECTION_ASSESSMENT_V1_FIELDS: Final = {
+    "schema_version": pl.UInt16,
+    "run_id": pl.String,
+    "status": pl.String,
+    "reason": pl.String,
+    "as_of": pl.Date,
+}
+
+
+def _validate_projection_assessment_v1(frame: pl.DataFrame) -> None:
+    if any(value not in {"required", "not_required"} for value in frame["status"]):
+        raise _semantic_error(
+            "model.projection-assessment.v1", "status is not controlled"
+        )
+
+
+MODEL_PROJECTION_ASSESSMENT_V1: Final = DatasetContract(
+    name="model.projection-assessment",
+    version=1,
+    schema=pl.Schema(MODEL_PROJECTION_ASSESSMENT_V1_FIELDS),
+    non_nullable=tuple(MODEL_PROJECTION_ASSESSMENT_V1_FIELDS),
+    unique_key=("run_id", "reason"),
+    sort_key=("reason",),
+    semantic_validator=_validate_projection_assessment_v1,
+)
+
 CONTRACTS: Final = {
     RAW_YFINANCE_DAILY_PRICES_V1.identifier: RAW_YFINANCE_DAILY_PRICES_V1,
     RAW_SEC_SUBMISSIONS_V1.identifier: RAW_SEC_SUBMISSIONS_V1,
@@ -914,6 +1439,17 @@ CONTRACTS: Final = {
     DERIVED_INSTRUMENT_MASTER_CURRENT_V1.identifier: (
         DERIVED_INSTRUMENT_MASTER_CURRENT_V1
     ),
+    MODEL_DCF_INPUTS_V1.identifier: MODEL_DCF_INPUTS_V1,
+    MODEL_DCF_CASHFLOWS_V1.identifier: MODEL_DCF_CASHFLOWS_V1,
+    MODEL_DCF_RESULTS_V1.identifier: MODEL_DCF_RESULTS_V1,
+    MODEL_DCF_SENSITIVITY_V1.identifier: MODEL_DCF_SENSITIVITY_V1,
+    MODEL_DCF_RECONCILIATION_V1.identifier: MODEL_DCF_RECONCILIATION_V1,
+    MODEL_COMPS_OBSERVATIONS_V1.identifier: MODEL_COMPS_OBSERVATIONS_V1,
+    MODEL_COMPS_INPUTS_V1.identifier: MODEL_COMPS_INPUTS_V1,
+    MODEL_COMPS_RESULTS_V1.identifier: MODEL_COMPS_RESULTS_V1,
+    MODEL_COMPS_SUMMARY_V1.identifier: MODEL_COMPS_SUMMARY_V1,
+    MODEL_COMPS_RECONCILIATION_V1.identifier: MODEL_COMPS_RECONCILIATION_V1,
+    MODEL_PROJECTION_ASSESSMENT_V1.identifier: MODEL_PROJECTION_ASSESSMENT_V1,
 }
 
 

@@ -121,6 +121,20 @@ uv run finresearch --workspace /path/to/research-artifacts \
   data reconcile-instrument-master aapl-2026-08-11 --as-of 2026-08-11
 ```
 
+Run an auditable case-backed DCF or declared comparable-company analysis:
+
+```bash
+uv run finresearch --workspace /path/to/research-artifacts \
+  model dcf aapl-2026-08-11 --input analysis/dcf-inputs.toml --scenario all
+
+uv run finresearch --workspace /path/to/research-artifacts \
+  model comps aapl-2026-08-11 --input ARTIFACT_ID --as-of 2026-08-11 \
+  --metrics ev_revenue,ev_ebitda
+```
+
+See [the modeling contract](docs/modeling.md) for strict source-provenance,
+input, and projection-gate requirements.
+
 Validate and summarize the human-edited research registers (evidence,
 assumptions, scenarios, catalysts, open questions):
 

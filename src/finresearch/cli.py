@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
-from typing import Annotated, NoReturn
+from typing import Annotated, Literal, NoReturn, cast
 
 import typer
 
@@ -38,6 +38,7 @@ from finresearch.local_import import (
     import_parquet,
     parse_import_timestamp,
 )
+from finresearch.modeling import projection_assessment, run_comps, run_dcf
 from finresearch.normalization import (
     normalize_daily_prices,
     normalize_fundamental_facts,
@@ -53,9 +54,11 @@ app = typer.Typer(
 )
 case_app = typer.Typer(help="Inspect and manage research cases.")
 data_app = typer.Typer(help="Ingest and inspect research data.")
+model_app = typer.Typer(help="Run auditable deterministic valuation models.")
 register_app = typer.Typer(help="Validate and summarize research registers.")
 app.add_typer(case_app, name="case")
 app.add_typer(data_app, name="data")
+app.add_typer(model_app, name="model")
 data_app.add_typer(register_app, name="registers")
 
 WorkspaceOption = Annotated[
@@ -158,6 +161,34 @@ SourceArtifactOption = Annotated[
         "--source-artifact-id",
         help="Restrict reconciliation to raw source artifact ids; repeatable.",
     ),
+]
+DCFInputPathOption = Annotated[
+    str,
+    typer.Option("--input", help="Case-relative path to strict dcf-inputs.toml."),
+]
+CompsInputArtifactOption = Annotated[
+    str,
+    typer.Option("--input", help="Artifact id for model.comps-observations.v1."),
+]
+ScenarioOption = Annotated[
+    str,
+    typer.Option("--scenario", help="DCF scenario: bear, base, bull, or all."),
+]
+SensitivityOption = Annotated[
+    str | None,
+    typer.Option(
+        "--sensitivity",
+        help="WACC values; terminal-growth values, e.g. 0.08,0.1;0.01,0.02.",
+    ),
+]
+MetricsOption = Annotated[
+    str,
+    typer.Option(
+        "--metrics", help="Comma-separated multiples: ev_revenue,ev_ebitda,ev_ebit,pe."
+    ),
+]
+TargetOption = Annotated[
+    str | None, typer.Option("--target", help="Declared target company_id.")
 ]
 
 
@@ -494,6 +525,88 @@ def reconcile_instrument_master_command(
     print_ingestion_receipt(receipt)
 
 
+@model_app.command("dcf")
+def model_dcf_command(
+    ctx: typer.Context,
+    case_id: CaseIdArgument,
+    input_path: DCFInputPathOption = "analysis/dcf-inputs.toml",
+    scenario: ScenarioOption = "all",
+    sensitivity: SensitivityOption = None,
+) -> None:
+    """Run the strict case-backed DCF model and register all typed outputs."""
+    try:
+        receipt = run_dcf(
+            state_from_context(ctx).workspace,
+            case_id,
+            input_path=input_path,
+            scenario=cast_dcf_scenario(scenario),
+            sensitivity=parse_dcf_sensitivity(sensitivity),
+        )
+    except (
+        CaseContractError,
+        DataContractError,
+        IngestionError,
+        ValueError,
+        OSError,
+    ) as exc:
+        fail(str(exc))
+    print_model_run(receipt)
+
+
+@model_app.command("comps")
+def model_comps_command(
+    ctx: typer.Context,
+    case_id: CaseIdArgument,
+    input_artifact_id: CompsInputArtifactOption,
+    as_of: AsOfOption,
+    metrics: MetricsOption,
+    target: TargetOption = None,
+) -> None:
+    """Compute declared comparable-company multiples without peer discovery."""
+    try:
+        receipt = run_comps(
+            state_from_context(ctx).workspace,
+            case_id,
+            input_artifact_id=input_artifact_id,
+            as_of=parse_iso_date(as_of, "as_of"),
+            metrics=tuple(item.strip() for item in metrics.split(",") if item.strip()),
+            target=target,
+        )
+    except (
+        CaseContractError,
+        DataContractError,
+        IngestionError,
+        ValueError,
+        OSError,
+    ) as exc:
+        fail(str(exc))
+    print_model_run(receipt)
+
+
+@model_app.command("projection-assess")
+def model_projection_assess_command(
+    ctx: typer.Context,
+    case_id: CaseIdArgument,
+    input_path: DCFInputPathOption = "analysis/dcf-inputs.toml",
+) -> None:
+    """Record whether explicit disclosed needs require later projections."""
+    try:
+        receipt = projection_assessment(
+            state_from_context(ctx).workspace,
+            case_id,
+            input_path=input_path,
+        )
+    except (
+        CaseContractError,
+        DataContractError,
+        IngestionError,
+        ValueError,
+        OSError,
+    ) as exc:
+        fail(str(exc))
+    print_model_run(receipt)
+
+
 @register_app.command("status")
 def show_registers_status(ctx: typer.Context, case_id: CaseIdArgument) -> None:
     """Validate and summarize the case research registers."""
@@ -549,6 +662,43 @@ def print_local_import_receipt(receipt: LocalImportReceipt) -> None:
     typer.echo(f"path: {receipt.normalized.path}")
     typer.echo(f"rows: {receipt.normalized.row_count}")
     typer.echo(f"sha256: {receipt.normalized.sha256}")
+
+
+def cast_dcf_scenario(value: str) -> Literal["bear", "base", "bull", "all"]:
+    """Validate the compact CLI scenario token before model execution."""
+    if value not in {"bear", "base", "bull", "all"}:
+        raise IngestionError("scenario must be bear, base, bull, or all")
+    return cast(Literal["bear", "base", "bull", "all"], value)
+
+
+def parse_dcf_sensitivity(
+    value: str | None,
+) -> tuple[tuple[float, ...], tuple[float, ...]] | None:
+    """Parse explicit WACC;growth grids without accepting inferred values."""
+    if value is None:
+        return None
+    parts = value.split(";")
+    if len(parts) != 2:
+        raise IngestionError("sensitivity must be WACCS;GROWTHS")
+    try:
+        waccs = tuple(float(item) for item in parts[0].split(",") if item)
+        growths = tuple(float(item) for item in parts[1].split(",") if item)
+    except ValueError as exc:
+        raise IngestionError("sensitivity values must be decimals") from exc
+    if not waccs or not growths:
+        raise IngestionError("sensitivity must contain WACCS and GROWTHS")
+    return waccs, growths
+
+
+def print_model_run(run: object) -> None:
+    """Print only stable run/artifact identifiers for all model commands."""
+    from finresearch.modeling import ModelRun
+
+    if not isinstance(run, ModelRun):
+        raise RuntimeError("unexpected model receipt")
+    typer.echo(f"run_id: {run.run_id}")
+    for receipt in run.receipts:
+        typer.echo(f"artifact: {receipt.artifact_id}")
 
 
 def print_artifact_inspection(inspection: ArtifactInspection) -> None:

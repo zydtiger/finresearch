@@ -438,6 +438,7 @@ def publish_snapshot(
     input_artifact_ids: tuple[str, ...],
     produced_at: datetime,
     source: str | None = None,
+    extra_input_file_hashes: tuple[InputFileHash, ...] = (),
 ) -> IngestionReceipt:
     """Publish a deterministic Parquet artifact and return its row receipt."""
     if manifest.manifest_version == MANIFEST_V2 and source is not None:
@@ -468,6 +469,7 @@ def publish_snapshot(
             statistics=True,
         ),
         source=source,
+        extra_input_file_hashes=extra_input_file_hashes,
     )
     return IngestionReceipt(
         artifact_id=receipt.artifact_id,
@@ -495,6 +497,7 @@ def publish_artifact_bytes(
     parameters_sha256: str,
     input_artifact_ids: tuple[str, ...],
     produced_at: datetime,
+    extra_input_file_hashes: tuple[InputFileHash, ...] = (),
 ) -> ArtifactPublicationReceipt:
     """Publish deterministic normalized, derived, or report bytes safely."""
     if not filename or "/" in filename or "\\" in filename:
@@ -521,6 +524,7 @@ def publish_artifact_bytes(
         produced_at=produced_at,
         row_count=None,
         write_temporary=write_content,
+        extra_input_file_hashes=extra_input_file_hashes,
     )
 
 
@@ -541,6 +545,7 @@ def _publish_deterministic_artifact(
     row_count: int | None,
     write_temporary: Callable[[Path], None],
     source: str | None = None,
+    extra_input_file_hashes: tuple[InputFileHash, ...] = (),
 ) -> ArtifactPublicationReceipt:
     """Publish a deterministic artifact without overwriting prior state.
 
@@ -569,6 +574,11 @@ def _publish_deterministic_artifact(
             case_dir,
             current_manifest,
             input_artifact_ids,
+        )
+        input_file_hashes = _merge_input_file_hashes(
+            case_dir,
+            input_file_hashes,
+            extra_input_file_hashes,
         )
         output_path.parent.mkdir(parents=True, exist_ok=True)
         temporary_path: Path | None = None
@@ -762,6 +772,37 @@ def _input_file_hashes(
             )
         )
     return tuple(hashes)
+
+
+def _merge_input_file_hashes(
+    case_dir: Path,
+    parent_hashes: tuple[InputFileHash, ...],
+    extra_hashes: tuple[InputFileHash, ...],
+) -> tuple[InputFileHash, ...]:
+    """Append validated non-artifact inputs without changing parent bindings."""
+    names = {record.name for record in parent_hashes}
+    paths = {record.path for record in parent_hashes}
+    merged = list(parent_hashes)
+    for record in extra_hashes:
+        if record.name.startswith("artifact."):
+            raise ArtifactIntegrityError(
+                "extra input file hashes must not replace artifact parent bindings"
+            )
+        if record.name in names or record.path in paths:
+            raise ArtifactIntegrityError("duplicate deterministic input file hash")
+        path = resolve_relative_path(
+            case_dir,
+            record.path,
+            f"extra input file {record.name}",
+        )
+        if not path.is_file() or _sha256(path) != record.sha256:
+            raise ArtifactIntegrityError(
+                f"extra deterministic input checksum mismatch: {record.name}"
+            )
+        names.add(record.name)
+        paths.add(record.path)
+        merged.append(record)
+    return tuple(merged)
 
 
 def _artifact_is_registered(

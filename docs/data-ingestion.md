@@ -279,7 +279,7 @@ OHLC ordering, positive FX rates, valid action amounts, and PIT timestamp order.
 
 ```text
 finresearch --workspace PATH data import-csv CASE_ID FILE \
-  --schema instrument-master.v2|daily-prices.v2|fundamental-facts.v2|estimates.v1|corporate-actions.v1|fx-rates.v1 \
+  --schema instrument-master.v2|daily-prices.v2|fundamental-facts.v2|estimates.v1|corporate-actions.v1|fx-rates.v1|model.comps-observations.v1 \
   --provider PROVIDER --retrieved-at RFC3339_UTC
 
 finresearch --workspace PATH data import-parquet CASE_ID FILE \

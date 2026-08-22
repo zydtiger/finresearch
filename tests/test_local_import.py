@@ -68,6 +68,12 @@ def _value(name: str, dtype: pl.DataType) -> object | None:
         "rate_kind": "spot",
         "base_currency": "USD",
         "quote_currency": "EUR",
+        "company_id": "target",
+        "company_name": "Target Co.",
+        "role": "target",
+        "metric": "revenue",
+        "period_basis": "LTM",
+        "source_id": "evidence-001",
     }
     if name in {"cash_amount"}:
         return 1.0

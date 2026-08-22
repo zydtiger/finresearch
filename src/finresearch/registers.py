@@ -127,6 +127,58 @@ class RegisterStatus:
         return not self.issues
 
 
+@dataclass(frozen=True)
+class ModelSource:
+    """One date-bounded evidence or assumption record usable by a model."""
+
+    source_id: str
+    kind: str
+    effective_date: date
+
+
+def load_model_sources(case_dir: Path, *, as_of: date) -> dict[str, ModelSource]:
+    """Load strict evidence/assumption ids and reject invalid records.
+
+    This public loader deliberately uses the same register validation as the
+    CLI instead of giving models a second, permissive CSV parser. Callers apply
+    their model-specific cutoff to the returned effective dates.
+    """
+    manifest = read_manifest(case_dir)
+    registers_dir = resolve_relative_path(
+        case_dir, manifest.paths["registers"], "paths.registers"
+    )
+    status = inspect_registers(case_dir.parent.parent, manifest.case_id)
+    relevant = [
+        issue
+        for issue in status.issues
+        if issue.message.startswith("evidence.csv")
+        or issue.message.startswith("assumptions.csv")
+    ]
+    if relevant:
+        detail = "; ".join(issue.message for issue in relevant)
+        raise CaseContractError(f"model source registers are invalid: {detail}")
+    sources: dict[str, ModelSource] = {}
+    for filename, kind, date_column in (
+        ("evidence.csv", "evidence", "observed_at"),
+        ("assumptions.csv", "assumption", "updated_at"),
+    ):
+        path = registers_dir / filename
+        if not path.is_file():
+            continue
+        rows, issues = _validate_register(path)
+        if issues:
+            raise CaseContractError(f"model source register is invalid: {filename}")
+        for row in rows:
+            source_id = row.get("id", "")
+            if not source_id:
+                continue
+            effective_date = date.fromisoformat(row[date_column])
+            if source_id in sources:
+                raise CaseContractError(f"duplicate model source id: {source_id!r}")
+            sources[source_id] = ModelSource(source_id, kind, effective_date)
+    return sources
+
+
 def inspect_registers(workspace: Path, case_id: str) -> RegisterStatus:
     """Validate every present register; missing registers are not errors."""
     registers_dir = _registers_directory(workspace, case_id)

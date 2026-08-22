@@ -32,6 +32,7 @@ from finresearch.cases import (
     write_manifest,
 )
 from finresearch.data_contracts import (
+    MODEL_COMPS_OBSERVATIONS_V1,
     NORMALIZED_CORPORATE_ACTIONS_V1,
     NORMALIZED_DAILY_PRICES_V2,
     NORMALIZED_ESTIMATES_V1,
@@ -136,6 +137,13 @@ IMPORT_SCHEMAS: Final[dict[str, LocalImportSchema]] = {
     "fx-rates.v1": _schema(
         "fx-rates.v1",
         NORMALIZED_FX_RATES_V1,
+        frozenset(
+            {"schema_version", "provider", "source_artifact_id", "normalized_at"}
+        ),
+    ),
+    "model.comps-observations.v1": _schema(
+        "model.comps-observations.v1",
+        MODEL_COMPS_OBSERVATIONS_V1,
         frozenset(
             {"schema_version", "provider", "source_artifact_id", "normalized_at"}
         ),
