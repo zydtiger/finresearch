@@ -11,10 +11,13 @@ uses research state receives the workspace explicitly with `--workspace`.
 
 ## Setup
 
-Install the CLI directly from the public Git repository:
+Choose the most recent published `vX.Y.Z` tag from
+[GitHub Releases](https://github.com/zydtiger/finresearch/releases), then
+install the CLI from that immutable tag. Replace `vX.Y.Z` below with the tag
+you selected:
 
 ```bash
-uv tool install git+https://github.com/zydtiger/finresearch.git
+uv tool install git+https://github.com/zydtiger/finresearch.git@vX.Y.Z
 ```
 
 For development from a source checkout:
@@ -30,10 +33,11 @@ is distributed independently from the executable through `skillctl` file mode:
 
 ```bash
 skillctl add --global https://github.com/zydtiger/finresearch.git \
-  --file SKILL.md --name finresearch-skill --ref main
+  --file SKILL.md --name finresearch-skill --ref vX.Y.Z
 ```
 
-Update an existing managed installation with:
+To follow development from `main` instead of an immutable release, explicitly
+use `--ref main`. Update a managed moving-ref installation with:
 
 ```bash
 skillctl update --global finresearch-skill

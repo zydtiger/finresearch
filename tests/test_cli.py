@@ -1,15 +1,21 @@
 from datetime import UTC, date, datetime
+from importlib.metadata import version
 from pathlib import Path
 
 import pytest
 from typer.testing import CliRunner, Result
 
+import finresearch
 from finresearch.cases import DEFAULT_PATHS, CaseManifest, write_manifest
 from finresearch.cli import app
 from finresearch.ingestion import IngestionReceipt
 from finresearch.providers.sec import SECProviderError
 
 runner = CliRunner()
+
+
+def test_package_version_comes_from_installed_metadata() -> None:
+    assert finresearch.__version__ == version("finresearch")
 
 
 def invoke(workspace: Path, *arguments: str) -> Result:

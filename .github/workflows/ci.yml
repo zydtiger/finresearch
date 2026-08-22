@@ -40,3 +40,14 @@ jobs:
 
       - name: Build distributions
         run: uv build --no-sources
+
+      - name: Validate wheel installation
+        run: |
+          wheel=$(find dist -maxdepth 1 -type f -name '*.whl' -print -quit)
+          test -n "$wheel"
+          uv venv --python 3.12 .release-venv
+          uv pip install --python .release-venv/bin/python "$wheel"
+          .release-venv/bin/python -c \
+            'import finresearch; print(finresearch.__version__)'
+          .release-venv/bin/finresearch --help
+          uv pip check --python .release-venv/bin/python
