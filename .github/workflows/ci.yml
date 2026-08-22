@@ -32,6 +32,9 @@ jobs:
 
       - name: Run repository gates
         run: |
+          # Rich forces ANSI styling when it detects GitHub Actions, which
+          # breaks plain-text CLI assertions despite identical CLI behavior.
+          unset GITHUB_ACTIONS
           uvx prek@0.4.14 run --all-files --stage pre-commit
           uvx prek@0.4.14 run --all-files --stage pre-push
 
