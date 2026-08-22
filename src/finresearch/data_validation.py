@@ -19,7 +19,12 @@ from finresearch.cases import (
     read_manifest,
     resolve_relative_path,
 )
-from finresearch.data_contracts import DataContractError, DatasetContract, get_contract
+from finresearch.data_contracts import (
+    NORMALIZED_INSTRUMENT_MASTER_V2,
+    DataContractError,
+    DatasetContract,
+    get_contract,
+)
 
 MAX_PREVIEW_ROWS = 100
 
@@ -91,6 +96,7 @@ def validate_artifact(
                 artifact,
                 manifest.manifest_version,
                 declared_ids,
+                manifest,
             )
         )
     return tuple(issues)
@@ -149,6 +155,7 @@ def _validate_artifact(
     artifact: Artifact,
     manifest_version: int,
     declared_ids: set[str],
+    manifest: CaseManifest,
 ) -> list[ValidationIssue]:
     """Apply common byte checks, then Parquet-specific dataset validation."""
     path = resolve_relative_path(
@@ -187,19 +194,23 @@ def _validate_artifact(
     return [
         *issues,
         *_validate_parquet_artifact(
+            case_dir,
             path,
             artifact,
             manifest_version,
             declared_ids,
+            manifest,
         ),
     ]
 
 
 def _validate_parquet_artifact(
+    case_dir: Path,
     path: Path,
     artifact: Artifact,
     manifest_version: int,
     declared_ids: set[str],
+    manifest: CaseManifest,
 ) -> list[ValidationIssue]:
     """Apply Parquet dataset and provenance checks after common integrity checks."""
     issues: list[ValidationIssue] = []
@@ -263,36 +274,50 @@ def _validate_parquet_artifact(
                 )
             )
 
-    if contract_valid and "source_artifact_id" in frame.columns:
+    if (
+        contract_valid
+        and not frame.is_empty()
+        and "source_artifact_id" in frame.columns
+    ):
         sources = frame.get_column("source_artifact_id").unique().to_list()
-        if len(sources) != 1 or not isinstance(sources[0], str):
+        if any(not isinstance(source, str) for source in sources):
             issues.append(
                 ValidationIssue(
                     "lineage_invalid",
-                    f"artifact {artifact.artifact_id} has inconsistent "
+                    f"artifact {artifact.artifact_id} has null or non-string "
                     f"source_artifact_id: {sources!r}",
                 )
             )
-        elif (
-            manifest_version == MANIFEST_V2
-            and sources[0] not in artifact.input_artifact_ids
-        ):
-            issues.append(
-                ValidationIssue(
-                    "lineage_invalid",
-                    f"artifact {artifact.artifact_id} source_artifact_id "
-                    f"{sources[0]!r} does not match manifest "
-                    f"input_artifact_ids {list(artifact.input_artifact_ids)!r}",
-                )
+        else:
+            observed_sources = {source for source in sources if isinstance(source, str)}
+            allowed_sources = (
+                set(artifact.input_artifact_ids)
+                if manifest_version == MANIFEST_V2
+                else declared_ids
             )
-        elif manifest_version != MANIFEST_V2 and sources[0] not in declared_ids:
-            issues.append(
-                ValidationIssue(
-                    "lineage_invalid",
-                    f"artifact {artifact.artifact_id} points at undeclared "
-                    f"source artifact {sources[0]!r}",
+            undeclared_sources = sorted(observed_sources - allowed_sources)
+            if undeclared_sources:
+                scope = (
+                    "manifest input_artifact_ids"
+                    if manifest_version == MANIFEST_V2
+                    else "declared artifact ids"
                 )
+                issues.append(
+                    ValidationIssue(
+                        "lineage_invalid",
+                        f"artifact {artifact.artifact_id} source_artifact_id values "
+                        f"{undeclared_sources!r} are not in {scope}",
+                    )
+                )
+    if contract_valid:
+        issues.extend(
+            _validate_master_currency(
+                case_dir=case_dir,
+                artifact=artifact,
+                frame=frame,
+                manifest=manifest,
             )
+        )
     return issues
 
 
@@ -328,6 +353,79 @@ def _validate_input_file_hashes(
                     f"artifact {artifact.artifact_id} input file sha256 mismatch: "
                     f"{input_file.name} ({input_file.path}); manifest "
                     f"{input_file.sha256}, file {actual}",
+                )
+            )
+    return issues
+
+
+def _validate_master_currency(
+    *,
+    case_dir: Path,
+    artifact: Artifact,
+    frame: pl.DataFrame,
+    manifest: CaseManifest,
+) -> list[ValidationIssue]:
+    """Compare every price/action key with all valid v2 master observations."""
+    if artifact.kind not in {
+        "normalized.daily-prices",
+        "normalized.corporate-actions",
+    } or artifact.schema_version not in {1, 2}:
+        return []
+    required = {"provider", "instrument_id", "currency"}
+    if not required.issubset(frame.columns):
+        return []
+    expected_by_key: dict[tuple[str, str], set[str]] = {}
+    for master in manifest.artifacts:
+        if master.kind != "normalized.instrument-master" or master.schema_version != 2:
+            continue
+        master_path = resolve_relative_path(
+            case_dir,
+            master.path,
+            f"artifact {master.artifact_id}",
+        )
+        if not master_path.is_file():
+            continue
+        try:
+            master_frame = pl.read_parquet(master_path)
+        except Exception:
+            continue
+        try:
+            NORMALIZED_INSTRUMENT_MASTER_V2.validate(master_frame)
+        except DataContractError:
+            continue
+        for row in master_frame.iter_rows(named=True):
+            provider = row["provider"]
+            instrument_id = row["instrument_id"]
+            currency = row["trading_currency"]
+            if all(
+                isinstance(value, str) for value in (provider, instrument_id, currency)
+            ):
+                expected_by_key.setdefault((provider, instrument_id), set()).add(
+                    currency
+                )
+    observed_by_key: dict[tuple[str, str], set[str]] = {}
+    for row in frame.iter_rows(named=True):
+        provider = row["provider"]
+        instrument_id = row["instrument_id"]
+        currency = row["currency"]
+        if not isinstance(provider, str) or not isinstance(instrument_id, str):
+            continue
+        # Action rows can legitimately omit a currency and make no comparison
+        # claim in that case.
+        if isinstance(currency, str):
+            observed_by_key.setdefault((provider, instrument_id), set()).add(currency)
+    issues: list[ValidationIssue] = []
+    for key in sorted(observed_by_key):
+        expected = expected_by_key.get(key, set())
+        observed = observed_by_key[key]
+        if len(expected) == 1 and observed != expected:
+            expected_currency = next(iter(expected))
+            issues.append(
+                ValidationIssue(
+                    "currency_mismatch",
+                    f"artifact {artifact.artifact_id} currency mismatch for "
+                    f"{key[0]}:{key[1]}; expected {expected_currency!r}, "
+                    f"observed {sorted(observed)!r}",
                 )
             )
     return issues

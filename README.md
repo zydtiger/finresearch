@@ -80,9 +80,10 @@ uv run finresearch \
   --user-agent "Researcher Name researcher@example.com"
 ```
 
-Derive deterministic normalized artifacts (instrument master and unadjusted
-daily price bars) from one raw yfinance snapshot. V2 manifests record ordered
-input artifact lineage, input file hashes, and producer metadata:
+Derive deterministic provider-scoped instrument-master observations,
+unadjusted daily-price bars, and separate corporate actions from one raw
+yfinance snapshot. V2 manifests record ordered input artifact lineage, input
+file hashes, and producer metadata:
 
 ```bash
 uv run finresearch \
@@ -96,6 +97,28 @@ Parse one raw SEC companyfacts snapshot into structured fundamental facts:
 uv run finresearch \
   --workspace /path/to/research-artifacts \
   data normalize-fundamental-facts aapl-2026-08-11 320193 [--raw-artifact-id ID]
+```
+
+Import an explicit local CSV or Parquet projection without guessing its schema,
+provider, or retrieval time. The command preserves the source bytes below the
+case raw directory and writes a deterministic canonical normalized Parquet:
+
+```bash
+uv run finresearch --workspace /path/to/research-artifacts \
+  data import-csv aapl-2026-08-11 ./prices.csv \
+  --schema daily-prices.v2 --provider manual --retrieved-at 2026-08-11T04:00:00Z
+
+uv run finresearch --workspace /path/to/research-artifacts \
+  data import-parquet aapl-2026-08-11 ./facts.parquet \
+  --schema fundamental-facts.v2 --provider manual --retrieved-at 2026-08-11T04:00:00Z
+```
+
+Build an explicit as-of current-state master only when the provider-scoped v2
+observations are already present:
+
+```bash
+uv run finresearch --workspace /path/to/research-artifacts \
+  data reconcile-instrument-master aapl-2026-08-11 --as-of 2026-08-11
 ```
 
 Validate and summarize the human-edited research registers (evidence,

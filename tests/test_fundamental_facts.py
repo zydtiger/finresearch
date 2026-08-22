@@ -16,7 +16,7 @@ from finresearch.cases import (
     write_manifest,
 )
 from finresearch.cli import app
-from finresearch.data_contracts import NORMALIZED_FUNDAMENTAL_FACTS_V1
+from finresearch.data_contracts import NORMALIZED_FUNDAMENTAL_FACTS_V2
 from finresearch.ingestion import IngestionError, ingest_sec_companyfacts
 from finresearch.normalization import normalize_fundamental_facts
 from finresearch.providers.sec import companyfacts_to_frame
@@ -162,9 +162,11 @@ def test_normalize_facts_value_parsing(tmp_path: Path) -> None:
     )
 
     frame = normalized_frame(workspace)
-    NORMALIZED_FUNDAMENTAL_FACTS_V1.validate(frame)
+    NORMALIZED_FUNDAMENTAL_FACTS_V2.validate(frame)
     revenues = frame.filter(pl.col("concept") == "Revenues").row(0, named=True)
-    assert revenues["value_type"] == "integer"
+    assert revenues["fact_id"]
+    assert revenues["metric_id"] == "us-gaap:Revenues"
+    assert revenues["canonical_metric"] == "revenue"
     assert revenues["value_text"] == "300000000000"
     assert revenues["value"] == 300_000_000_000.0
     assert revenues["period_type"] == "duration"
@@ -179,7 +181,6 @@ def test_normalize_facts_value_parsing(tmp_path: Path) -> None:
         0,
         named=True,
     )
-    assert public_float["value_type"] == "number"
     assert public_float["value"] == 2_500_000_000_000.5
     assert public_float["period_type"] == "instant"
     assert public_float["start_date"] is None
@@ -197,6 +198,31 @@ def test_normalize_facts_removes_exact_duplicates(tmp_path: Path) -> None:
     )
 
     assert normalized_frame(workspace).height == 2
+
+
+def test_normalize_facts_preserves_source_context_distinctions(tmp_path: Path) -> None:
+    base = fixture_frame().head(1)
+    differentiated = [
+        base,
+        base.with_columns(pl.lit("Q2").alias("fiscal_period")),
+        base.with_columns(pl.lit("10-K").alias("form")),
+        base.with_columns(pl.lit("Revenue (restated)").alias("label")),
+        base,
+    ]
+    workspace = build_facts_case(tmp_path, frame=pl.concat(differentiated))
+    normalize_fundamental_facts(
+        workspace,
+        "aapl",
+        CIK,
+        normalized_at=NORMALIZED_AT,
+    )
+
+    output = normalized_frame(workspace)
+    assert output.height == 4
+    assert output.get_column("fact_id").n_unique() == 4
+    assert "Q2" in output.get_column("fiscal_period").to_list()
+    assert "10-K" in output.get_column("form").to_list()
+    assert "Revenue (restated)" in output.get_column("label").to_list()
 
 
 def test_normalize_facts_string_values_stay_unparsed(tmp_path: Path) -> None:

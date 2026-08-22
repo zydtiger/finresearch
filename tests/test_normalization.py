@@ -18,8 +18,8 @@ from finresearch.cases import (
 )
 from finresearch.cli import app
 from finresearch.data_contracts import (
-    NORMALIZED_DAILY_PRICES_V1,
-    NORMALIZED_INSTRUMENT_MASTER_V1,
+    NORMALIZED_DAILY_PRICES_V2,
+    NORMALIZED_INSTRUMENT_MASTER_V2,
     RAW_YFINANCE_DAILY_PRICES_V1,
 )
 from finresearch.ingestion import (
@@ -28,14 +28,17 @@ from finresearch.ingestion import (
     ingest_yfinance_daily_prices,
     publish_snapshot,
 )
-from finresearch.normalization import normalize_daily_prices
+from finresearch.normalization import (
+    normalize_daily_prices,
+    reconcile_instrument_master,
+)
 
 runner = CliRunner()
 
 RETRIEVED_AT = datetime(2026, 8, 11, 3, 12, 45, 123456, tzinfo=UTC)
 NORMALIZED_AT = datetime(2026, 8, 11, 4, 0, 0, tzinfo=UTC)
 SYMBOL = "AAPL"
-INSTRUMENT_ID = "aapl"
+INSTRUMENT_ID = "yfinance.aapl"
 
 
 def invoke(workspace: Path, *arguments: str) -> Result:
@@ -196,9 +199,14 @@ def test_normalize_writes_master_and_prices(tmp_path: Path) -> None:
     )
 
     assert receipt.instrument_master.artifact_id.startswith(
-        "normalized.instrument-master.aapl."
+        "normalized.instrument-master.yfinance.aapl."
     )
-    assert receipt.daily_prices.artifact_id.startswith("normalized.daily-prices.aapl.")
+    assert receipt.daily_prices.artifact_id.startswith(
+        "normalized.daily-prices.yfinance.aapl."
+    )
+    assert receipt.corporate_actions.artifact_id.startswith(
+        "normalized.corporate-actions.yfinance.aapl."
+    )
     master, prices = normalized_artifacts(workspace)
     assert master.path.startswith("data/normalized/normalized.instrument-master/")
     assert prices.path.startswith("data/normalized/normalized.daily-prices/")
@@ -219,6 +227,84 @@ def test_normalize_outputs_pass_data_validate(tmp_path: Path) -> None:
     assert "valid: all declared artifacts of aapl" in result.output
 
 
+def test_reconcile_v2_instrument_master_is_deterministic_and_lineaged(
+    tmp_path: Path,
+) -> None:
+    workspace = build_raw_case(tmp_path)
+    normalize_daily_prices(workspace, "aapl", SYMBOL, normalized_at=NORMALIZED_AT)
+
+    first = reconcile_instrument_master(
+        workspace,
+        "aapl",
+        as_of=date(2026, 8, 11),
+    )
+    second = reconcile_instrument_master(
+        workspace,
+        "aapl",
+        as_of=date(2026, 8, 11),
+    )
+
+    assert second == first
+    manifest = read_manifest(workspace / "cases" / "aapl")
+    derived = next(
+        artifact
+        for artifact in manifest.artifacts
+        if artifact.kind == "derived.instrument-master-current"
+    )
+    assert len(derived.input_artifact_ids) == 2
+    assert (
+        invoke(workspace, "data", "validate", "aapl", derived.artifact_id).exit_code
+        == 0
+    )
+
+
+def test_reconcile_canonicalizes_filter_and_parent_order(tmp_path: Path) -> None:
+    workspace = build_raw_case(tmp_path, snapshots=2)
+    manifest = read_manifest(workspace / "cases" / "aapl")
+    raw_ids = tuple(
+        artifact.artifact_id
+        for artifact in manifest.artifacts
+        if artifact.kind == "raw.yfinance.daily-prices"
+    )
+    normalize_daily_prices(
+        workspace,
+        "aapl",
+        SYMBOL,
+        raw_artifact_id=raw_ids[0],
+        normalized_at=NORMALIZED_AT,
+    )
+    normalize_daily_prices(
+        workspace,
+        "aapl",
+        SYMBOL,
+        raw_artifact_id=raw_ids[1],
+        normalized_at=NORMALIZED_AT.replace(minute=30),
+    )
+
+    first = reconcile_instrument_master(
+        workspace,
+        "aapl",
+        as_of=date(2026, 8, 11),
+        source_artifact_ids=raw_ids,
+    )
+    second = reconcile_instrument_master(
+        workspace,
+        "aapl",
+        as_of=date(2026, 8, 11),
+        source_artifact_ids=(raw_ids[1], raw_ids[0], raw_ids[0]),
+    )
+
+    assert second == first
+    manifest = read_manifest(workspace / "cases" / "aapl")
+    derived = [
+        artifact
+        for artifact in manifest.artifacts
+        if artifact.kind == "derived.instrument-master-current"
+    ]
+    assert len(derived) == 1
+    assert derived[0].input_artifact_ids == tuple(sorted(derived[0].input_artifact_ids))
+
+
 def test_normalize_master_fields(tmp_path: Path) -> None:
     workspace = build_raw_case(tmp_path, rows=2)
     normalize_daily_prices(workspace, "aapl", SYMBOL, normalized_at=NORMALIZED_AT)
@@ -234,16 +320,13 @@ def test_normalize_master_fields(tmp_path: Path) -> None:
         )
     )
     frame = pl.read_parquet(master_path)
-    NORMALIZED_INSTRUMENT_MASTER_V1.validate(frame)
+    NORMALIZED_INSTRUMENT_MASTER_V2.validate(frame)
     row = frame.row(0, named=True)
     assert row["instrument_id"] == INSTRUMENT_ID
     assert row["provider_symbol"] == SYMBOL
-    assert row["currency"] == "USD"
-    assert row["provider_timezone"] == "America/New_York"
-    assert row["first_session_date"] == date(2026, 1, 2)
-    assert row["last_session_date"] == date(2026, 1, 3)
-    assert row["observation_count"] == 2
-    assert row["normalized_at"] == NORMALIZED_AT
+    assert row["trading_currency"] == "USD"
+    assert row["asset_class"] == "unknown"
+    assert row["observed_at"] == NORMALIZED_AT
 
 
 def test_normalize_prices_fields(tmp_path: Path) -> None:
@@ -261,7 +344,7 @@ def test_normalize_prices_fields(tmp_path: Path) -> None:
         )
     )
     frame = pl.read_parquet(prices_path)
-    NORMALIZED_DAILY_PRICES_V1.validate(frame)
+    NORMALIZED_DAILY_PRICES_V2.validate(frame)
     row = frame.row(0, named=True)
     assert row["instrument_id"] == INSTRUMENT_ID
     assert row["provider_symbol"] == SYMBOL
@@ -287,8 +370,11 @@ def test_normalize_carries_currency_from_raw_snapshot(tmp_path: Path) -> None:
         ):
             continue
         frame = pl.read_parquet(workspace / "cases" / "aapl" / artifact.path)
-        assert frame["currency"].unique().to_list() == ["HKD"]
-        assert frame["instrument_id"].unique().to_list() == ["0700.hk"]
+        currency_column = (
+            "trading_currency" if "trading_currency" in frame.columns else "currency"
+        )
+        assert frame[currency_column].unique().to_list() == ["HKD"]
+        assert frame["instrument_id"].unique().to_list() == ["yfinance.0700.hk"]
 
 
 def test_normalize_lineage_points_at_raw_artifact(tmp_path: Path) -> None:
@@ -336,7 +422,9 @@ def test_normalize_multiple_snapshots_requires_selection(tmp_path: Path) -> None
         raw_artifact_id=raw_ids[0],
         normalized_at=NORMALIZED_AT,
     )
-    assert receipt.daily_prices.artifact_id.startswith("normalized.daily-prices.aapl.")
+    assert receipt.daily_prices.artifact_id.startswith(
+        "normalized.daily-prices.yfinance.aapl."
+    )
 
 
 def test_normalize_rejects_duplicate_session_dates(tmp_path: Path) -> None:
@@ -374,7 +462,7 @@ def test_normalize_rerun_appends_second_pair(tmp_path: Path) -> None:
         for artifact in manifest.artifacts
         if artifact.kind.startswith("normalized.")
     ]
-    assert len(normalized) == 4
+    assert len(normalized) == 6
 
 
 def test_normalize_deterministic_rerun_reuses_receipts_and_bytes(
@@ -395,7 +483,7 @@ def test_normalize_deterministic_rerun_reuses_receipts_and_bytes(
     normalized = [
         item for item in manifest.artifacts if item.kind.startswith("normalized.")
     ]
-    assert len(normalized) == 2
+    assert len(normalized) == 3
 
 
 def test_normalize_recovers_after_interrupt_between_pair_publications(
@@ -468,6 +556,10 @@ def test_normalize_recovers_after_interrupt_between_pair_publications(
     )
     assert master_count == 1
     assert prices_count == 1
+    assert (
+        sum(artifact.kind == "normalized.corporate-actions" for artifact in normalized)
+        == 1
+    )
 
 
 def test_deterministic_publish_rejects_conflicting_bytes_without_overwrite(
@@ -485,7 +577,7 @@ def test_deterministic_publish_rejects_conflicting_bytes_without_overwrite(
     master_path = case_dir / master.path
     original_bytes = master_path.read_bytes()
     conflicting_frame = pl.read_parquet(master_path).with_columns(
-        pl.lit(2, dtype=pl.Int64).alias("observation_count")
+        pl.lit("equity").alias("asset_class")
     )
 
     with pytest.raises(ArtifactIntegrityError, match="metadata conflict"):
@@ -494,7 +586,7 @@ def test_deterministic_publish_rejects_conflicting_bytes_without_overwrite(
             manifest=manifest,
             path_role="normalized",
             frame=conflicting_frame,
-            contract=NORMALIZED_INSTRUMENT_MASTER_V1,
+            contract=NORMALIZED_INSTRUMENT_MASTER_V2,
             path_parts=("normalized.instrument-master", INSTRUMENT_ID),
             entity_key=INSTRUMENT_ID,
             identity=master.parameters_sha256 or "",
@@ -517,8 +609,9 @@ def test_normalize_cli_reports_both_receipts(tmp_path: Path) -> None:
     assert result.exit_code == 0
     assert "normalized instrument-master:" in result.output
     assert "normalized daily-prices:" in result.output
-    assert "artifact: normalized.instrument-master.aapl." in result.output
-    assert "artifact: normalized.daily-prices.aapl." in result.output
+    assert "artifact: normalized.instrument-master.yfinance.aapl." in result.output
+    assert "artifact: normalized.daily-prices.yfinance.aapl." in result.output
+    assert "normalized corporate-actions:" in result.output
 
 
 def test_normalize_cli_v1_without_manifest_retrieved_at_is_deterministic(
@@ -538,10 +631,15 @@ def test_normalize_cli_v1_without_manifest_retrieved_at_is_deterministic(
         if artifact.kind.startswith("normalized.")
     ]
     assert manifest.manifest_version == 1
-    assert len(normalized) == 2
+    assert len(normalized) == 3
     for artifact in normalized:
         frame = pl.read_parquet(workspace / "cases" / "aapl" / artifact.path)
-        assert frame.get_column("normalized_at").unique().to_list() == [RETRIEVED_AT]
+        if frame.is_empty():
+            continue
+        timestamp_column = (
+            "observed_at" if "observed_at" in frame.columns else "normalized_at"
+        )
+        assert frame.get_column(timestamp_column).unique().to_list() == [RETRIEVED_AT]
 
 
 def test_normalize_cli_failure_exits_nonzero(tmp_path: Path) -> None:

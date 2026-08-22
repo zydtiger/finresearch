@@ -649,7 +649,7 @@ def test_validate_rejects_dangling_lineage(price_case: Path) -> None:
 
     assert result.exit_code == 1
     assert "error [lineage_invalid]" in result.output
-    assert "does not match manifest input_artifact_ids" in result.output
+    assert "are not in manifest input_artifact_ids" in result.output
 
 
 def test_validate_accepts_declared_lineage(price_case: Path) -> None:
@@ -751,7 +751,7 @@ def test_validate_rejects_lineage_switched_to_different_declared_parent(
 
     assert result.exit_code == 1
     assert "error [lineage_invalid]" in result.output
-    assert "does not match manifest input_artifact_ids" in result.output
+    assert "are not in manifest input_artifact_ids" in result.output
 
 
 def test_validate_rejects_v2_input_file_hash_mismatch(price_case: Path) -> None:

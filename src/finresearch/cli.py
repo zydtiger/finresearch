@@ -32,9 +32,16 @@ from finresearch.ingestion import (
     ingest_sec_submissions,
     ingest_yfinance_daily_prices,
 )
+from finresearch.local_import import (
+    LocalImportReceipt,
+    import_csv,
+    import_parquet,
+    parse_import_timestamp,
+)
 from finresearch.normalization import (
     normalize_daily_prices,
     normalize_fundamental_facts,
+    reconcile_instrument_master,
 )
 from finresearch.providers import ProviderError
 from finresearch.registers import REGISTER_FILES, inspect_registers
@@ -116,6 +123,40 @@ RawArtifactOption = Annotated[
     typer.Option(
         "--raw-artifact-id",
         help="Raw snapshot to normalize when multiple exist for the symbol.",
+    ),
+]
+ImportFileArgument = Annotated[
+    Path,
+    typer.Argument(
+        exists=True,
+        file_okay=True,
+        dir_okay=False,
+        readable=True,
+        resolve_path=True,
+        help="Explicit local source file to preserve and import.",
+    ),
+]
+ImportSchemaOption = Annotated[
+    str,
+    typer.Option("--schema", help="Strict named source projection."),
+]
+ImportProviderOption = Annotated[
+    str,
+    typer.Option("--provider", help="Provider identifier recorded in canonical rows."),
+]
+ImportRetrievedAtOption = Annotated[
+    str,
+    typer.Option("--retrieved-at", help="Explicit RFC3339 UTC source retrieval time."),
+]
+AsOfOption = Annotated[
+    str,
+    typer.Option("--as-of", help="Current-state cutoff date in YYYY-MM-DD."),
+]
+SourceArtifactOption = Annotated[
+    list[str] | None,
+    typer.Option(
+        "--source-artifact-id",
+        help="Restrict reconciliation to raw source artifact ids; repeatable.",
     ),
 ]
 
@@ -288,6 +329,54 @@ def ingest_sec_companyfacts_command(
     print_ingestion_receipt(receipt)
 
 
+@data_app.command("import-csv")
+def import_csv_command(
+    ctx: typer.Context,
+    case_id: CaseIdArgument,
+    source_file: ImportFileArgument,
+    schema_name: ImportSchemaOption,
+    provider: ImportProviderOption,
+    retrieved_at: ImportRetrievedAtOption,
+) -> None:
+    """Preserve one strict UTF-8 CSV source and publish canonical Parquet."""
+    try:
+        receipt = import_csv(
+            state_from_context(ctx).workspace,
+            case_id,
+            source_file,
+            schema_name=schema_name,
+            provider=provider,
+            retrieved_at=parse_import_timestamp(retrieved_at),
+        )
+    except (CaseContractError, DataContractError, IngestionError, OSError) as exc:
+        fail(str(exc))
+    print_local_import_receipt(receipt)
+
+
+@data_app.command("import-parquet")
+def import_parquet_command(
+    ctx: typer.Context,
+    case_id: CaseIdArgument,
+    source_file: ImportFileArgument,
+    schema_name: ImportSchemaOption,
+    provider: ImportProviderOption,
+    retrieved_at: ImportRetrievedAtOption,
+) -> None:
+    """Preserve one exact-schema Parquet source and publish canonical Parquet."""
+    try:
+        receipt = import_parquet(
+            state_from_context(ctx).workspace,
+            case_id,
+            source_file,
+            schema_name=schema_name,
+            provider=provider,
+            retrieved_at=parse_import_timestamp(retrieved_at),
+        )
+    except (CaseContractError, DataContractError, IngestionError, OSError) as exc:
+        fail(str(exc))
+    print_local_import_receipt(receipt)
+
+
 @data_app.command("validate")
 def validate_data_command(
     ctx: typer.Context,
@@ -349,6 +438,8 @@ def normalize_daily_prices_command(
     print_ingestion_receipt(receipt.instrument_master)
     typer.echo("normalized daily-prices:")
     print_ingestion_receipt(receipt.daily_prices)
+    typer.echo("normalized corporate-actions:")
+    print_ingestion_receipt(receipt.corporate_actions)
 
 
 @data_app.command("normalize-fundamental-facts")
@@ -374,6 +465,32 @@ def normalize_fundamental_facts_command(
     ) as exc:
         fail(str(exc))
     typer.echo("normalized fundamental-facts:")
+    print_ingestion_receipt(receipt)
+
+
+@data_app.command("reconcile-instrument-master")
+def reconcile_instrument_master_command(
+    ctx: typer.Context,
+    case_id: CaseIdArgument,
+    as_of: AsOfOption,
+    source_artifact_ids: SourceArtifactOption = None,
+) -> None:
+    """Derive an as-of current-state master from v2 observations."""
+    try:
+        receipt = reconcile_instrument_master(
+            state_from_context(ctx).workspace,
+            case_id,
+            as_of=parse_iso_date(as_of, "as_of"),
+            source_artifact_ids=tuple(source_artifact_ids or ()),
+        )
+    except (
+        CaseContractError,
+        DataContractError,
+        IngestionError,
+        OSError,
+    ) as exc:
+        fail(str(exc))
+    typer.echo("reconciled instrument-master:")
     print_ingestion_receipt(receipt)
 
 
@@ -419,6 +536,19 @@ def print_ingestion_receipt(receipt: IngestionReceipt) -> None:
     typer.echo(f"path: {receipt.path}")
     typer.echo(f"rows: {receipt.row_count}")
     typer.echo(f"sha256: {receipt.sha256}")
+
+
+def print_local_import_receipt(receipt: LocalImportReceipt) -> None:
+    """Report both immutable source and canonical local-import outputs."""
+    typer.echo("raw import:")
+    typer.echo(f"artifact: {receipt.raw.artifact_id}")
+    typer.echo(f"path: {receipt.raw.path}")
+    typer.echo(f"sha256: {receipt.raw.sha256}")
+    typer.echo("normalized import:")
+    typer.echo(f"artifact: {receipt.normalized.artifact_id}")
+    typer.echo(f"path: {receipt.normalized.path}")
+    typer.echo(f"rows: {receipt.normalized.row_count}")
+    typer.echo(f"sha256: {receipt.normalized.sha256}")
 
 
 def print_artifact_inspection(inspection: ArtifactInspection) -> None:

@@ -24,7 +24,11 @@ Ingestion, validation, and future inspection commands must import the same
   relative path, provider (`source`), retrieval time, row count, and SHA-256
   checksum. New v2 cases instead record deterministic producer metadata and an
   empty ordered parent list for raw snapshots; v2 has no legacy `source` field.
-- A failed Parquet write or manifest update removes only the new partial output.
+- A synchronous failed Parquet write or manifest update removes only output
+  created by that invocation. A rerun may atomically recover matching,
+  undeclared local-import outputs after verifying their expected bytes; a
+  mismatched or partially declared output is an integrity failure and is never
+  overwritten or removed.
 - Per-case file and process locks serialize snapshot publication with manifest
   updates; the persistent `.finresearch.lock` file is internal workspace state.
 - Provider adapters may use pandas at their external boundary; internal
@@ -159,8 +163,9 @@ verifies, per artifact as applicable:
   contract;
 - the manifest `retrieved_at` matches the snapshot's own `retrieved_at`
   provenance column; and
-- for a v2 Parquet contract with `source_artifact_id`, the observed source is
-  one of the artifact's authoritative `input_artifact_ids`.
+- for a v2 Parquet contract with `source_artifact_id`, every non-null observed
+  source is in the artifact's authoritative `input_artifact_ids`; tables may
+  carry multiple valid source ids when they reconcile multiple inputs.
 
 ```text
 finresearch --workspace PATH data validate CASE_ID [ARTIFACT_ID]
@@ -183,18 +188,19 @@ Both commands share the `DatasetContract` registry so schema, validation, and
 inspection cannot drift; adding a new raw or normalized table means registering
 one contract.
 
-## Normalized daily prices v1
+## Normalized daily prices v1 (legacy compatibility)
 
-Normalization is a deterministic, offline transformation from one immutable raw
-yfinance snapshot. It never rewrites raw files and never fetches from the
-network; the same snapshot and code version always produce the same output.
+The historical v1 normalization was a deterministic, offline transformation
+from one immutable raw yfinance snapshot. Existing v1 artifacts remain
+readable; the current v2 provider output is specified below. Neither form
+rewrites raw files or fetches from the network.
 
 ```text
 finresearch --workspace PATH data normalize-daily-prices \
   CASE_ID SYMBOL [--raw-artifact-id ARTIFACT_ID]
 ```
 
-The command writes two registered artifacts below `data/normalized/`. In a v2
+The v1 form wrote two registered artifacts below `data/normalized/`. In a v2
 manifest, each records the raw artifact in `input_artifact_ids` plus its
 case-relative input-file hash, so every normalized row can be traced to its
 exact input bytes. A v1 manifest retains its legacy `source` declaration. When
@@ -237,20 +243,94 @@ price bars; if publication is interrupted between them, a rerun reuses the
 master receipt and completes the pair. Existing v1 cases remain readable with
 their original artifact files.
 
-Both normalized tables share the same `DatasetContract` registry, so
+Both legacy normalized tables share the same `DatasetContract` registry, so
 `data validate` and `data inspect` cover them without extra code.
 
-## Normalized fundamental-facts v1
+## Canonical contracts and explicit local import
+
+Current provider normalization writes immutable `normalized.instrument-master.v2`
+and `normalized.daily-prices.v2` artifacts, plus
+`normalized.corporate-actions.v1`. The master uses a provider-scoped stable
+`instrument_id`; yfinance-derived fields that the raw snapshot cannot prove
+remain NULL and `asset_class = "unknown"`. Price bars remain a single
+`unadjusted` basis and actions are separate rows (`dividend`, `capital-gain`,
+or `split`) with either a positive cash amount or a positive split ratio.
+
+`normalized.fundamental-facts.v2` adds deterministic `fact_id`, nullable
+entity/instrument mappings, metric/category fields, controlled unit and
+currency values, accession and knowledge provenance, and an optional
+`available_at`. SEC normalization records a safe hard-coded canonical mapping
+only for known concepts; it does not invent an instrument mapping or filing
+acceptance time. Exact duplicate facts collapse, while restatements remain
+distinct because their fact-defining provenance differs.
+
+The registry also defines strict canonical `normalized.estimates.v1` (explicit
+estimate-as-of, availability, and retrieval timestamps; entity/instrument are
+part of its unique identity),
+`normalized.fx-rates.v1`, and the action contract above. Controlled values are:
+currencies `AUD,CAD,CHF,CNY,EUR,GBP,HKD,JPY,KRW,SGD,USD`; price bases
+`unadjusted,split-adjusted,total-return`; asset classes
+`commodity,crypto,derivative,equity,etf,fixed-income,fund,fx,index,other,unknown`;
+and fact categories `balance-sheet,cash-flow,entity,income-statement,other,share-data`.
+Canonical publication applies each contract's declared deterministic sort key;
+contracts enforce exact schemas,
+nullability, unique keys, UTC timestamps, and semantic invariants such as
+OHLC ordering, positive FX rates, valid action amounts, and PIT timestamp order.
+
+```text
+finresearch --workspace PATH data import-csv CASE_ID FILE \
+  --schema instrument-master.v2|daily-prices.v2|fundamental-facts.v2|estimates.v1|corporate-actions.v1|fx-rates.v1 \
+  --provider PROVIDER --retrieved-at RFC3339_UTC
+
+finresearch --workspace PATH data import-parquet CASE_ID FILE \
+  --schema NAME --provider PROVIDER --retrieved-at RFC3339_UTC
+```
+
+CSV imports require UTF-8, the exact ordered header, exact `YYYY-MM-DD` dates,
+`Z`-terminated RFC3339 UTC timestamps, decimal-dot numeric values, and empty
+strings only for nullable fields. No NA aliases, missing/extra columns, best
+effort casts, mtime, or local-time defaults are accepted. Input Parquet must
+match its named projection exactly. The original byte stream is stored as a
+non-Parquet raw source so validation can verify its own SHA without treating a
+user projection as a dataset contract; absolute input paths are never put in
+the manifest. Canonical parsing consumes that already-read byte stream, so a
+source-path change during import cannot create mismatched raw and normalized
+lineage.
+
+The raw source and canonical output have identities from source bytes, schema,
+provider, retrieval time, and the explicit import producer name and version.
+An identical rerun reuses both; changing that producer version or other
+identity metadata appends a separate pair. Import validation occurs before
+publication, and a publication error removes any new raw/canonical files and
+leaves no manifest declaration.
+
+```text
+finresearch --workspace PATH data reconcile-instrument-master CASE_ID \
+  --as-of YYYY-MM-DD [--source-artifact-id ID ...]
+```
+
+Reconciliation writes `derived.instrument-master-current.v1` from v2 master
+observations valid at the cutoff. It selects the latest `observed_at` without
+guessing identifiers; equal-time conflicting non-null values fail explicitly.
+Its ordered lineage includes the observed master artifacts and their raw source
+artifacts in canonical artifact-id order; repeated source filters are treated
+as one sorted set. `data validate` also compares every non-null price/action
+currency by provider and instrument against a single
+matching v2 master currency when one is unambiguous.
+
+## Normalized fundamental-facts v1 (legacy compatibility)
 
 ```text
 finresearch --workspace PATH data normalize-fundamental-facts \
   CASE_ID CIK [--raw-artifact-id ARTIFACT_ID]
 ```
 
-Parses one immutable raw SEC companyfacts snapshot into a long-form table with
-one row per reported observation. Like the other normalized tables it is a
-deterministic, offline transformation; v2 manifests record the raw artifact id
-in `input_artifact_ids` and v1 manifests retain the legacy `source` field.
+The historical v1 form parses one immutable raw SEC companyfacts snapshot into
+a long-form table with one row per reported observation. Existing artifacts
+remain valid under this immutable contract; current normalization writes the v2
+form documented above. Like the other normalized tables it is a deterministic,
+offline transformation; v2 manifests record the raw artifact id in
+`input_artifact_ids` and v1 manifests retain the legacy `source` field.
 
 Contract identifier: `normalized.fundamental-facts.v1`
 
