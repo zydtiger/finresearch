@@ -14,6 +14,7 @@ import pytest
 import finresearch.ingestion as ingestion_module
 from finresearch.cases import (
     Artifact,
+    CaseContractError,
     append_artifact,
     initialize_case,
     read_manifest,
@@ -24,6 +25,8 @@ from finresearch.ingestion import (
     ingest_sec_companyfacts,
     ingest_sec_submissions,
     ingest_yfinance_daily_prices,
+    publish_artifact_bytes,
+    publish_snapshot,
 )
 from finresearch.providers.sec import (
     SECProviderError,
@@ -223,7 +226,11 @@ def test_ingestion_writes_parquet_and_registers_provenance(tmp_path: Path) -> No
     assert artifact.kind == "raw.yfinance.daily-prices"
     assert artifact.schema_version == 1
     assert artifact.path == receipt.path.relative_to(case_dir).as_posix()
-    assert artifact.source == "yfinance"
+    assert artifact.source is None
+    assert artifact.input_artifact_ids == ()
+    assert artifact.producer == "finresearch.data.ingest"
+    assert artifact.producer_version == "1"
+    assert artifact.parameters_sha256 is not None
     assert artifact.sha256 == receipt.sha256
     assert artifact.retrieved_at == "2026-08-11T04:05:06.123456Z"
     assert artifact.row_count == 1
@@ -257,6 +264,75 @@ def test_ingestion_never_overwrites_same_snapshot(tmp_path: Path) -> None:
     assert len(read_manifest(tmp_path / "cases/aapl").artifacts) == 1
 
 
+def test_publish_report_bytes_is_idempotent(tmp_path: Path) -> None:
+    case_dir = initialize_case(tmp_path, "aapl")
+    manifest = read_manifest(case_dir)
+
+    def publish() -> ingestion_module.ArtifactPublicationReceipt:
+        return publish_artifact_bytes(
+            case_dir=case_dir,
+            manifest=manifest,
+            path_role="reports",
+            kind="report.markdown",
+            schema_version=1,
+            path_parts=(),
+            filename="summary.md",
+            entity_key="aapl",
+            identity="summary-v1",
+            content=b"# Summary\n",
+            producer="finresearch.report.render",
+            producer_version="1",
+            parameters_sha256="a" * 64,
+            input_artifact_ids=(),
+            produced_at=datetime(2026, 8, 11, tzinfo=UTC),
+        )
+
+    first = publish()
+    second = publish()
+
+    assert second == first
+    assert first.path.read_bytes() == b"# Summary\n"
+    artifact = read_manifest(case_dir).artifacts[0]
+    assert artifact.kind == "report.markdown"
+    assert artifact.row_count is None
+    assert artifact.input_artifact_ids == ()
+
+
+def test_publish_snapshot_rejects_legacy_source_for_v2_without_changes(
+    tmp_path: Path,
+) -> None:
+    case_dir = initialize_case(tmp_path, "aapl")
+    manifest = read_manifest(case_dir)
+    original = (case_dir / "manifest.toml").read_bytes()
+    frame = valid_price_frame(
+        symbol="AAPL",
+        retrieved_at=datetime(2026, 8, 11, tzinfo=UTC),
+        start=date(2026, 1, 2),
+        end=date(2026, 1, 3),
+    )
+
+    with pytest.raises(CaseContractError, match="must not set legacy source"):
+        publish_snapshot(
+            case_dir=case_dir,
+            manifest=manifest,
+            path_role="raw",
+            frame=frame,
+            contract=RAW_YFINANCE_DAILY_PRICES_V1,
+            path_parts=("test",),
+            entity_key="aapl",
+            identity="source-rejected",
+            producer="finresearch.test",
+            producer_version="1",
+            parameters_sha256="a" * 64,
+            input_artifact_ids=(),
+            produced_at=datetime(2026, 8, 11, tzinfo=UTC),
+            source="legacy-provider",
+        )
+
+    assert (case_dir / "manifest.toml").read_bytes() == original
+    assert list((case_dir / "data/raw").rglob("*.parquet")) == []
+
+
 def test_ingestion_does_not_repair_missing_declared_snapshot_with_stale_metadata(
     tmp_path: Path,
 ) -> None:
@@ -270,10 +346,12 @@ def test_ingestion_does_not_repair_missing_declared_snapshot_with_stale_metadata
             kind="raw.yfinance.daily-prices",
             schema_version=1,
             path=relative_path,
-            source="yfinance",
             sha256="0" * 64,
             retrieved_at="2026-08-11T00:00:00Z",
             row_count=999,
+            producer="finresearch.test",
+            producer_version="1",
+            parameters_sha256="a" * 64,
         ),
     )
 
@@ -609,7 +687,11 @@ def test_sec_ingestions_write_separate_raw_contracts(tmp_path: Path) -> None:
         "raw.sec.submissions",
         "raw.sec.companyfacts",
     ]
-    assert all(artifact.source == "sec" for artifact in manifest.artifacts)
+    assert all(artifact.source is None for artifact in manifest.artifacts)
+    assert all(
+        artifact.producer == "finresearch.data.ingest"
+        for artifact in manifest.artifacts
+    )
 
 
 def test_sec_ingestions_validate_user_agent_before_provider_override(

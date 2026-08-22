@@ -38,6 +38,15 @@ uv run finresearch \
   case validate aapl-2026-08-11
 ```
 
+New cases use manifest v2. Existing v1 cases remain readable; migrate one
+explicitly without rewriting its artifacts when v2 lineage is needed:
+
+```bash
+uv run finresearch \
+  --workspace /path/to/research-artifacts \
+  case migrate aapl-2026-08-11
+```
+
 The case directory and `manifest.toml` contract are documented in
 [`docs/case-contract.md`](docs/case-contract.md). The same CLI is available
 through `uv run python -m finresearch`.
@@ -72,8 +81,8 @@ uv run finresearch \
 ```
 
 Derive deterministic normalized artifacts (instrument master and unadjusted
-daily price bars) from one raw yfinance snapshot, carrying the raw artifact id
-as lineage:
+daily price bars) from one raw yfinance snapshot. V2 manifests record ordered
+input artifact lineage, input file hashes, and producer metadata:
 
 ```bash
 uv run finresearch \

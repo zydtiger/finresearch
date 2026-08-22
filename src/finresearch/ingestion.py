@@ -6,22 +6,25 @@ import hashlib
 import os
 import re
 import tempfile
-from collections.abc import Iterator
-from contextlib import contextmanager
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Protocol
 
 import polars as pl
-from filelock import FileLock
 
 from finresearch.cases import (
+    MANIFEST_V1,
+    MANIFEST_V2,
     Artifact,
     CaseContractError,
     CaseManifest,
+    InputFileHash,
     append_artifact,
+    canonical_parameters_sha256,
     case_directory,
+    case_write_lock,
     read_manifest,
     resolve_relative_path,
 )
@@ -35,6 +38,10 @@ from finresearch.data_contracts import (
 
 class IngestionError(RuntimeError):
     """Raised when an ingestion cannot complete without partial state."""
+
+
+class ArtifactIntegrityError(IngestionError):
+    """Raised when a deterministic artifact identity has conflicting state."""
 
 
 class DailyPriceProvider(Protocol):
@@ -80,6 +87,17 @@ class IngestionReceipt:
     row_count: int
     sha256: str
     retrieved_at: datetime
+
+
+@dataclass(frozen=True)
+class ArtifactPublicationReceipt:
+    """Stable result metadata for a deterministic artifact of any file type."""
+
+    artifact_id: str
+    path: Path
+    sha256: str
+    produced_at: datetime
+    row_count: int | None = None
 
 
 def ingest_yfinance_daily_prices(
@@ -283,12 +301,17 @@ def persist_snapshot(
     entity_key: str,
     retrieved_at: datetime,
     source: str | None = None,
+    producer: str = "finresearch.data.ingest",
+    producer_version: str = "1",
+    parameters: dict[str, object] | None = None,
 ) -> IngestionReceipt:
     """Atomically publish and register one immutable Parquet snapshot.
 
     Raw snapshots record the provider as their manifest source; normalized
     snapshots pass the raw artifact id as lineage through ``source``.
     """
+    if manifest.manifest_version == MANIFEST_V2 and source is not None:
+        raise CaseContractError("manifest v2 artifacts must not set legacy source")
     contract.validate(frame)
     timestamp_key = retrieved_at.strftime("%Y%m%dT%H%M%S%fZ")
     relative_path = Path(
@@ -302,7 +325,7 @@ def persist_snapshot(
         manifest.paths[path_role],
         f"paths.{path_role}",
     )
-    with _case_write_lock(case_dir):
+    with case_write_lock(case_dir):
         current_manifest = read_manifest(case_dir)
         if any(
             artifact.artifact_id == artifact_id
@@ -348,15 +371,30 @@ def persist_snapshot(
             temporary_path.unlink()
             append_artifact(
                 case_dir,
-                Artifact(
+                _artifact_for_manifest(
+                    current_manifest,
                     artifact_id=artifact_id,
                     kind=contract.name,
                     schema_version=contract.version,
                     path=relative_path.as_posix(),
-                    source=source or provider,
                     sha256=sha256,
                     retrieved_at=_format_utc(retrieved_at),
                     row_count=frame.height,
+                    source=source or provider,
+                    producer=producer,
+                    producer_version=producer_version,
+                    parameters_sha256=canonical_parameters_sha256(
+                        parameters
+                        or {
+                            "contract": contract.name,
+                            "contract_version": contract.version,
+                            "entity_key": entity_key,
+                            "path_parts": list(path_parts),
+                            "retrieved_at": _format_utc(retrieved_at),
+                        }
+                    ),
+                    input_artifact_ids=(),
+                    input_file_hashes=(),
                 ),
             )
         except BaseException:
@@ -384,12 +422,346 @@ def persist_snapshot(
     )
 
 
-@contextmanager
-def _case_write_lock(case_dir: Path) -> Iterator[None]:
-    """Serialize artifact publication and manifest updates per case."""
-    lock_path = resolve_relative_path(case_dir, ".finresearch.lock", "case lock")
-    with FileLock(lock_path):
-        yield
+def publish_snapshot(
+    *,
+    case_dir: Path,
+    manifest: CaseManifest,
+    path_role: str,
+    frame: pl.DataFrame,
+    contract: DatasetContract,
+    path_parts: tuple[str, ...],
+    entity_key: str,
+    identity: str,
+    producer: str,
+    producer_version: str,
+    parameters_sha256: str,
+    input_artifact_ids: tuple[str, ...],
+    produced_at: datetime,
+    source: str | None = None,
+) -> IngestionReceipt:
+    """Publish a deterministic Parquet artifact and return its row receipt."""
+    if manifest.manifest_version == MANIFEST_V2 and source is not None:
+        raise CaseContractError("manifest v2 artifacts must not set legacy source")
+    contract.validate(frame)
+    relative_path = Path(
+        manifest.paths[path_role],
+        *path_parts,
+        f"{identity}.parquet",
+    )
+    receipt = _publish_deterministic_artifact(
+        case_dir=case_dir,
+        manifest=manifest,
+        artifact_id=f"{contract.name}.{entity_key}.{identity}",
+        kind=contract.name,
+        schema_version=contract.version,
+        path_role=path_role,
+        relative_path=relative_path,
+        producer=producer,
+        producer_version=producer_version,
+        parameters_sha256=parameters_sha256,
+        input_artifact_ids=input_artifact_ids,
+        produced_at=produced_at,
+        row_count=frame.height,
+        write_temporary=lambda output: frame.write_parquet(
+            output,
+            compression="zstd",
+            statistics=True,
+        ),
+        source=source,
+    )
+    return IngestionReceipt(
+        artifact_id=receipt.artifact_id,
+        path=receipt.path,
+        row_count=frame.height,
+        sha256=receipt.sha256,
+        retrieved_at=produced_at,
+    )
+
+
+def publish_artifact_bytes(
+    *,
+    case_dir: Path,
+    manifest: CaseManifest,
+    path_role: str,
+    kind: str,
+    schema_version: int,
+    path_parts: tuple[str, ...],
+    filename: str,
+    entity_key: str,
+    identity: str,
+    content: bytes,
+    producer: str,
+    producer_version: str,
+    parameters_sha256: str,
+    input_artifact_ids: tuple[str, ...],
+    produced_at: datetime,
+) -> ArtifactPublicationReceipt:
+    """Publish deterministic normalized, derived, or report bytes safely."""
+    if not filename or "/" in filename or "\\" in filename:
+        raise IngestionError("artifact filename must be one portable path component")
+    if not isinstance(content, bytes):
+        raise IngestionError("artifact content must be bytes")
+
+    def write_content(output: Path) -> None:
+        output.write_bytes(content)
+
+    relative_path = Path(manifest.paths[path_role], *path_parts, filename)
+    return _publish_deterministic_artifact(
+        case_dir=case_dir,
+        manifest=manifest,
+        artifact_id=f"{kind}.{entity_key}.{identity}",
+        kind=kind,
+        schema_version=schema_version,
+        path_role=path_role,
+        relative_path=relative_path,
+        producer=producer,
+        producer_version=producer_version,
+        parameters_sha256=parameters_sha256,
+        input_artifact_ids=input_artifact_ids,
+        produced_at=produced_at,
+        row_count=None,
+        write_temporary=write_content,
+    )
+
+
+def _publish_deterministic_artifact(
+    *,
+    case_dir: Path,
+    manifest: CaseManifest,
+    artifact_id: str,
+    kind: str,
+    schema_version: int,
+    path_role: str,
+    relative_path: Path,
+    producer: str,
+    producer_version: str,
+    parameters_sha256: str,
+    input_artifact_ids: tuple[str, ...],
+    produced_at: datetime,
+    row_count: int | None,
+    write_temporary: Callable[[Path], None],
+    source: str | None = None,
+) -> ArtifactPublicationReceipt:
+    """Publish a deterministic artifact without overwriting prior state.
+
+    The caller supplies a stable identity derived only from explicit inputs and
+    producer parameters. An identical rerun returns the existing receipt;
+    any byte or declaration mismatch at that identity is an integrity failure.
+    """
+    _require_utc_datetime(produced_at, "produced_at")
+    root = resolve_relative_path(
+        case_dir,
+        manifest.paths[path_role],
+        f"paths.{path_role}",
+    )
+    output_path = resolve_relative_path(
+        case_dir,
+        relative_path.as_posix(),
+        "deterministic output",
+    )
+    with case_write_lock(case_dir):
+        current_manifest = read_manifest(case_dir)
+        if current_manifest.manifest_version != manifest.manifest_version:
+            raise ArtifactIntegrityError(
+                "manifest version changed while publishing deterministic artifact"
+            )
+        input_file_hashes = _input_file_hashes(
+            case_dir,
+            current_manifest,
+            input_artifact_ids,
+        )
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary_path: Path | None = None
+        published = False
+        try:
+            file_descriptor, temporary_name = tempfile.mkstemp(
+                dir=output_path.parent,
+                prefix=f".{output_path.name}.",
+                suffix=".tmp",
+            )
+            temporary_path = Path(temporary_name)
+            os.close(file_descriptor)
+            write_temporary(temporary_path)
+            sha256 = _sha256(temporary_path)
+            expected = _artifact_for_manifest(
+                current_manifest,
+                artifact_id=artifact_id,
+                kind=kind,
+                schema_version=schema_version,
+                path=relative_path.as_posix(),
+                sha256=sha256,
+                retrieved_at=_format_utc(produced_at),
+                row_count=row_count,
+                source=source,
+                producer=producer,
+                producer_version=producer_version,
+                parameters_sha256=parameters_sha256,
+                input_artifact_ids=input_artifact_ids,
+                input_file_hashes=input_file_hashes,
+            )
+            same_id = next(
+                (
+                    artifact
+                    for artifact in current_manifest.artifacts
+                    if artifact.artifact_id == artifact_id
+                ),
+                None,
+            )
+            same_path = next(
+                (
+                    artifact
+                    for artifact in current_manifest.artifacts
+                    if artifact.path == relative_path.as_posix()
+                ),
+                None,
+            )
+            if same_id is not None or same_path is not None:
+                if same_id != same_path or same_id is None:
+                    raise ArtifactIntegrityError(
+                        "deterministic artifact identity conflicts with an existing "
+                        "artifact id or path"
+                    )
+                if same_id != expected:
+                    raise ArtifactIntegrityError(
+                        f"deterministic artifact metadata conflict: {artifact_id}"
+                    )
+                if not output_path.is_file():
+                    raise ArtifactIntegrityError(
+                        f"declared deterministic artifact is missing: {relative_path}"
+                    )
+                if _sha256(output_path) != sha256:
+                    raise ArtifactIntegrityError(
+                        f"deterministic artifact byte conflict: {artifact_id}"
+                    )
+                temporary_path.unlink()
+                return ArtifactPublicationReceipt(
+                    artifact_id=artifact_id,
+                    path=output_path,
+                    sha256=sha256,
+                    produced_at=produced_at,
+                    row_count=row_count,
+                )
+            if output_path.exists():
+                raise ArtifactIntegrityError(
+                    "deterministic artifact output already exists without a matching "
+                    f"manifest declaration: {output_path}"
+                )
+            os.link(temporary_path, output_path)
+            published = True
+            temporary_path.unlink()
+            append_artifact(case_dir, expected)
+        except BaseException:
+            owns_published_output = published or _paths_share_inode(
+                temporary_path,
+                output_path,
+            )
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
+            if owns_published_output and not _artifact_is_registered(
+                case_dir,
+                artifact_id,
+                relative_path.as_posix(),
+            ):
+                output_path.unlink(missing_ok=True)
+                _remove_empty_parents(output_path.parent, root)
+            raise
+
+    return ArtifactPublicationReceipt(
+        artifact_id=artifact_id,
+        path=output_path,
+        sha256=sha256,
+        produced_at=produced_at,
+        row_count=row_count,
+    )
+
+
+def _artifact_for_manifest(
+    manifest: CaseManifest,
+    *,
+    artifact_id: str,
+    kind: str,
+    schema_version: int,
+    path: str,
+    sha256: str,
+    retrieved_at: str,
+    row_count: int | None,
+    source: str | None,
+    producer: str,
+    producer_version: str,
+    parameters_sha256: str,
+    input_artifact_ids: tuple[str, ...],
+    input_file_hashes: tuple[InputFileHash, ...],
+) -> Artifact:
+    """Build the strict declaration shape required by the active manifest."""
+    if manifest.manifest_version == MANIFEST_V1:
+        return Artifact(
+            artifact_id=artifact_id,
+            kind=kind,
+            schema_version=schema_version,
+            path=path,
+            source=source,
+            sha256=sha256,
+            retrieved_at=retrieved_at,
+            row_count=row_count,
+        )
+    if manifest.manifest_version == MANIFEST_V2:
+        return Artifact(
+            artifact_id=artifact_id,
+            kind=kind,
+            schema_version=schema_version,
+            path=path,
+            sha256=sha256,
+            retrieved_at=retrieved_at,
+            row_count=row_count,
+            input_artifact_ids=input_artifact_ids,
+            producer=producer,
+            producer_version=producer_version,
+            parameters_sha256=parameters_sha256,
+            input_file_hashes=input_file_hashes,
+        )
+    raise CaseContractError(
+        f"unsupported manifest_version {manifest.manifest_version}; expected 1 or 2"
+    )
+
+
+def _input_file_hashes(
+    case_dir: Path,
+    manifest: CaseManifest,
+    input_artifact_ids: tuple[str, ...],
+) -> tuple[InputFileHash, ...]:
+    """Record ordered parent bytes for v2 output declarations."""
+    if manifest.manifest_version == MANIFEST_V1:
+        return ()
+    by_id = {artifact.artifact_id: artifact for artifact in manifest.artifacts}
+    hashes: list[InputFileHash] = []
+    for parent_id in input_artifact_ids:
+        parent = by_id.get(parent_id)
+        if parent is None:
+            raise ArtifactIntegrityError(
+                f"deterministic artifact input is not declared: {parent_id}"
+            )
+        parent_path = resolve_relative_path(
+            case_dir,
+            parent.path,
+            f"input artifact {parent_id}",
+        )
+        if not parent_path.is_file():
+            raise ArtifactIntegrityError(
+                f"deterministic artifact input is missing: {parent.path}"
+            )
+        digest = _sha256(parent_path)
+        if parent.sha256 is not None and parent.sha256 != digest:
+            raise ArtifactIntegrityError(
+                f"deterministic artifact input checksum mismatch: {parent_id}"
+            )
+        hashes.append(
+            InputFileHash(
+                name=f"artifact.{parent_id}",
+                path=parent.path,
+                sha256=digest,
+            )
+        )
+    return tuple(hashes)
 
 
 def _artifact_is_registered(
@@ -464,9 +836,14 @@ def _validate_constant_metadata(
 
 def _retrieval_time(value: datetime | None) -> datetime:
     retrieval_time = value or datetime.now(UTC)
-    if retrieval_time.tzinfo is None or retrieval_time.utcoffset() is None:
-        raise IngestionError("retrieved_at must be timezone-aware")
+    _require_utc_datetime(retrieval_time, "retrieved_at")
     return retrieval_time.astimezone(UTC)
+
+
+def _require_utc_datetime(value: datetime, field: str) -> None:
+    """Require an aware timestamp before normalizing it to UTC."""
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise IngestionError(f"{field} must be timezone-aware")
 
 
 def symbol_key(symbol: str) -> str:

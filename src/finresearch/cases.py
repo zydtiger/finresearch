@@ -2,20 +2,26 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 import shutil
 import tempfile
 import tomllib
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path, PurePosixPath
 from typing import Final
 
 import tomli_w
+from filelock import FileLock
 
 MANIFEST_FILENAME: Final = "manifest.toml"
-MANIFEST_VERSION: Final = 1
+MANIFEST_V1: Final = 1
+MANIFEST_V2: Final = 2
+MANIFEST_VERSION: Final = MANIFEST_V2
 CASE_ID_PATTERN: Final = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?")
 ARTIFACT_NAME_PATTERN: Final = re.compile(r"[a-z0-9](?:[a-z0-9_.-]*[a-z0-9])?")
 SHA256_PATTERN: Final = re.compile(r"[0-9a-f]{64}")
@@ -33,7 +39,16 @@ REQUIRED_PATH_ROLES: Final = ("raw", "normalized", "derived", "reports")
 
 
 class CaseContractError(ValueError):
-    """Raised when a case cannot satisfy the v1 contract."""
+    """Raised when a case cannot satisfy its versioned contract."""
+
+
+@dataclass(frozen=True)
+class InputFileHash:
+    """A named, case-relative input file and its immutable byte hash."""
+
+    name: str
+    path: str
+    sha256: str
 
 
 @dataclass(frozen=True)
@@ -48,11 +63,16 @@ class Artifact:
     sha256: str | None = None
     retrieved_at: str | None = None
     row_count: int | None = None
+    input_artifact_ids: tuple[str, ...] = ()
+    producer: str | None = None
+    producer_version: str | None = None
+    parameters_sha256: str | None = None
+    input_file_hashes: tuple[InputFileHash, ...] = ()
 
 
 @dataclass(frozen=True)
 class CaseManifest:
-    """The supported v1 case manifest."""
+    """A supported versioned case manifest."""
 
     manifest_version: int
     case_id: str
@@ -86,8 +106,17 @@ class CaseStatus:
 
     @property
     def valid(self) -> bool:
-        """Return whether the case passes the complete v1 validation."""
+        """Return whether the case passes complete manifest validation."""
         return not self.issues
+
+
+@dataclass(frozen=True)
+class CaseMigrationReceipt:
+    """The result of an explicit manifest-only v1-to-v2 migration."""
+
+    case_dir: Path
+    migrated: bool
+    manifest: CaseManifest
 
 
 def validate_case_id(case_id: str) -> str:
@@ -108,8 +137,16 @@ def case_directory(workspace: Path, case_id: str) -> Path:
     return case_dir
 
 
+@contextmanager
+def case_write_lock(case_dir: Path) -> Iterator[None]:
+    """Serialize manifest changes and artifact publication for one case."""
+    lock_path = resolve_relative_path(case_dir, ".finresearch.lock", "case lock")
+    with FileLock(lock_path):
+        yield
+
+
 def initialize_case(workspace: Path, case_id: str, title: str | None = None) -> Path:
-    """Create a v1 case without overwriting an existing path."""
+    """Create a current-version case without overwriting an existing path."""
     validated_id = validate_case_id(case_id)
     case_title = title.strip() if title is not None else validated_id
     if not case_title:
@@ -139,9 +176,9 @@ def initialize_case(workspace: Path, case_id: str, title: str | None = None) -> 
 
 
 def new_manifest(case_id: str, title: str) -> CaseManifest:
-    """Build an empty v1 manifest for a newly initialized case."""
+    """Build an empty current-version manifest for a newly initialized case."""
     return CaseManifest(
-        manifest_version=MANIFEST_VERSION,
+        manifest_version=MANIFEST_V2,
         case_id=case_id,
         title=title,
         status="active",
@@ -157,9 +194,14 @@ def write_manifest(case_dir: Path, manifest: CaseManifest) -> None:
         "case_id": manifest.case_id,
         "title": manifest.title,
         "status": manifest.status,
-        "artifacts": [artifact_to_dict(item) for item in manifest.artifacts],
+        "artifacts": [
+            artifact_to_dict(item, manifest.manifest_version)
+            for item in manifest.artifacts
+        ],
         "paths": dict(manifest.paths),
     }
+    # Programmatic writes obey the same strict versioned schema as TOML input.
+    parse_manifest(payload, case_dir)
     manifest_path = resolve_relative_path(case_dir, MANIFEST_FILENAME, "manifest")
     with tempfile.NamedTemporaryFile(
         mode="w",
@@ -179,16 +221,39 @@ def write_manifest(case_dir: Path, manifest: CaseManifest) -> None:
             raise
 
 
-def artifact_to_dict(artifact: Artifact) -> dict[str, object]:
+def artifact_to_dict(artifact: Artifact, manifest_version: int) -> dict[str, object]:
     """Convert an artifact to its TOML representation."""
+    validate_artifact_object_version(artifact, manifest_version)
     data: dict[str, object] = {
         "id": artifact.artifact_id,
         "kind": artifact.kind,
         "schema_version": artifact.schema_version,
         "path": artifact.path,
     }
-    if artifact.source is not None:
-        data["source"] = artifact.source
+    if manifest_version == MANIFEST_V1:
+        if artifact.source is not None:
+            data["source"] = artifact.source
+    elif manifest_version == MANIFEST_V2:
+        data.update(
+            {
+                "input_artifact_ids": list(artifact.input_artifact_ids),
+                "producer": artifact.producer,
+                "producer_version": artifact.producer_version,
+                "parameters_sha256": artifact.parameters_sha256,
+                "input_file_hashes": [
+                    {
+                        "name": input_file.name,
+                        "path": input_file.path,
+                        "sha256": input_file.sha256,
+                    }
+                    for input_file in artifact.input_file_hashes
+                ],
+            }
+        )
+    else:
+        raise CaseContractError(
+            f"unsupported manifest_version {manifest_version}; expected 1 or 2"
+        )
     if artifact.sha256 is not None:
         data["sha256"] = artifact.sha256
     if artifact.retrieved_at is not None:
@@ -196,6 +261,36 @@ def artifact_to_dict(artifact: Artifact) -> dict[str, object]:
     if artifact.row_count is not None:
         data["row_count"] = artifact.row_count
     return data
+
+
+def validate_artifact_object_version(
+    artifact: Artifact,
+    manifest_version: int,
+) -> None:
+    """Reject cross-version Artifact fields before they can be filtered out."""
+    if manifest_version == MANIFEST_V1:
+        v2_fields = {
+            "input_artifact_ids": artifact.input_artifact_ids,
+            "producer": artifact.producer,
+            "producer_version": artifact.producer_version,
+            "parameters_sha256": artifact.parameters_sha256,
+            "input_file_hashes": artifact.input_file_hashes,
+        }
+        present = [name for name, value in v2_fields.items() if value not in ((), None)]
+        if present:
+            raise CaseContractError(
+                f"manifest v1 artifacts must not set v2 fields: {', '.join(present)}"
+            )
+        return
+    if manifest_version == MANIFEST_V2:
+        if artifact.source is not None:
+            raise CaseContractError("manifest v2 artifacts must not set legacy source")
+        if artifact.sha256 is None:
+            raise CaseContractError("manifest v2 artifacts must set sha256")
+        return
+    raise CaseContractError(
+        f"unsupported manifest_version {manifest_version}; expected 1 or 2"
+    )
 
 
 def append_artifact(case_dir: Path, artifact: Artifact) -> CaseManifest:
@@ -207,7 +302,8 @@ def append_artifact(case_dir: Path, artifact: Artifact) -> CaseManifest:
         "title": manifest.title,
         "status": manifest.status,
         "artifacts": [
-            artifact_to_dict(item) for item in (*manifest.artifacts, artifact)
+            artifact_to_dict(item, manifest.manifest_version)
+            for item in (*manifest.artifacts, artifact)
         ],
         "paths": dict(manifest.paths),
     }
@@ -230,7 +326,7 @@ def read_manifest(case_dir: Path) -> CaseManifest:
 
 
 def parse_manifest(data: Mapping[str, object], case_dir: Path) -> CaseManifest:
-    """Parse and validate the structural v1 manifest contract."""
+    """Parse and validate the structural manifest contract for its version."""
     validate_table_keys(
         data,
         required={
@@ -244,9 +340,9 @@ def parse_manifest(data: Mapping[str, object], case_dir: Path) -> CaseManifest:
         field="manifest",
     )
     version = require_integer(data, "manifest_version")
-    if version != MANIFEST_VERSION:
+    if version not in (MANIFEST_V1, MANIFEST_V2):
         raise CaseContractError(
-            f"unsupported manifest_version {version}; expected {MANIFEST_VERSION}"
+            f"unsupported manifest_version {version}; expected 1 or 2"
         )
 
     case_id = validate_case_id(require_string(data, "case_id"))
@@ -276,7 +372,7 @@ def parse_manifest(data: Mapping[str, object], case_dir: Path) -> CaseManifest:
     artifacts_value = data.get("artifacts")
     if not isinstance(artifacts_value, list):
         raise CaseContractError("manifest artifacts must be an array")
-    artifacts = parse_artifacts(artifacts_value, case_dir, paths)
+    artifacts = parse_artifacts(artifacts_value, case_dir, paths, version)
 
     return CaseManifest(
         manifest_version=version,
@@ -289,7 +385,7 @@ def parse_manifest(data: Mapping[str, object], case_dir: Path) -> CaseManifest:
 
 
 def parse_paths(data: Mapping[str, object], case_dir: Path) -> dict[str, str]:
-    """Validate the complete path-role table for manifest v1."""
+    """Validate the complete path-role table for a versioned manifest."""
     expected = set(DEFAULT_PATHS)
     actual = set(data)
     if actual != expected:
@@ -320,6 +416,7 @@ def parse_artifacts(
     items: list[object],
     case_dir: Path,
     paths: Mapping[str, str],
+    manifest_version: int,
 ) -> tuple[Artifact, ...]:
     """Validate artifacts and their independent schema versions."""
     artifacts: list[Artifact] = []
@@ -334,12 +431,31 @@ def parse_artifacts(
         field = f"artifacts[{index}]"
         if not isinstance(item, dict):
             raise CaseContractError(f"{field} must be a TOML table")
-        validate_table_keys(
-            item,
-            required={"id", "kind", "schema_version", "path"},
-            optional={"source", "sha256", "retrieved_at", "row_count"},
-            field=field,
-        )
+        if manifest_version == MANIFEST_V1:
+            validate_table_keys(
+                item,
+                required={"id", "kind", "schema_version", "path"},
+                optional={"source", "sha256", "retrieved_at", "row_count"},
+                field=field,
+            )
+        else:
+            validate_table_keys(
+                item,
+                required={
+                    "id",
+                    "kind",
+                    "schema_version",
+                    "path",
+                    "sha256",
+                    "input_artifact_ids",
+                    "producer",
+                    "producer_version",
+                    "parameters_sha256",
+                    "input_file_hashes",
+                },
+                optional={"retrieved_at", "row_count"},
+                field=field,
+            )
         artifact_id = require_named_string(item, "id", field)
         if ARTIFACT_NAME_PATTERN.fullmatch(artifact_id) is None:
             raise CaseContractError(f"{field}.id has an invalid format")
@@ -363,8 +479,16 @@ def parse_artifacts(
                 f"{field}.path must be inside a directory declared by manifest paths"
             )
 
-        source = optional_named_string(item, "source", field)
-        sha256 = optional_named_string(item, "sha256", field)
+        source = (
+            optional_named_string(item, "source", field)
+            if manifest_version == MANIFEST_V1
+            else None
+        )
+        sha256 = (
+            require_named_string(item, "sha256", field)
+            if manifest_version == MANIFEST_V2
+            else optional_named_string(item, "sha256", field)
+        )
         if sha256 is not None and SHA256_PATTERN.fullmatch(sha256) is None:
             raise CaseContractError(f"{field}.sha256 must be 64 lowercase hex digits")
 
@@ -376,6 +500,41 @@ def parse_artifacts(
         if row_count is not None and row_count < 0:
             raise CaseContractError(f"{field}.row_count must not be negative")
 
+        input_artifact_ids = (
+            parse_input_artifact_ids(item, artifact_id, field)
+            if manifest_version == MANIFEST_V2
+            else ()
+        )
+        producer = (
+            require_named_string(item, "producer", field)
+            if manifest_version == MANIFEST_V2
+            else None
+        )
+        if producer is not None and ARTIFACT_NAME_PATTERN.fullmatch(producer) is None:
+            raise CaseContractError(f"{field}.producer has an invalid format")
+        producer_version = (
+            require_named_string(item, "producer_version", field)
+            if manifest_version == MANIFEST_V2
+            else None
+        )
+        parameters_sha256 = (
+            require_named_string(item, "parameters_sha256", field)
+            if manifest_version == MANIFEST_V2
+            else None
+        )
+        if (
+            parameters_sha256 is not None
+            and SHA256_PATTERN.fullmatch(parameters_sha256) is None
+        ):
+            raise CaseContractError(
+                f"{field}.parameters_sha256 must be 64 lowercase hex digits"
+            )
+        input_file_hashes = (
+            parse_input_file_hashes(item, case_dir, field)
+            if manifest_version == MANIFEST_V2
+            else ()
+        )
+
         artifacts.append(
             Artifact(
                 artifact_id=artifact_id,
@@ -386,11 +545,321 @@ def parse_artifacts(
                 sha256=sha256,
                 retrieved_at=retrieved_at,
                 row_count=row_count,
+                input_artifact_ids=input_artifact_ids,
+                producer=producer,
+                producer_version=producer_version,
+                parameters_sha256=parameters_sha256,
+                input_file_hashes=input_file_hashes,
             )
         )
         artifact_ids.add(artifact_id)
         artifact_paths.add(resolved_path)
-    return tuple(artifacts)
+    parsed = tuple(artifacts)
+    if manifest_version == MANIFEST_V2:
+        validate_artifact_dag(parsed)
+    return parsed
+
+
+def parse_input_artifact_ids(
+    data: Mapping[str, object], artifact_id: str, field: str
+) -> tuple[str, ...]:
+    """Validate ordered v2 parent ids before resolving the complete DAG."""
+    value = data.get("input_artifact_ids")
+    if not isinstance(value, list):
+        raise CaseContractError(f"{field}.input_artifact_ids must be an array")
+    parent_ids: list[str] = []
+    seen: set[str] = set()
+    for index, parent_id in enumerate(value):
+        parent_field = f"{field}.input_artifact_ids[{index}]"
+        if not isinstance(parent_id, str) or not parent_id:
+            raise CaseContractError(f"{parent_field} must be a non-empty string")
+        if ARTIFACT_NAME_PATTERN.fullmatch(parent_id) is None:
+            raise CaseContractError(f"{parent_field} has an invalid format")
+        if parent_id == artifact_id:
+            raise CaseContractError(f"{field} must not declare itself as an input")
+        if parent_id in seen:
+            raise CaseContractError(
+                f"{field} declares duplicate input artifact id: {parent_id}"
+            )
+        seen.add(parent_id)
+        parent_ids.append(parent_id)
+    return tuple(parent_ids)
+
+
+def parse_input_file_hashes(
+    data: Mapping[str, object], case_dir: Path, field: str
+) -> tuple[InputFileHash, ...]:
+    """Validate named case-relative input byte-hash records for manifest v2."""
+    value = data.get("input_file_hashes")
+    if not isinstance(value, list):
+        raise CaseContractError(f"{field}.input_file_hashes must be an array")
+    records: list[InputFileHash] = []
+    names: set[str] = set()
+    paths: set[Path] = set()
+    for index, record in enumerate(value):
+        record_field = f"{field}.input_file_hashes[{index}]"
+        if not isinstance(record, dict):
+            raise CaseContractError(f"{record_field} must be a TOML table")
+        validate_table_keys(
+            record,
+            required={"name", "path", "sha256"},
+            field=record_field,
+        )
+        name = require_named_string(record, "name", record_field)
+        if ARTIFACT_NAME_PATTERN.fullmatch(name) is None:
+            raise CaseContractError(f"{record_field}.name has an invalid format")
+        path = require_named_string(record, "path", record_field)
+        resolved_path = resolve_relative_path(case_dir, path, f"{record_field}.path")
+        sha256 = require_named_string(record, "sha256", record_field)
+        if SHA256_PATTERN.fullmatch(sha256) is None:
+            raise CaseContractError(
+                f"{record_field}.sha256 must be 64 lowercase hex digits"
+            )
+        if name in names:
+            raise CaseContractError(f"duplicate input file hash name: {name}")
+        if resolved_path in paths:
+            raise CaseContractError(f"duplicate input file hash path: {path}")
+        names.add(name)
+        paths.add(resolved_path)
+        records.append(InputFileHash(name=name, path=path, sha256=sha256))
+    return tuple(records)
+
+
+def validate_artifact_dag(artifacts: tuple[Artifact, ...]) -> None:
+    """Require that every v2 lineage edge is declared and acyclic."""
+    by_id = {artifact.artifact_id: artifact for artifact in artifacts}
+    for artifact in artifacts:
+        for parent_id in artifact.input_artifact_ids:
+            if parent_id not in by_id:
+                raise CaseContractError(
+                    f"artifact {artifact.artifact_id} declares missing input artifact: "
+                    f"{parent_id}"
+                )
+
+    visiting: set[str] = set()
+    visited: set[str] = set()
+
+    def visit(artifact_id: str) -> None:
+        if artifact_id in visiting:
+            raise CaseContractError(
+                f"artifact lineage contains a cycle at: {artifact_id}"
+            )
+        if artifact_id in visited:
+            return
+        visiting.add(artifact_id)
+        for parent_id in by_id[artifact_id].input_artifact_ids:
+            visit(parent_id)
+        visiting.remove(artifact_id)
+        visited.add(artifact_id)
+
+    for artifact in artifacts:
+        visit(artifact.artifact_id)
+
+    for artifact in artifacts:
+        _validate_parent_input_hashes(artifact, by_id)
+
+
+def _validate_parent_input_hashes(
+    artifact: Artifact,
+    by_id: Mapping[str, Artifact],
+) -> None:
+    """Bind each v2 parent edge to its canonical immutable input record."""
+    parent_ids = set(artifact.input_artifact_ids)
+    records_by_name = {
+        input_file.name: input_file for input_file in artifact.input_file_hashes
+    }
+    for parent_id in artifact.input_artifact_ids:
+        input_name = f"artifact.{parent_id}"
+        input_file = records_by_name.get(input_name)
+        if input_file is None:
+            raise CaseContractError(
+                f"artifact {artifact.artifact_id} missing input file hash for "
+                f"parent: {parent_id}"
+            )
+        parent = by_id[parent_id]
+        if input_file.path != parent.path:
+            raise CaseContractError(
+                f"artifact {artifact.artifact_id} input file hash for parent "
+                f"{parent_id} must use path {parent.path!r}"
+            )
+        if parent.sha256 is not None and input_file.sha256 != parent.sha256:
+            raise CaseContractError(
+                f"artifact {artifact.artifact_id} input file hash for parent "
+                f"{parent_id} must match its declared sha256"
+            )
+
+    for input_file in artifact.input_file_hashes:
+        if input_file.name.startswith("artifact.") and (
+            input_file.name.removeprefix("artifact.") not in parent_ids
+        ):
+            raise CaseContractError(
+                f"artifact {artifact.artifact_id} input file hash "
+                f"{input_file.name!r} does not name a declared parent"
+            )
+
+
+def canonical_parameters_sha256(parameters: Mapping[str, object]) -> str:
+    """Hash explicitly supplied JSON-compatible producer parameters stably."""
+    try:
+        encoded = json.dumps(
+            parameters,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise CaseContractError(
+            "producer parameters must be JSON-compatible deterministic values"
+        ) from exc
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def migrate_case(workspace: Path, case_id: str) -> CaseMigrationReceipt:
+    """Explicitly upgrade one v1 manifest to v2 without touching artifacts."""
+    case_dir = case_directory(workspace, case_id)
+    if not case_dir.is_dir():
+        raise CaseContractError(f"case not found: {case_id}")
+    with case_write_lock(case_dir):
+        manifest = read_manifest(case_dir)
+        if manifest.manifest_version == MANIFEST_V2:
+            return CaseMigrationReceipt(
+                case_dir=case_dir,
+                migrated=False,
+                manifest=manifest,
+            )
+
+        by_id = {artifact.artifact_id: artifact for artifact in manifest.artifacts}
+        actual_sha256_by_id = {
+            artifact.artifact_id: _migration_artifact_sha256(case_dir, artifact)
+            for artifact in manifest.artifacts
+        }
+        migrated_artifacts: list[Artifact] = []
+        for artifact in manifest.artifacts:
+            parent_ids: tuple[str, ...] = ()
+            role = _artifact_path_role(case_dir, artifact.path, manifest.paths)
+            if (
+                role in {"normalized", "derived", "reports"}
+                and artifact.source is not None
+                and artifact.source in by_id
+            ):
+                parent_ids = (artifact.source,)
+            input_hashes = tuple(
+                _migration_input_file_hash(
+                    parent=by_id[parent_id],
+                    sha256=actual_sha256_by_id[parent_id],
+                )
+                for parent_id in parent_ids
+            )
+            migrated_artifacts.append(
+                Artifact(
+                    artifact_id=artifact.artifact_id,
+                    kind=artifact.kind,
+                    schema_version=artifact.schema_version,
+                    path=artifact.path,
+                    sha256=actual_sha256_by_id[artifact.artifact_id],
+                    retrieved_at=artifact.retrieved_at,
+                    row_count=artifact.row_count,
+                    input_artifact_ids=parent_ids,
+                    producer="finresearch.case.migrate-v1",
+                    producer_version="1",
+                    parameters_sha256=canonical_parameters_sha256(
+                        {
+                            "legacy_artifact": artifact_to_dict(artifact, MANIFEST_V1),
+                            "migration_version": 1,
+                        }
+                    ),
+                    input_file_hashes=input_hashes,
+                )
+            )
+        migrated = CaseManifest(
+            manifest_version=MANIFEST_V2,
+            case_id=manifest.case_id,
+            title=manifest.title,
+            status=manifest.status,
+            paths=manifest.paths,
+            artifacts=tuple(migrated_artifacts),
+        )
+        # Validate before changing the manifest; data files are intentionally untouched.
+        parse_manifest(
+            {
+                "manifest_version": migrated.manifest_version,
+                "case_id": migrated.case_id,
+                "title": migrated.title,
+                "status": migrated.status,
+                "artifacts": [
+                    artifact_to_dict(artifact, migrated.manifest_version)
+                    for artifact in migrated.artifacts
+                ],
+                "paths": dict(migrated.paths),
+            },
+            case_dir,
+        )
+        write_manifest(case_dir, migrated)
+        return CaseMigrationReceipt(
+            case_dir=case_dir,
+            migrated=True,
+            manifest=migrated,
+        )
+
+
+def _artifact_path_role(
+    case_dir: Path,
+    artifact_path: str,
+    paths: Mapping[str, str],
+) -> str | None:
+    """Return the declared role containing an already-validated artifact path."""
+    resolved_artifact = resolve_relative_path(case_dir, artifact_path, "artifact path")
+    candidates: list[tuple[str, Path]] = []
+    for role, value in paths.items():
+        root = resolve_relative_path(case_dir, value, f"paths.{role}")
+        if root in resolved_artifact.parents:
+            candidates.append((role, root))
+    if not candidates:
+        return None
+    return max(candidates, key=lambda candidate: len(candidate[1].parts))[0]
+
+
+def _migration_artifact_sha256(case_dir: Path, artifact: Artifact) -> str:
+    """Verify and return actual legacy artifact bytes for a v2 declaration."""
+    path = resolve_relative_path(
+        case_dir,
+        artifact.path,
+        f"migration artifact {artifact.artifact_id}",
+    )
+    if not path.is_file():
+        raise CaseContractError(
+            f"migration artifact missing: {artifact.artifact_id} ({artifact.path})"
+        )
+    digest = _sha256(path)
+    if artifact.sha256 is not None and artifact.sha256 != digest:
+        raise CaseContractError(
+            f"migration artifact checksum mismatch: {artifact.artifact_id}; "
+            f"manifest {artifact.sha256}, file {digest}"
+        )
+    return digest
+
+
+def _migration_input_file_hash(
+    *,
+    parent: Artifact,
+    sha256: str,
+) -> InputFileHash:
+    """Build the canonical v2 input record from a verified parent artifact."""
+    return InputFileHash(
+        name=f"artifact.{parent.artifact_id}",
+        path=parent.path,
+        sha256=sha256,
+    )
+
+
+def _sha256(path: Path) -> str:
+    """Hash a file without loading it into memory."""
+    digest = hashlib.sha256()
+    with path.open("rb") as file_handle:
+        for chunk in iter(lambda: file_handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def inspect_case(workspace: Path, case_id: str) -> CaseStatus:

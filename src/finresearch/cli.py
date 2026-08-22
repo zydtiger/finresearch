@@ -15,6 +15,7 @@ from finresearch.cases import (
     ValidationIssue,
     initialize_case,
     inspect_case,
+    migrate_case,
 )
 from finresearch.data_contracts import DataContractError
 from finresearch.data_validation import (
@@ -186,12 +187,25 @@ def show_case_status(ctx: typer.Context, case_id: CaseIdArgument) -> None:
 
 @case_app.command("validate")
 def validate_case_command(ctx: typer.Context, case_id: CaseIdArgument) -> None:
-    """Validate a case against the complete v1 contract."""
+    """Validate a case against its versioned contract."""
     status = get_case_status(ctx, case_id)
     if not status.valid:
         print_issues(status.issues)
         raise typer.Exit(1)
     typer.echo(f"valid case: {case_id}")
+
+
+@case_app.command("migrate")
+def migrate_case_command(ctx: typer.Context, case_id: CaseIdArgument) -> None:
+    """Explicitly upgrade one v1 manifest to v2 without rewriting artifacts."""
+    try:
+        receipt = migrate_case(state_from_context(ctx).workspace, case_id)
+    except (CaseContractError, OSError) as exc:
+        fail(str(exc))
+    if receipt.migrated:
+        typer.echo(f"migrated case manifest to v2: {case_id}")
+    else:
+        typer.echo(f"case manifest already at v2: {case_id}")
 
 
 @data_app.command("ingest-yfinance-prices")
@@ -280,7 +294,7 @@ def validate_data_command(
     case_id: CaseIdArgument,
     artifact_id: ArtifactIdArgument = None,
 ) -> None:
-    """Deep-validate declared snapshots against their dataset contracts."""
+    """Validate declared artifact integrity and Parquet dataset contracts."""
     workspace = state_from_context(ctx).workspace
     try:
         issues = validate_artifact(workspace, case_id, artifact_id)

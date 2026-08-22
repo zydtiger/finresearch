@@ -10,9 +10,11 @@ from typing import Final
 import polars as pl
 
 from finresearch.cases import (
+    MANIFEST_V1,
     Artifact,
     CaseContractError,
     CaseManifest,
+    canonical_parameters_sha256,
     case_directory,
     read_manifest,
     resolve_relative_path,
@@ -24,11 +26,12 @@ from finresearch.data_contracts import (
     RAW_SEC_COMPANYFACTS_V1,
     RAW_YFINANCE_DAILY_PRICES_V1,
     DataContractError,
+    DatasetContract,
 )
 from finresearch.ingestion import (
     IngestionError,
     IngestionReceipt,
-    persist_snapshot,
+    publish_snapshot,
     symbol_key,
 )
 
@@ -39,6 +42,7 @@ PRICE_BASIS: Final = "unadjusted"
 COMPANYFACTS_KIND: Final = "raw.sec.companyfacts"
 # value types that carry a numeric JSON scalar in value_text
 _NUMERIC_VALUE_TYPES: Final = ("integer", "number")
+NORMALIZATION_PRODUCER_VERSION: Final = "2"
 
 
 @dataclass(frozen=True)
@@ -72,7 +76,7 @@ def normalize_daily_prices(
         raw_artifact,
     )
 
-    timestamp = _normalization_time(normalized_at)
+    timestamp = _normalization_time(normalized_at, raw_artifact, raw_frame)
     instrument_id = symbol_key(provider_symbol)
     currency = _require_constant(raw_frame, "currency", raw_artifact.artifact_id)
 
@@ -100,32 +104,29 @@ def normalize_daily_prices(
             f"raw snapshot {raw_artifact.artifact_id} cannot be normalized: {exc}"
         ) from exc
 
-    # The master registers first; if the price write is interrupted, the
-    # orphaned master is flagged by `case validate` and a re-run produces a
-    # fresh immutable pair.
-    master_receipt = persist_snapshot(
+    # The master registers first. If the price publication is interrupted, a
+    # rerun recognizes the identical master receipt and completes the pair.
+    master_receipt = _publish_normalized_snapshot(
         case_dir=case_dir,
         manifest=manifest,
         path_role="normalized",
         frame=master_frame,
         contract=NORMALIZED_INSTRUMENT_MASTER_V1,
-        provider="yfinance",
         path_parts=("normalized.instrument-master", instrument_id),
         entity_key=instrument_id,
-        retrieved_at=timestamp,
-        source=raw_artifact.artifact_id,
+        raw_artifact=raw_artifact,
+        normalized_at=timestamp,
     )
-    prices_receipt = persist_snapshot(
+    prices_receipt = _publish_normalized_snapshot(
         case_dir=case_dir,
         manifest=manifest,
         path_role="normalized",
         frame=prices_frame,
         contract=NORMALIZED_DAILY_PRICES_V1,
-        provider="yfinance",
         path_parts=("normalized.daily-prices", instrument_id),
         entity_key=instrument_id,
-        retrieved_at=timestamp,
-        source=raw_artifact.artifact_id,
+        raw_artifact=raw_artifact,
+        normalized_at=timestamp,
     )
     return NormalizationReceipt(
         instrument_master=master_receipt,
@@ -154,7 +155,7 @@ def normalize_fundamental_facts(
     raw_frame = _read_raw_snapshot(case_dir, raw_artifact)
     RAW_SEC_COMPANYFACTS_V1.validate(raw_frame)
 
-    timestamp = _normalization_time(normalized_at)
+    timestamp = _normalization_time(normalized_at, raw_artifact, raw_frame)
     facts_frame = _fundamental_facts_frame(
         raw_frame,
         normalized_cik=normalized_cik,
@@ -167,17 +168,61 @@ def normalize_fundamental_facts(
         raise IngestionError(
             f"raw snapshot {raw_artifact.artifact_id} cannot be normalized: {exc}"
         ) from exc
-    return persist_snapshot(
+    return _publish_normalized_snapshot(
         case_dir=case_dir,
         manifest=manifest,
         path_role="normalized",
         frame=facts_frame,
         contract=NORMALIZED_FUNDAMENTAL_FACTS_V1,
-        provider="sec",
         path_parts=("normalized.fundamental-facts", normalized_cik),
         entity_key=normalized_cik,
-        retrieved_at=timestamp,
-        source=raw_artifact.artifact_id,
+        raw_artifact=raw_artifact,
+        normalized_at=timestamp,
+    )
+
+
+def _publish_normalized_snapshot(
+    *,
+    case_dir: Path,
+    manifest: CaseManifest,
+    path_role: str,
+    frame: pl.DataFrame,
+    contract: DatasetContract,
+    path_parts: tuple[str, ...],
+    entity_key: str,
+    raw_artifact: Artifact,
+    normalized_at: datetime,
+) -> IngestionReceipt:
+    """Publish one normalized snapshot under a source-derived identity."""
+    parameters_sha256 = canonical_parameters_sha256(
+        {
+            "contract": contract.name,
+            "contract_version": contract.version,
+            "input_artifact_ids": [raw_artifact.artifact_id],
+            "normalized_at": _format_utc(normalized_at),
+            "producer": "finresearch.data.normalize",
+            "producer_version": NORMALIZATION_PRODUCER_VERSION,
+        }
+    )
+    return publish_snapshot(
+        case_dir=case_dir,
+        manifest=manifest,
+        path_role=path_role,
+        frame=frame,
+        contract=contract,
+        path_parts=path_parts,
+        entity_key=entity_key,
+        identity=parameters_sha256,
+        producer="finresearch.data.normalize",
+        producer_version=NORMALIZATION_PRODUCER_VERSION,
+        parameters_sha256=parameters_sha256,
+        input_artifact_ids=(raw_artifact.artifact_id,),
+        produced_at=normalized_at,
+        source=(
+            raw_artifact.artifact_id
+            if manifest.manifest_version == MANIFEST_V1
+            else None
+        ),
     )
 
 
@@ -259,7 +304,7 @@ def _fundamental_facts_frame(
             "numeric fact value"
         )
     # SEC can publish exact duplicate observations; keep the first copy.
-    return parsed.unique()
+    return parsed.unique(maintain_order=True)
 
 
 def _case_normalized_context(
@@ -436,8 +481,36 @@ def _require_constant(frame: pl.DataFrame, column: str, label: str) -> str:
     return values[0]
 
 
-def _normalization_time(value: datetime | None) -> datetime:
-    timestamp = value or datetime.now(UTC)
+def _normalization_time(
+    value: datetime | None,
+    raw_artifact: Artifact,
+    raw_frame: pl.DataFrame,
+) -> datetime:
+    """Use explicit or immutable source provenance, never the wall clock."""
+    timestamp = value
+    if timestamp is None:
+        if raw_artifact.retrieved_at is not None:
+            try:
+                timestamp = datetime.fromisoformat(
+                    raw_artifact.retrieved_at.removesuffix("Z") + "+00:00"
+                )
+            except ValueError as exc:
+                raise IngestionError(
+                    f"raw artifact {raw_artifact.artifact_id} has invalid retrieved_at"
+                ) from exc
+        else:
+            values = raw_frame.get_column("retrieved_at").unique().to_list()
+            if len(values) != 1 or not isinstance(values[0], datetime):
+                raise IngestionError(
+                    f"raw snapshot {raw_artifact.artifact_id} has inconsistent "
+                    f"retrieved_at: {values!r}"
+                )
+            timestamp = values[0]
     if timestamp.tzinfo is None or timestamp.utcoffset() is None:
         raise IngestionError("normalized_at must be timezone-aware")
     return timestamp.astimezone(UTC)
+
+
+def _format_utc(value: datetime) -> str:
+    """Render a normalized UTC timestamp for deterministic producer identity."""
+    return value.astimezone(UTC).isoformat().replace("+00:00", "Z")

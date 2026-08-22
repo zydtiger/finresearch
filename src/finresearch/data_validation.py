@@ -10,6 +10,7 @@ from pathlib import Path
 import polars as pl
 
 from finresearch.cases import (
+    MANIFEST_V2,
     Artifact,
     CaseContractError,
     CaseManifest,
@@ -84,7 +85,14 @@ def validate_artifact(
     declared_ids = {artifact.artifact_id for artifact in manifest.artifacts}
     issues: list[ValidationIssue] = []
     for artifact in _select_artifacts(manifest, artifact_id):
-        issues.extend(_validate_artifact(case_dir, artifact, declared_ids))
+        issues.extend(
+            _validate_artifact(
+                case_dir,
+                artifact,
+                manifest.manifest_version,
+                declared_ids,
+            )
+        )
     return tuple(issues)
 
 
@@ -96,15 +104,20 @@ def inspect_artifact(
 ) -> ArtifactInspection:
     """Deep-validate and inspect one declared Parquet artifact."""
     _validate_limit(limit)
-    issues = validate_artifact(workspace, case_id, artifact_id)
-    if issues:
-        details = "; ".join(f"[{issue.code}] {issue.message}" for issue in issues)
-        raise DataValidationError(f"artifact failed validation: {details}")
     case_dir = _case_directory(workspace, case_id)
     manifest = read_manifest(case_dir)
     selected = _select_artifacts(manifest, artifact_id)
     if len(selected) != 1:
         raise DataValidationError("inspect requires exactly one artifact id")
+    if Path(selected[0].path).suffix != ".parquet":
+        raise DataValidationError(
+            f"data inspect supports Parquet artifacts only: {artifact_id} "
+            f"({selected[0].path})"
+        )
+    issues = validate_artifact(workspace, case_id, artifact_id)
+    if issues:
+        details = "; ".join(f"[{issue.code}] {issue.message}" for issue in issues)
+        raise DataValidationError(f"artifact failed validation: {details}")
     return _inspect_artifact(case_dir, selected[0], limit)
 
 
@@ -120,11 +133,7 @@ def _select_artifacts(
     artifact_id: str | None,
 ) -> tuple[Artifact, ...]:
     if artifact_id is None:
-        return tuple(
-            artifact
-            for artifact in manifest.artifacts
-            if Path(artifact.path).suffix == ".parquet"
-        )
+        return manifest.artifacts
     selected = [
         artifact
         for artifact in manifest.artifacts
@@ -132,32 +141,35 @@ def _select_artifacts(
     ]
     if not selected:
         raise DataValidationError(f"artifact not declared: {artifact_id}")
-    if Path(selected[0].path).suffix != ".parquet":
-        raise DataValidationError(
-            f"unsupported non-Parquet artifact: {artifact_id} ({selected[0].path})"
-        )
     return tuple(selected)
 
 
 def _validate_artifact(
     case_dir: Path,
     artifact: Artifact,
+    manifest_version: int,
     declared_ids: set[str],
 ) -> list[ValidationIssue]:
+    """Apply common byte checks, then Parquet-specific dataset validation."""
     path = resolve_relative_path(
         case_dir,
         artifact.path,
         f"artifact {artifact.artifact_id}",
     )
+    issues = _validate_input_file_hashes(
+        case_dir,
+        artifact,
+        manifest_version,
+    )
     if not path.is_file():
-        return [
+        issues.insert(
+            0,
             ValidationIssue(
                 "artifact_missing",
                 f"artifact missing: {artifact.artifact_id} ({artifact.path})",
-            )
-        ]
-
-    issues: list[ValidationIssue] = []
+            ),
+        )
+        return issues
     if artifact.sha256 is not None:
         actual = _sha256(path)
         if actual != artifact.sha256:
@@ -169,6 +181,28 @@ def _validate_artifact(
                 )
             )
 
+    if Path(artifact.path).suffix != ".parquet":
+        return issues
+
+    return [
+        *issues,
+        *_validate_parquet_artifact(
+            path,
+            artifact,
+            manifest_version,
+            declared_ids,
+        ),
+    ]
+
+
+def _validate_parquet_artifact(
+    path: Path,
+    artifact: Artifact,
+    manifest_version: int,
+    declared_ids: set[str],
+) -> list[ValidationIssue]:
+    """Apply Parquet dataset and provenance checks after common integrity checks."""
+    issues: list[ValidationIssue] = []
     try:
         frame = pl.read_parquet(path)
     except Exception as exc:
@@ -239,12 +273,61 @@ def _validate_artifact(
                     f"source_artifact_id: {sources!r}",
                 )
             )
-        elif sources[0] not in declared_ids:
+        elif (
+            manifest_version == MANIFEST_V2
+            and sources[0] not in artifact.input_artifact_ids
+        ):
+            issues.append(
+                ValidationIssue(
+                    "lineage_invalid",
+                    f"artifact {artifact.artifact_id} source_artifact_id "
+                    f"{sources[0]!r} does not match manifest "
+                    f"input_artifact_ids {list(artifact.input_artifact_ids)!r}",
+                )
+            )
+        elif manifest_version != MANIFEST_V2 and sources[0] not in declared_ids:
             issues.append(
                 ValidationIssue(
                     "lineage_invalid",
                     f"artifact {artifact.artifact_id} points at undeclared "
                     f"source artifact {sources[0]!r}",
+                )
+            )
+    return issues
+
+
+def _validate_input_file_hashes(
+    case_dir: Path,
+    artifact: Artifact,
+    manifest_version: int,
+) -> list[ValidationIssue]:
+    """Verify that every v2 declared input file still has its recorded bytes."""
+    if manifest_version != MANIFEST_V2:
+        return []
+    issues: list[ValidationIssue] = []
+    for input_file in artifact.input_file_hashes:
+        path = resolve_relative_path(
+            case_dir,
+            input_file.path,
+            f"artifact {artifact.artifact_id} input {input_file.name}",
+        )
+        if not path.is_file():
+            issues.append(
+                ValidationIssue(
+                    "input_file_missing",
+                    f"artifact {artifact.artifact_id} input file missing: "
+                    f"{input_file.name} ({input_file.path})",
+                )
+            )
+            continue
+        actual = _sha256(path)
+        if actual != input_file.sha256:
+            issues.append(
+                ValidationIssue(
+                    "input_file_checksum_mismatch",
+                    f"artifact {artifact.artifact_id} input file sha256 mismatch: "
+                    f"{input_file.name} ({input_file.path}); manifest "
+                    f"{input_file.sha256}, file {actual}",
                 )
             )
     return issues

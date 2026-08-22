@@ -1,3 +1,4 @@
+import hashlib
 import json
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -6,7 +7,14 @@ import polars as pl
 import pytest
 from typer.testing import CliRunner, Result
 
-from finresearch.cases import initialize_case, read_manifest
+from finresearch.cases import (
+    DEFAULT_PATHS,
+    Artifact,
+    CaseManifest,
+    initialize_case,
+    read_manifest,
+    write_manifest,
+)
 from finresearch.cli import app
 from finresearch.data_contracts import NORMALIZED_FUNDAMENTAL_FACTS_V1
 from finresearch.ingestion import IngestionError, ingest_sec_companyfacts
@@ -72,6 +80,37 @@ def build_facts_case(
     return tmp_path
 
 
+def build_v1_facts_case_without_manifest_retrieved_at(tmp_path: Path) -> Path:
+    """Create a legacy raw declaration whose retrieval time remains in Parquet."""
+    case_dir = initialize_case(tmp_path, "aapl")
+    path = f"data/raw/sec/companyfacts/{CIK}/legacy.parquet"
+    output = case_dir / path
+    output.parent.mkdir(parents=True)
+    fixture_frame().write_parquet(output, compression="zstd")
+    write_manifest(
+        case_dir,
+        CaseManifest(
+            manifest_version=1,
+            case_id="aapl",
+            title="Legacy case",
+            status="active",
+            paths=dict(DEFAULT_PATHS),
+            artifacts=(
+                Artifact(
+                    artifact_id=f"raw.sec.companyfacts.{CIK}.legacy",
+                    kind="raw.sec.companyfacts",
+                    schema_version=1,
+                    path=path,
+                    source="sec",
+                    sha256=hashlib.sha256(output.read_bytes()).hexdigest(),
+                    row_count=2,
+                ),
+            ),
+        ),
+    )
+    return tmp_path
+
+
 def normalized_frame(workspace: Path) -> pl.DataFrame:
     """Read the single normalized fundamental-facts artifact."""
     manifest = read_manifest(workspace / "cases" / "aapl")
@@ -109,7 +148,8 @@ def test_normalize_facts_writes_parsed_table(tmp_path: Path) -> None:
         for item in manifest.artifacts
         if item.kind == "raw.sec.companyfacts"
     ]
-    assert artifact.source == raw_ids[0]
+    assert artifact.source is None
+    assert artifact.input_artifact_ids == (raw_ids[0],)
 
 
 def test_normalize_facts_value_parsing(tmp_path: Path) -> None:
@@ -243,3 +283,25 @@ def test_normalize_facts_cli_reports_receipt(tmp_path: Path) -> None:
     assert "normalized fundamental-facts:" in result.output
     assert "artifact: normalized.fundamental-facts.0000320193." in result.output
     assert "rows: 2" in result.output
+
+
+def test_normalize_facts_cli_v1_without_manifest_retrieved_at_is_deterministic(
+    tmp_path: Path,
+) -> None:
+    workspace = build_v1_facts_case_without_manifest_retrieved_at(tmp_path)
+
+    first = invoke(workspace, "data", "normalize-fundamental-facts", "aapl", CIK)
+    second = invoke(workspace, "data", "normalize-fundamental-facts", "aapl", CIK)
+
+    assert first.exit_code == 0
+    assert second.exit_code == 0, second.output
+    manifest = read_manifest(workspace / "cases" / "aapl")
+    normalized = [
+        artifact
+        for artifact in manifest.artifacts
+        if artifact.kind == "normalized.fundamental-facts"
+    ]
+    assert manifest.manifest_version == 1
+    assert len(normalized) == 1
+    frame = pl.read_parquet(workspace / "cases" / "aapl" / normalized[0].path)
+    assert frame.get_column("normalized_at").unique().to_list() == [RETRIEVED_AT]

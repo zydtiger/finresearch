@@ -7,7 +7,7 @@ import polars as pl
 import pytest
 from typer.testing import CliRunner, Result
 
-from finresearch.cases import Artifact, append_artifact, initialize_case
+from finresearch.cases import Artifact, InputFileHash, append_artifact, initialize_case
 from finresearch.cli import app
 from finresearch.data_contracts import (
     NORMALIZED_INSTRUMENT_MASTER_V1,
@@ -104,6 +104,8 @@ def write_artifact(
     sha256: str | None = None,
     row_count: int | None = None,
     retrieved_at: str = RETRIEVED_AT_TEXT,
+    input_artifact_ids: tuple[str, ...] = (),
+    input_file_hashes: tuple[InputFileHash, ...] = (),
 ) -> Path:
     """Persist a parquet snapshot and declare it in the case manifest."""
     output = case_dir / path
@@ -117,10 +119,14 @@ def write_artifact(
             kind=kind,
             schema_version=schema_version,
             path=path,
-            source=kind.split(".")[1],
             sha256=digest,
             retrieved_at=retrieved_at,
             row_count=frame.height if row_count is None else row_count,
+            producer="finresearch.test",
+            producer_version="1",
+            parameters_sha256=hashlib.sha256(artifact_id.encode()).hexdigest(),
+            input_artifact_ids=input_artifact_ids,
+            input_file_hashes=input_file_hashes,
         ),
     )
     return output
@@ -163,7 +169,7 @@ def test_validate_no_artifacts_is_valid(tmp_path: Path) -> None:
     assert "valid: all declared artifacts of empty" in result.output
 
 
-def test_validate_all_ignores_declared_non_parquet_artifact(price_case: Path) -> None:
+def test_validate_all_checks_declared_non_parquet_artifact(price_case: Path) -> None:
     case_dir = price_case / "cases" / "aapl"
     report_path = case_dir / "reports/summary.md"
     report_path.write_text("# Summary\n", encoding="utf-8")
@@ -174,6 +180,10 @@ def test_validate_all_ignores_declared_non_parquet_artifact(price_case: Path) ->
             kind="report.markdown",
             schema_version=1,
             path="reports/summary.md",
+            producer="finresearch.test",
+            producer_version="1",
+            parameters_sha256="a" * 64,
+            sha256=hashlib.sha256(report_path.read_bytes()).hexdigest(),
         ),
     )
 
@@ -183,8 +193,10 @@ def test_validate_all_ignores_declared_non_parquet_artifact(price_case: Path) ->
     assert "valid: all declared artifacts of aapl" in result.output
 
 
-def test_validate_exact_non_parquet_artifact_is_unsupported(price_case: Path) -> None:
+def test_validate_exact_non_parquet_artifact_checks_integrity(price_case: Path) -> None:
     case_dir = price_case / "cases" / "aapl"
+    report_path = case_dir / "reports/summary.md"
+    report_path.write_text("# Summary\n", encoding="utf-8")
     append_artifact(
         case_dir,
         Artifact(
@@ -192,13 +204,43 @@ def test_validate_exact_non_parquet_artifact_is_unsupported(price_case: Path) ->
             kind="report.markdown",
             schema_version=1,
             path="reports/summary.md",
+            producer="finresearch.test",
+            producer_version="1",
+            parameters_sha256="a" * 64,
+            sha256=hashlib.sha256(report_path.read_bytes()).hexdigest(),
         ),
     )
 
     result = invoke(price_case, "data", "validate", "aapl", "report.summary")
 
+    assert result.exit_code == 0
+    assert "valid: report.summary" in result.output
+
+
+def test_inspect_rejects_non_parquet_artifact(
+    price_case: Path,
+) -> None:
+    case_dir = price_case / "cases" / "aapl"
+    report_path = case_dir / "reports/summary.md"
+    report_path.write_text("# Summary\n", encoding="utf-8")
+    append_artifact(
+        case_dir,
+        Artifact(
+            artifact_id="report.summary",
+            kind="report.markdown",
+            schema_version=1,
+            path="reports/summary.md",
+            producer="finresearch.test",
+            producer_version="1",
+            parameters_sha256="a" * 64,
+            sha256=hashlib.sha256(report_path.read_bytes()).hexdigest(),
+        ),
+    )
+
+    result = invoke(price_case, "data", "inspect", "aapl", "report.summary")
+
     assert result.exit_code == 1
-    assert "unsupported non-Parquet artifact: report.summary" in result.output
+    assert "data inspect supports Parquet artifacts only" in result.output
 
 
 def test_validate_checksum_mismatch(price_case: Path) -> None:
@@ -206,6 +248,31 @@ def test_validate_checksum_mismatch(price_case: Path) -> None:
     artifact_path.write_bytes(b"tampered snapshot bytes")
 
     result = invoke(price_case, "data", "validate", "aapl")
+
+    assert result.exit_code == 1
+    assert "error [checksum_mismatch]" in result.output
+
+
+def test_validate_non_parquet_checksum_mismatch(price_case: Path) -> None:
+    case_dir = price_case / "cases" / "aapl"
+    report_path = case_dir / "reports/summary.md"
+    report_path.write_bytes(b"# Summary\n")
+    append_artifact(
+        case_dir,
+        Artifact(
+            artifact_id="report.summary",
+            kind="report.markdown",
+            schema_version=1,
+            path="reports/summary.md",
+            sha256=hashlib.sha256(report_path.read_bytes()).hexdigest(),
+            producer="finresearch.test",
+            producer_version="1",
+            parameters_sha256="a" * 64,
+        ),
+    )
+    report_path.write_bytes(b"# Tampered\n")
+
+    result = invoke(price_case, "data", "validate", "aapl", "report.summary")
 
     assert result.exit_code == 1
     assert "error [checksum_mismatch]" in result.output
@@ -582,20 +649,207 @@ def test_validate_rejects_dangling_lineage(price_case: Path) -> None:
 
     assert result.exit_code == 1
     assert "error [lineage_invalid]" in result.output
-    assert "undeclared source artifact" in result.output
+    assert "does not match manifest input_artifact_ids" in result.output
 
 
 def test_validate_accepts_declared_lineage(price_case: Path) -> None:
     case_dir = price_case / "cases" / "aapl"
+    parent_path = case_dir / PRICE_ARTIFACT_PATH
     write_artifact(
         case_dir,
         master_frame(source_artifact_id=PRICE_ARTIFACT_ID),
         artifact_id="normalized.instrument-master.aapl.valid",
         kind="normalized.instrument-master",
         path="data/normalized/normalized.instrument-master/aapl/valid.parquet",
+        input_artifact_ids=(PRICE_ARTIFACT_ID,),
+        input_file_hashes=(
+            InputFileHash(
+                name=f"artifact.{PRICE_ARTIFACT_ID}",
+                path=PRICE_ARTIFACT_PATH,
+                sha256=hashlib.sha256(parent_path.read_bytes()).hexdigest(),
+            ),
+        ),
     )
 
     result = invoke(price_case, "data", "validate", "aapl")
 
     assert result.exit_code == 0
     assert "valid: all declared artifacts of aapl" in result.output
+
+
+def test_validate_accepts_source_with_multiple_declared_v2_inputs(
+    price_case: Path,
+) -> None:
+    case_dir = price_case / "cases" / "aapl"
+    other_id = "raw.yfinance.daily-prices.aapl.other-input"
+    other_path = "data/raw/yfinance/daily-prices/aapl/other-input.parquet"
+    other_output = write_artifact(
+        case_dir,
+        price_frame(),
+        artifact_id=other_id,
+        kind="raw.yfinance.daily-prices",
+        path=other_path,
+    )
+    parent_path = case_dir / PRICE_ARTIFACT_PATH
+    write_artifact(
+        case_dir,
+        master_frame(source_artifact_id=PRICE_ARTIFACT_ID),
+        artifact_id="normalized.instrument-master.aapl.multiple-inputs",
+        kind="normalized.instrument-master",
+        path="data/normalized/normalized.instrument-master/aapl/multiple-inputs.parquet",
+        input_artifact_ids=(PRICE_ARTIFACT_ID, other_id),
+        input_file_hashes=(
+            InputFileHash(
+                name=f"artifact.{PRICE_ARTIFACT_ID}",
+                path=PRICE_ARTIFACT_PATH,
+                sha256=hashlib.sha256(parent_path.read_bytes()).hexdigest(),
+            ),
+            InputFileHash(
+                name=f"artifact.{other_id}",
+                path=other_path,
+                sha256=hashlib.sha256(other_output.read_bytes()).hexdigest(),
+            ),
+        ),
+    )
+
+    result = invoke(price_case, "data", "validate", "aapl")
+
+    assert result.exit_code == 0
+    assert "valid: all declared artifacts of aapl" in result.output
+
+
+def test_validate_rejects_lineage_switched_to_different_declared_parent(
+    price_case: Path,
+) -> None:
+    case_dir = price_case / "cases" / "aapl"
+    other_id = "raw.yfinance.daily-prices.aapl.other"
+    other_path = "data/raw/yfinance/daily-prices/aapl/other.parquet"
+    other_output = write_artifact(
+        case_dir,
+        price_frame(),
+        artifact_id=other_id,
+        kind="raw.yfinance.daily-prices",
+        path=other_path,
+    )
+    write_artifact(
+        case_dir,
+        master_frame(source_artifact_id=PRICE_ARTIFACT_ID),
+        artifact_id="normalized.instrument-master.aapl.switched",
+        kind="normalized.instrument-master",
+        path="data/normalized/normalized.instrument-master/aapl/switched.parquet",
+        input_artifact_ids=(other_id,),
+        input_file_hashes=(
+            InputFileHash(
+                name=f"artifact.{other_id}",
+                path=other_path,
+                sha256=hashlib.sha256(other_output.read_bytes()).hexdigest(),
+            ),
+        ),
+    )
+
+    result = invoke(price_case, "data", "validate", "aapl")
+
+    assert result.exit_code == 1
+    assert "error [lineage_invalid]" in result.output
+    assert "does not match manifest input_artifact_ids" in result.output
+
+
+def test_validate_rejects_v2_input_file_hash_mismatch(price_case: Path) -> None:
+    case_dir = price_case / "cases" / "aapl"
+    parent_path = case_dir / PRICE_ARTIFACT_PATH
+    write_artifact(
+        case_dir,
+        master_frame(source_artifact_id=PRICE_ARTIFACT_ID),
+        artifact_id="normalized.instrument-master.aapl.bad-hash",
+        kind="normalized.instrument-master",
+        path="data/normalized/normalized.instrument-master/aapl/bad-hash.parquet",
+        input_artifact_ids=(PRICE_ARTIFACT_ID,),
+        input_file_hashes=(
+            InputFileHash(
+                name=f"artifact.{PRICE_ARTIFACT_ID}",
+                path=PRICE_ARTIFACT_PATH,
+                sha256=hashlib.sha256(parent_path.read_bytes()).hexdigest(),
+            ),
+        ),
+    )
+    parent_path.write_bytes(b"tampered raw input")
+
+    result = invoke(
+        price_case,
+        "data",
+        "validate",
+        "aapl",
+        "normalized.instrument-master.aapl.bad-hash",
+    )
+
+    assert result.exit_code == 1
+    assert "error [input_file_checksum_mismatch]" in result.output
+    assert "input file sha256 mismatch" in result.output
+
+
+def test_validate_rejects_v2_missing_input_file(price_case: Path) -> None:
+    case_dir = price_case / "cases" / "aapl"
+    parent_path = case_dir / PRICE_ARTIFACT_PATH
+    write_artifact(
+        case_dir,
+        master_frame(source_artifact_id=PRICE_ARTIFACT_ID),
+        artifact_id="normalized.instrument-master.aapl.missing-input",
+        kind="normalized.instrument-master",
+        path="data/normalized/normalized.instrument-master/aapl/missing-input.parquet",
+        input_artifact_ids=(PRICE_ARTIFACT_ID,),
+        input_file_hashes=(
+            InputFileHash(
+                name=f"artifact.{PRICE_ARTIFACT_ID}",
+                path=PRICE_ARTIFACT_PATH,
+                sha256=hashlib.sha256(parent_path.read_bytes()).hexdigest(),
+            ),
+            InputFileHash(
+                name="analysis-input",
+                path="analysis/missing-input.csv",
+                sha256="0" * 64,
+            ),
+        ),
+    )
+
+    result = invoke(price_case, "data", "validate", "aapl")
+
+    assert result.exit_code == 1
+    assert "error [input_file_missing]" in result.output
+    assert "input file missing" in result.output
+
+
+def test_validate_rejects_non_parquet_input_file_hash_mismatch(
+    price_case: Path,
+) -> None:
+    case_dir = price_case / "cases" / "aapl"
+    report_path = case_dir / "reports/summary.md"
+    report_path.write_text("# Summary\n", encoding="utf-8")
+    parent_path = case_dir / PRICE_ARTIFACT_PATH
+    append_artifact(
+        case_dir,
+        Artifact(
+            artifact_id="report.summary",
+            kind="report.markdown",
+            schema_version=1,
+            path="reports/summary.md",
+            sha256=hashlib.sha256(report_path.read_bytes()).hexdigest(),
+            producer="finresearch.test",
+            producer_version="1",
+            parameters_sha256="a" * 64,
+            input_artifact_ids=(PRICE_ARTIFACT_ID,),
+            input_file_hashes=(
+                InputFileHash(
+                    name=f"artifact.{PRICE_ARTIFACT_ID}",
+                    path=PRICE_ARTIFACT_PATH,
+                    sha256=hashlib.sha256(parent_path.read_bytes()).hexdigest(),
+                ),
+            ),
+        ),
+    )
+    parent_path.write_bytes(b"tampered raw input")
+
+    result = invoke(price_case, "data", "validate", "aapl", "report.summary")
+
+    assert result.exit_code == 1
+    assert "error [input_file_checksum_mismatch]" in result.output
+    assert "input file sha256 mismatch" in result.output

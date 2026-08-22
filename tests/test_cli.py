@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 from typer.testing import CliRunner, Result
 
+from finresearch.cases import DEFAULT_PATHS, CaseManifest, write_manifest
 from finresearch.cli import app
 from finresearch.ingestion import IngestionReceipt
 from finresearch.providers.sec import SECProviderError
@@ -52,6 +53,30 @@ def test_case_init_does_not_overwrite_collision(tmp_path: Path) -> None:
     assert repeated.exit_code == 1
     assert "case already exists: aapl" in repeated.output
     assert manifest.read_bytes() == original
+
+
+def test_case_migrate_upgrades_v1_and_is_idempotent(tmp_path: Path) -> None:
+    case_dir = tmp_path / "cases" / "legacy"
+    case_dir.mkdir(parents=True)
+    write_manifest(
+        case_dir,
+        CaseManifest(
+            manifest_version=1,
+            case_id="legacy",
+            title="Legacy case",
+            status="active",
+            paths=dict(DEFAULT_PATHS),
+            artifacts=(),
+        ),
+    )
+
+    migrated = invoke(tmp_path, "case", "migrate", "legacy")
+    repeated = invoke(tmp_path, "case", "migrate", "legacy")
+
+    assert migrated.exit_code == 0
+    assert "migrated case manifest to v2: legacy" in migrated.output
+    assert repeated.exit_code == 0
+    assert "case manifest already at v2: legacy" in repeated.output
 
 
 def test_case_status_reports_missing_case(tmp_path: Path) -> None:

@@ -20,8 +20,10 @@ Ingestion, validation, and future inspection commands must import the same
 - Every snapshot records provider-specific request identity and parameters,
   retrieval time, and an independent dataset schema version. For example,
   yfinance records symbol/period/interval while SEC records CIK and endpoint.
-- The manifest records artifact ID, kind, schema version, relative path,
-  provider, retrieval time, row count, and SHA-256 checksum.
+- In v1 manifests, the manifest records artifact ID, kind, schema version,
+  relative path, provider (`source`), retrieval time, row count, and SHA-256
+  checksum. New v2 cases instead record deterministic producer metadata and an
+  empty ordered parent list for raw snapshots; v2 has no legacy `source` field.
 - A failed Parquet write or manifest update removes only the new partial output.
 - Per-case file and process locks serialize snapshot publication with manifest
   updates; the persistent `.finresearch.lock` file is internal workspace state.
@@ -143,28 +145,34 @@ instances and CLI processes.
 ## Deep validation and inspection
 
 `case validate` only checks that the manifest is well-formed and that declared
-files exist. `data validate` re-reads each declared Parquet snapshot and
-verifies, per artifact:
+files exist. `data validate` performs common integrity checks for every
+declared artifact, then re-reads Parquet artifacts for dataset validation. It
+verifies, per artifact as applicable:
 
 - the manifest SHA-256 matches the file bytes;
+- for v2 artifacts, every declared input-file hash resolves to existing bytes
+  with the recorded SHA-256;
 - the manifest row count matches the Parquet height;
 - the artifact `kind` and `schema_version` resolve to a registered
   `DatasetContract` in `data_contracts.py`;
 - the Parquet schema, required non-null fields, and unique key satisfy that
-  contract; and
+  contract;
 - the manifest `retrieved_at` matches the snapshot's own `retrieved_at`
-  provenance column.
+  provenance column; and
+- for a v2 Parquet contract with `source_artifact_id`, the observed source is
+  one of the artifact's authoritative `input_artifact_ids`.
 
 ```text
 finresearch --workspace PATH data validate CASE_ID [ARTIFACT_ID]
 finresearch --workspace PATH data inspect CASE_ID ARTIFACT_ID [--limit N]
 ```
 
-Without `ARTIFACT_ID`, `data validate` deep-checks every declared `.parquet`
-artifact and ignores declared non-Parquet outputs such as reports. Exact
-selection of a non-Parquet artifact fails as unsupported. `data inspect` runs
-the same deep validation first, then reports the contract identifier, relative
-path, size, SHA-256,
+Without `ARTIFACT_ID`, `data validate` checks every declared artifact,
+including non-Parquet outputs such as reports. Exact selection of a non-Parquet
+artifact performs the same integrity checks. `data inspect` remains limited to
+Parquet artifacts and reports a clear unsupported-type error otherwise; for a
+Parquet artifact it runs the same deep validation first, then reports the
+contract identifier, relative path, size, SHA-256,
 row count, columns and dtypes, date and timestamp ranges, per-column null
 counts, unique-key violations, constant provenance fields (`provider`,
 `provider_symbol`, `cik`, and `source_url` when the snapshot declares them), and a
@@ -186,11 +194,12 @@ finresearch --workspace PATH data normalize-daily-prices \
   CASE_ID SYMBOL [--raw-artifact-id ARTIFACT_ID]
 ```
 
-The command writes two registered artifacts below `data/normalized/` and
-records each manifest `source` as the raw artifact id, so every normalized row
-can be traced to its exact raw snapshot. When a symbol has several raw
-snapshots, `--raw-artifact-id` selects one; otherwise normalization fails with
-the candidate ids.
+The command writes two registered artifacts below `data/normalized/`. In a v2
+manifest, each records the raw artifact in `input_artifact_ids` plus its
+case-relative input-file hash, so every normalized row can be traced to its
+exact input bytes. A v1 manifest retains its legacy `source` declaration. When
+a symbol has several raw snapshots, `--raw-artifact-id` selects one; otherwise
+normalization fails with the candidate ids.
 
 ### normalized.instrument-master.v1
 
@@ -216,10 +225,17 @@ Rules:
 - `adj_close` stays in raw; adjusted-price output is a future contract with its
   own `price_basis`, keeping any single table single-basis.
 
-Re-running normalization appends a fresh immutable pair (no overwrite). The
-instrument master registers before the price bars; if the process is
-interrupted between the two writes, `case validate` flags the orphaned master
-and a re-run produces a complete pair.
+Normalization derives its transform timestamp from explicit `normalized_at`
+input or the raw artifact's immutable `retrieved_at` metadata; for a valid
+legacy v1 declaration that lacks manifest `retrieved_at`, it uses the single
+contract-validated `retrieved_at` value in the raw Parquet snapshot. It never
+reads the wall clock. The resulting identity, Parquet bytes, and manifest
+declaration are therefore stable for the same source artifact, contract, and
+producer version. Re-running that exact transformation returns the existing
+pair without adding artifacts. The instrument master registers before the
+price bars; if publication is interrupted between them, a rerun reuses the
+master receipt and completes the pair. Existing v1 cases remain readable with
+their original artifact files.
 
 Both normalized tables share the same `DatasetContract` registry, so
 `data validate` and `data inspect` cover them without extra code.
@@ -233,8 +249,8 @@ finresearch --workspace PATH data normalize-fundamental-facts \
 
 Parses one immutable raw SEC companyfacts snapshot into a long-form table with
 one row per reported observation. Like the other normalized tables it is a
-deterministic, offline transformation; the manifest `source` records the raw
-artifact id.
+deterministic, offline transformation; v2 manifests record the raw artifact id
+in `input_artifact_ids` and v1 manifests retain the legacy `source` field.
 
 Contract identifier: `normalized.fundamental-facts.v1`
 
