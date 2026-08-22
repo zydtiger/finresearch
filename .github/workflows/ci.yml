@@ -10,8 +10,8 @@ permissions:
   contents: read
 
 jobs:
-  validate:
-    name: Validate
+  lint:
+    name: Lint
     runs-on: ubuntu-latest
 
     steps:
@@ -30,18 +30,51 @@ jobs:
       - name: Install project
         run: uv sync --locked --group dev
 
-      - name: Run repository gates
+      - name: Run static checks
+        run: |
+          uvx prek@0.4.14 run --all-files --stage pre-commit
+          uvx prek@0.4.14 run mypy --all-files --stage pre-push
+
+  test:
+    name: Test (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    env:
+      UV_PYTHON: ${{ matrix.python-version }}
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13", "3.14"]
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install uv and Python
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          cache-suffix: py${{ matrix.python-version }}
+          enable-cache: true
+          python-version: ${{ matrix.python-version }}
+          version: "0.12.5"
+
+      - name: Install project
+        run: uv sync --locked --group dev
+
+      - name: Run tests
         run: |
           # Rich forces ANSI styling when it detects GitHub Actions, which
           # breaks plain-text CLI assertions despite identical CLI behavior.
           unset GITHUB_ACTIONS
-          uvx prek@0.4.14 run --all-files --stage pre-commit
-          uvx prek@0.4.14 run --all-files --stage pre-push
+          uvx prek@0.4.14 run pytest --all-files --stage pre-push
 
       - name: Build distributions
+        if: matrix.python-version == '3.12'
         run: uv build --no-sources
 
       - name: Validate wheel installation
+        if: matrix.python-version == '3.12'
         run: |
           wheel=$(find dist -maxdepth 1 -type f -name '*.whl' -print -quit)
           test -n "$wheel"
