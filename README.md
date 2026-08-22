@@ -11,9 +11,36 @@ uses research state receives the workspace explicitly with `--workspace`.
 
 ## Setup
 
+Install the CLI directly from the public Git repository:
+
+```bash
+uv tool install git+https://github.com/zydtiger/finresearch.git
+```
+
+For development from a source checkout:
+
 ```bash
 uv sync --group dev
 ```
+
+## Agent usage skill
+
+The repository-root `SKILL.md` is a self-contained usage manual for agents. It
+is distributed independently from the executable through `skillctl` file mode:
+
+```bash
+skillctl add --global https://github.com/zydtiger/finresearch.git \
+  --file SKILL.md --name finresearch-skill --ref main
+```
+
+Update an existing managed installation with:
+
+```bash
+skillctl update --global finresearch-skill
+```
+
+Installing the Python package does not modify agent configuration, and
+installing the skill does not install the `finresearch` executable.
 
 ## Usage
 
