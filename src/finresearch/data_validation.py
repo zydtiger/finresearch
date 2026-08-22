@@ -83,8 +83,10 @@ def validate_artifact(
     workspace: Path,
     case_id: str,
     artifact_id: str | None = None,
+    *,
+    verify_hashes: bool = True,
 ) -> tuple[ValidationIssue, ...]:
-    """Deep-validate declared artifacts; return issues instead of raising."""
+    """Deep-validate declared artifacts; optionally verify every byte digest."""
     case_dir = _case_directory(workspace, case_id)
     manifest = read_manifest(case_dir)
     declared_ids = {artifact.artifact_id for artifact in manifest.artifacts}
@@ -97,6 +99,7 @@ def validate_artifact(
                 manifest.manifest_version,
                 declared_ids,
                 manifest,
+                verify_hashes=verify_hashes,
             )
         )
     return tuple(issues)
@@ -156,6 +159,8 @@ def _validate_artifact(
     manifest_version: int,
     declared_ids: set[str],
     manifest: CaseManifest,
+    *,
+    verify_hashes: bool,
 ) -> list[ValidationIssue]:
     """Apply common byte checks, then Parquet-specific dataset validation."""
     path = resolve_relative_path(
@@ -167,6 +172,7 @@ def _validate_artifact(
         case_dir,
         artifact,
         manifest_version,
+        verify_hashes=verify_hashes,
     )
     if not path.is_file():
         issues.insert(
@@ -177,7 +183,7 @@ def _validate_artifact(
             ),
         )
         return issues
-    if artifact.sha256 is not None:
+    if verify_hashes and artifact.sha256 is not None:
         actual = _sha256(path)
         if actual != artifact.sha256:
             issues.append(
@@ -325,8 +331,10 @@ def _validate_input_file_hashes(
     case_dir: Path,
     artifact: Artifact,
     manifest_version: int,
+    *,
+    verify_hashes: bool,
 ) -> list[ValidationIssue]:
-    """Verify that every v2 declared input file still has its recorded bytes."""
+    """Check v2 input-file locations and optionally verify their byte hashes."""
     if manifest_version != MANIFEST_V2:
         return []
     issues: list[ValidationIssue] = []
@@ -345,8 +353,8 @@ def _validate_input_file_hashes(
                 )
             )
             continue
-        actual = _sha256(path)
-        if actual != input_file.sha256:
+        actual = _sha256(path) if verify_hashes else None
+        if actual is not None and actual != input_file.sha256:
             issues.append(
                 ValidationIssue(
                     "input_file_checksum_mismatch",

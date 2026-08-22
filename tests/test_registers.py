@@ -211,6 +211,43 @@ def test_dangling_evidence_reference_is_rejected(register_case: Path) -> None:
     assert any(issue.code == "register_dangling_reference" for issue in status.issues)
 
 
+def test_register_reference_uses_physical_line_after_empty_row(
+    register_case: Path,
+) -> None:
+    assumptions = register_case / "cases" / "aapl" / "registers" / "assumptions.csv"
+    assumptions.write_text(
+        "id,parameter,value,unit,rationale,source_evidence,updated_at\n"
+        ",,,,,,\n"
+        "assumption-001,revenue_growth,0.10,pct,Three-year average,ghost,2026-08-01\n",
+        encoding="utf-8",
+    )
+
+    status = inspect_registers(register_case, "aapl")
+
+    assert (
+        "register_dangling_reference",
+        "assumptions.csv:3 source_evidence 'ghost' is not a declared evidence id",
+    ) in {(issue.code, issue.message) for issue in status.issues}
+
+
+def test_register_row_validation_uses_physical_line_after_empty_row(
+    register_case: Path,
+) -> None:
+    assumptions = register_case / "cases" / "aapl" / "registers" / "assumptions.csv"
+    assumptions.write_text(
+        "id,parameter,value,unit,rationale,source_evidence,updated_at\n"
+        ",,,,,,\n"
+        "assumption-001,,,,,,not-a-date\n",
+        encoding="utf-8",
+    )
+
+    status = inspect_registers(register_case, "aapl")
+    messages = {issue.message for issue in status.issues}
+
+    assert "assumptions.csv:3 missing 'parameter'" in messages
+    assert "assumptions.csv:3 updated_at is not YYYY-MM-DD: 'not-a-date'" in messages
+
+
 def test_missing_case_fails(tmp_path: Path) -> None:
     result = invoke(tmp_path, "data", "registers", "status", "missing")
 
@@ -224,9 +261,67 @@ def test_empty_register_file_is_valid(tmp_path: Path) -> None:
     registers_dir = case_dir / "registers"
     registers_dir.mkdir()
     for filename in REGISTER_FILES:
-        (registers_dir / filename).write_text("id\n", encoding="utf-8")
+        header = ",".join(VALID_REGISTERS[filename][0])
+        (registers_dir / filename).write_text(f"{header}\n", encoding="utf-8")
 
     status = inspect_registers(tmp_path, "aapl")
 
     assert status.registers_present == 5
     assert status.valid
+
+
+@pytest.mark.parametrize("filename", ("evidence.csv", "assumptions.csv"))
+def test_duplicate_legal_register_header_is_rejected(
+    register_case: Path, filename: str
+) -> None:
+    case_dir = register_case / "cases" / "aapl"
+    original = (case_dir / "registers" / filename).read_text(encoding="utf-8")
+    header, *rows = original.splitlines()
+    (case_dir / "registers" / filename).write_text(
+        f"{header},id\n" + "\n".join(rows) + "\n",
+        encoding="utf-8",
+    )
+
+    status = inspect_registers(register_case, "aapl")
+
+    assert any(
+        issue.code == "register_schema" and "duplicate columns: id" in issue.message
+        for issue in status.issues
+    )
+
+
+def test_register_header_order_is_rejected(register_case: Path) -> None:
+    case_dir = register_case / "cases" / "aapl"
+    evidence = case_dir / "registers" / "evidence.csv"
+    _header, *rows = evidence.read_text(encoding="utf-8").splitlines()
+    evidence.write_text(
+        "claim,id,source_type,source_ref,observed_at,notes\n" + "\n".join(rows) + "\n",
+        encoding="utf-8",
+    )
+
+    status = inspect_registers(register_case, "aapl")
+
+    assert any(
+        issue.code == "register_schema" and "expected ordered columns" in issue.message
+        for issue in status.issues
+    )
+
+
+@pytest.mark.parametrize(
+    "content",
+    (
+        b"\xff\xfe",
+        b'id,claim,source_type,source_ref,observed_at,notes\n"unterminated',
+    ),
+)
+def test_register_decode_and_csv_parse_errors_are_stable(
+    register_case: Path, content: bytes
+) -> None:
+    case_dir = register_case / "cases" / "aapl"
+    case_dir.joinpath("registers", "evidence.csv").write_bytes(content)
+
+    status = inspect_registers(register_case, "aapl")
+    assert any(issue.code == "register_unreadable" for issue in status.issues)
+    result = invoke(register_case, "data", "registers", "status", "aapl")
+    assert result.exit_code == 1
+    assert "UnicodeDecodeError" not in result.output

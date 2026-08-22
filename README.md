@@ -135,6 +135,30 @@ uv run finresearch --workspace /path/to/research-artifacts \
 See [the modeling contract](docs/modeling.md) for strict source-provenance,
 input, and projection-gate requirements.
 
+Render an immutable Markdown or self-contained HTML report from one complete,
+validated model run, or run the same deterministic integrity and point-in-time
+checks without modifying the case:
+
+```bash
+uv run finresearch --workspace /path/to/research-artifacts \
+  report markdown aapl-2026-08-11 --model-run-id RUN_ID
+
+uv run finresearch --workspace /path/to/research-artifacts \
+  report html aapl-2026-08-11 --model-run-id RUN_ID
+
+uv run finresearch --workspace /path/to/research-artifacts \
+  case audit aapl-2026-08-11 --as-of 2026-08-11 --max-price-age-days 7 \
+  --verify-hashes
+```
+
+Reports and audit gates require a manifest v2 case. Report publication is
+idempotent and only occurs after the relevant audit passes. `case audit` is
+structural/semantic by default and still checks every declared input-file path
+is safe and present; add `--verify-hashes` to digest-check every registered
+artifact and declared input file. See the
+[reporting and audit contract](docs/reporting.md) for the required model
+artifact sets, deterministic identity, and point-in-time checks.
+
 Validate and summarize the human-edited research registers (evidence,
 assumptions, scenarios, catalysts, open questions):
 

@@ -15,8 +15,11 @@ import polars as pl
 
 from finresearch.cases import (
     MANIFEST_V2,
+    Artifact,
     CaseContractError,
+    CaseManifest,
     InputFileHash,
+    ValidationIssue,
     canonical_parameters_sha256,
     case_directory,
     read_manifest,
@@ -24,7 +27,7 @@ from finresearch.cases import (
 )
 from finresearch.data_contracts import (
     CURRENCY_CODES,
-    MODEL_COMPS_INPUTS_V1,
+    MODEL_COMPS_INPUTS_V2,
     MODEL_COMPS_OBSERVATIONS_V1,
     MODEL_COMPS_RECONCILIATION_V1,
     MODEL_COMPS_RESULTS_V1,
@@ -37,6 +40,7 @@ from finresearch.data_contracts import (
     MODEL_PROJECTION_ASSESSMENT_V1,
     DataContractError,
     DatasetContract,
+    get_contract,
 )
 from finresearch.ingestion import IngestionError, IngestionReceipt, publish_snapshot
 from finresearch.model import (
@@ -97,6 +101,24 @@ class DCFCaseInput:
 class ModelRun:
     run_id: str
     receipts: tuple[IngestionReceipt, ...]
+
+
+@dataclass(frozen=True)
+class AuthenticatedModelRun:
+    """A model run whose cutoff and identity were reproduced from case bytes."""
+
+    family: Literal["dcf", "comps"]
+    run_id: str
+    as_of: date
+    artifacts: tuple[Artifact, ...]
+    tables: tuple[tuple[str, pl.DataFrame], ...]
+
+    def table(self, kind: str) -> pl.DataFrame:
+        """Return the one resolved, authenticated table of ``kind``."""
+        for table_kind, frame in self.tables:
+            if table_kind == kind:
+                return frame
+        raise CaseContractError(f"authenticated model run has no {kind} table")
 
 
 def load_dcf_input(
@@ -290,26 +312,98 @@ def run_dcf(
     if scenario not in {*_SCENARIOS, "all"}:
         raise IngestionError("scenario must be bear, base, bull, or all")
     if sensitivity is not None:
-        if config.terminal_method != "gordon_growth":
-            raise IngestionError("WACC/growth sensitivity requires gordon_growth")
-        if not sensitivity[0] or not sensitivity[1]:
-            raise IngestionError("DCF sensitivity grids must not be empty")
-        if any(
-            not isinstance(value, (int, float)) or not math.isfinite(value)
-            for value in (*sensitivity[0], *sensitivity[1])
-        ):
-            raise IngestionError("DCF sensitivity values must be finite")
-        if any(rate <= 0 for rate in sensitivity[0]) or any(
-            growth_rate <= -1 or growth_rate >= rate
-            for rate in sensitivity[0]
-            for growth_rate in sensitivity[1]
-        ):
-            raise IngestionError(
-                "each sensitivity terminal growth must be greater than -1 and "
-                "below WACC"
-            )
+        sensitivity = _canonicalize_dcf_sensitivity(sensitivity, config.terminal_method)
     extra_hashes = _model_input_hashes(case_dir, actual_input, input_bytes)
-    run_id = _run_id(input_bytes, config.as_of, selected, sensitivity, extra_hashes)
+    run_id = _run_id(
+        hashlib.sha256(input_bytes).hexdigest(),
+        config.as_of,
+        selected,
+        sensitivity,
+        extra_hashes,
+    )
+    (
+        input_frame,
+        cash_frame,
+        results_frame,
+        reconciliation_frame,
+        sensitivity_frame,
+    ) = _build_dcf_frames(config, sources, run_id, selected, sensitivity)
+    input_receipt = _publish(
+        case_dir,
+        manifest,
+        MODEL_DCF_INPUTS_V1,
+        run_id,
+        "inputs",
+        input_frame,
+        (),
+        config.as_of,
+        extra_hashes,
+    )
+    cash_receipt = _publish(
+        case_dir,
+        manifest,
+        MODEL_DCF_CASHFLOWS_V1,
+        run_id,
+        "cashflows",
+        cash_frame,
+        (input_receipt.artifact_id,),
+        config.as_of,
+        extra_hashes,
+    )
+    results_receipt = _publish(
+        case_dir,
+        manifest,
+        MODEL_DCF_RESULTS_V1,
+        run_id,
+        "results",
+        results_frame,
+        (cash_receipt.artifact_id,),
+        config.as_of,
+        extra_hashes,
+    )
+    reconciliation_receipt = _publish(
+        case_dir,
+        manifest,
+        MODEL_DCF_RECONCILIATION_V1,
+        run_id,
+        "reconciliation",
+        reconciliation_frame,
+        (results_receipt.artifact_id,),
+        config.as_of,
+        extra_hashes,
+    )
+    receipts = [input_receipt, cash_receipt, results_receipt, reconciliation_receipt]
+    if sensitivity_frame is not None:
+        receipts.append(
+            _publish(
+                case_dir,
+                manifest,
+                MODEL_DCF_SENSITIVITY_V1,
+                run_id,
+                "sensitivity",
+                sensitivity_frame,
+                (results_receipt.artifact_id,),
+                config.as_of,
+                extra_hashes,
+            )
+        )
+    return ModelRun(run_id, tuple(receipts))
+
+
+def _build_dcf_frames(
+    config: DCFCaseInput,
+    sources: dict[str, ModelSource],
+    run_id: str,
+    selected: tuple[str, ...],
+    sensitivity: tuple[tuple[float, ...], tuple[float, ...]] | None,
+) -> tuple[
+    pl.DataFrame,
+    pl.DataFrame,
+    pl.DataFrame,
+    pl.DataFrame,
+    pl.DataFrame | None,
+]:
+    """Build every deterministic DCF model table from authenticated inputs."""
     wacc = wacc_from_components(
         **{name: item.value for name, item in config.wacc.items()}
     )
@@ -495,66 +589,13 @@ def run_dcf(
         contract.validate(frame)
     if sensitivity_frame is not None:
         MODEL_DCF_SENSITIVITY_V1.validate(sensitivity_frame)
-    input_receipt = _publish(
-        case_dir,
-        manifest,
-        MODEL_DCF_INPUTS_V1,
-        run_id,
-        "inputs",
+    return (
         input_frame,
-        (),
-        config.as_of,
-        extra_hashes,
-    )
-    cash_receipt = _publish(
-        case_dir,
-        manifest,
-        MODEL_DCF_CASHFLOWS_V1,
-        run_id,
-        "cashflows",
         cash_frame,
-        (input_receipt.artifact_id,),
-        config.as_of,
-        extra_hashes,
-    )
-    results_receipt = _publish(
-        case_dir,
-        manifest,
-        MODEL_DCF_RESULTS_V1,
-        run_id,
-        "results",
         results_frame,
-        (cash_receipt.artifact_id,),
-        config.as_of,
-        extra_hashes,
-    )
-    reconciliation_receipt = _publish(
-        case_dir,
-        manifest,
-        MODEL_DCF_RECONCILIATION_V1,
-        run_id,
-        "reconciliation",
         reconciliation_frame,
-        (results_receipt.artifact_id,),
-        config.as_of,
-        extra_hashes,
+        sensitivity_frame,
     )
-    receipts = [input_receipt, cash_receipt, results_receipt, reconciliation_receipt]
-    if sensitivity_frame is not None:
-        receipts.append(
-            _publish(
-                case_dir,
-                manifest,
-                MODEL_DCF_SENSITIVITY_V1,
-                run_id,
-                "sensitivity",
-                sensitivity_frame,
-                (results_receipt.artifact_id,),
-                config.as_of,
-                extra_hashes,
-            )
-        )
-    return ModelRun(run_id, tuple(receipts))
 
 
 def projection_assessment(
@@ -572,7 +613,11 @@ def projection_assessment(
     _validate_dcf_sources(config, sources)
     extra_hashes = _model_input_hashes(case_dir, actual_input, input_bytes)
     run_id = _run_id(
-        input_bytes, config.as_of, ("projection-assessment",), None, extra_hashes
+        hashlib.sha256(input_bytes).hexdigest(),
+        config.as_of,
+        ("projection-assessment",),
+        None,
+        extra_hashes,
     )
     reasons = config.projection_needs or ("direct-free-cash-flow-traceable",)
     status = "required" if config.projection_needs else "not_required"
@@ -634,102 +679,34 @@ def run_comps(
         raise IngestionError("input artifact must be model.comps-observations.v1")
     source_path = resolve_relative_path(case_dir, artifact.path, "comps input artifact")
     frame = pl.read_parquet(source_path)
-    try:
-        MODEL_COMPS_OBSERVATIONS_V1.validate(frame)
-    except DataContractError as exc:
-        raise IngestionError(f"comps input contract failure: {exc}") from exc
-    if frame.filter(pl.col("as_of") != as_of).height:
-        raise IngestionError(
-            "comps observations must all use the CLI --as-of common snapshot"
-        )
     sources = load_model_sources(case_dir, as_of=as_of)
-    missing = sorted(set(frame["source_id"].to_list()) - set(sources))
-    if missing:
-        raise IngestionError(f"comps observations have dangling source ids: {missing}")
-    future_sources = sorted(
-        source_id
-        for source_id in set(frame["source_id"].to_list())
-        if sources[source_id].effective_date > as_of
+    selected_frame, declared_target = _prepare_comps_source(
+        frame, as_of, sources, error_type=IngestionError
     )
-    if future_sources:
-        raise IngestionError(
-            f"comps sources are dated after model as_of: {future_sources}"
-        )
-    company_roles = {
-        cast(str, key[0]): set(group["role"].to_list())
-        for key, group in frame.group_by("company_id", maintain_order=True)
-    }
-    if any(len(roles) != 1 for roles in company_roles.values()):
-        raise IngestionError("each comps company must have one consistent role")
-    targets = [
-        company for company, roles in company_roles.items() if roles == {"target"}
-    ]
-    if len(targets) != 1:
-        raise IngestionError("comps input requires exactly one declared target")
-    selected_frame = _select_comps_pit(frame, as_of)
-    currencies = selected_frame["currency"].unique().to_list()
-    if len(set(currencies)) != 1:
-        raise IngestionError("comps observations must use one non-null currency")
-    currency = cast(str, currencies[0])
-    required_components = _required_comps_components(metrics)
-    basis_by_metric = _validate_comps_periods(selected_frame, required_components)
-    selected_target = target or _single_target(frame)
-    if selected_target != targets[0]:
+    selected_target = target or declared_target
+    if selected_target != declared_target:
         raise IngestionError("--target must equal the declared role=target company")
     bytes_hash = _sha256(source_path)
     extra = _register_hashes(case_dir)
-    run_id = canonical_parameters_sha256(
-        {
-            "input_artifact_id": input_artifact_id,
-            "input_sha256": bytes_hash,
-            "as_of": as_of.isoformat(),
-            "metrics": sorted(set(metrics)),
-            "target": selected_target,
-            "producer": MODEL_PRODUCER,
-            "producer_version": MODEL_PRODUCER_VERSION,
-            "register_hashes": [(item.path, item.sha256) for item in extra],
-        }
+    run_id = _comps_run_id(
+        input_artifact_id=input_artifact_id,
+        input_sha256=bytes_hash,
+        as_of=as_of,
+        metrics=metrics,
+        target=selected_target,
+        register_hashes=extra,
     )
-    input_frame = selected_frame.with_columns(
-        pl.lit(1, dtype=pl.UInt16).alias("schema_version")
-    )
-    rows, checks = _comps_rows(
+    input_frame, results, summary, checks_frame = _build_comps_frames(
         selected_frame,
         run_id,
+        as_of,
         metrics,
         selected_target,
-        currency,
-        basis_by_metric,
-        required_components,
     )
-    peer_metrics = {
-        row["multiple"]
-        for row in rows
-        if row["role"] == "peer" and row["multiple"] in metrics
-    }
-    missing_peer_metrics = sorted(set(metrics) - peer_metrics)
-    if missing_peer_metrics:
-        raise IngestionError(
-            "requested comps multiples have no valid peer observations: "
-            f"{missing_peer_metrics}"
-        )
-    results = pl.DataFrame(rows, schema=MODEL_COMPS_RESULTS_V1.schema)
-    summary = pl.DataFrame(
-        _comps_summary(rows, run_id, currency, metrics),
-        schema=MODEL_COMPS_SUMMARY_V1.schema,
-    )
-    checks_frame = pl.DataFrame(checks, schema=MODEL_COMPS_RECONCILIATION_V1.schema)
-    for contract, output in (
-        (MODEL_COMPS_INPUTS_V1, input_frame),
-        (MODEL_COMPS_RESULTS_V1, results),
-        (MODEL_COMPS_SUMMARY_V1, summary),
-        (MODEL_COMPS_RECONCILIATION_V1, checks_frame),
-    ):
-        contract.validate(output)
     input_receipt = _publish(
         case_dir,
         manifest,
-        MODEL_COMPS_INPUTS_V1,
+        MODEL_COMPS_INPUTS_V2,
         run_id,
         "inputs",
         input_frame,
@@ -773,6 +750,109 @@ def run_comps(
     return ModelRun(
         run_id, (input_receipt, results_receipt, summary_receipt, checks_receipt)
     )
+
+
+def _prepare_comps_source(
+    frame: pl.DataFrame,
+    as_of: date,
+    sources: dict[str, ModelSource],
+    *,
+    error_type: type[CaseContractError] | type[IngestionError],
+) -> tuple[pl.DataFrame, str]:
+    """Validate one source snapshot and select its declared PIT observations."""
+    try:
+        MODEL_COMPS_OBSERVATIONS_V1.validate(frame)
+    except DataContractError as exc:
+        raise error_type(f"comps input contract failure: {exc}") from exc
+    source_as_ofs = frame["as_of"].unique().to_list()
+    if (
+        len(source_as_ofs) != 1
+        or not isinstance(source_as_ofs[0], date)
+        or source_as_ofs[0] > as_of
+    ):
+        raise error_type(
+            "comps observations must use one common snapshot as_of not after "
+            "the CLI --as-of"
+        )
+    missing = sorted(set(frame["source_id"].to_list()) - set(sources))
+    if missing:
+        raise error_type(f"comps observations have dangling source ids: {missing}")
+    future_sources = sorted(
+        source_id
+        for source_id in set(frame["source_id"].to_list())
+        if sources[source_id].effective_date > as_of
+    )
+    if future_sources:
+        raise error_type(f"comps sources are dated after model as_of: {future_sources}")
+    company_roles = {
+        cast(str, key[0]): set(group["role"].to_list())
+        for key, group in frame.group_by("company_id", maintain_order=True)
+    }
+    if any(len(roles) != 1 for roles in company_roles.values()):
+        raise error_type("each comps company must have one consistent role")
+    targets = [
+        company for company, roles in company_roles.items() if roles == {"target"}
+    ]
+    if len(targets) != 1:
+        raise error_type("comps input requires exactly one declared target")
+    return _select_comps_pit(frame, as_of), targets[0]
+
+
+def _build_comps_frames(
+    selected_frame: pl.DataFrame,
+    run_id: str,
+    as_of: date,
+    metrics: tuple[str, ...],
+    target: str,
+) -> tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame, pl.DataFrame]:
+    """Build all deterministic comps frames from selected authenticated rows."""
+    currencies = selected_frame["currency"].unique().to_list()
+    if len(set(currencies)) != 1:
+        raise IngestionError("comps observations must use one non-null currency")
+    currency = cast(str, currencies[0])
+    required_components = _required_comps_components(metrics)
+    basis_by_metric = _validate_comps_periods(selected_frame, required_components)
+    input_frame = selected_frame.with_columns(
+        pl.lit(MODEL_COMPS_INPUTS_V2.version, dtype=pl.UInt16).alias("schema_version"),
+        pl.lit(run_id, dtype=pl.String).alias("run_id"),
+        pl.lit(as_of, dtype=pl.Date).alias("run_as_of"),
+        pl.lit(",".join(metrics), dtype=pl.String).alias("requested_metrics"),
+        pl.lit(target, dtype=pl.String).alias("target_company_id"),
+    )
+    rows, checks = _comps_rows(
+        selected_frame,
+        run_id,
+        metrics,
+        target,
+        currency,
+        basis_by_metric,
+        required_components,
+    )
+    peer_metrics = {
+        row["multiple"]
+        for row in rows
+        if row["role"] == "peer" and row["multiple"] in metrics
+    }
+    missing_peer_metrics = sorted(set(metrics) - peer_metrics)
+    if missing_peer_metrics:
+        raise IngestionError(
+            "requested comps multiples have no valid peer observations: "
+            f"{missing_peer_metrics}"
+        )
+    results = pl.DataFrame(rows, schema=MODEL_COMPS_RESULTS_V1.schema)
+    summary = pl.DataFrame(
+        _comps_summary(rows, run_id, currency, metrics),
+        schema=MODEL_COMPS_SUMMARY_V1.schema,
+    )
+    checks_frame = pl.DataFrame(checks, schema=MODEL_COMPS_RECONCILIATION_V1.schema)
+    for contract, output in (
+        (MODEL_COMPS_INPUTS_V2, input_frame),
+        (MODEL_COMPS_RESULTS_V1, results),
+        (MODEL_COMPS_SUMMARY_V1, summary),
+        (MODEL_COMPS_RECONCILIATION_V1, checks_frame),
+    ):
+        contract.validate(output)
+    return input_frame, results, summary, checks_frame
 
 
 def _publish(
@@ -857,8 +937,38 @@ def _register_hashes(case_dir: Path) -> tuple[InputFileHash, ...]:
     return tuple(records)
 
 
+def _canonicalize_dcf_sensitivity(
+    sensitivity: tuple[tuple[float, ...], tuple[float, ...]],
+    terminal_method: str,
+) -> tuple[tuple[float, ...], tuple[float, ...]]:
+    """Validate public sensitivity inputs and normalize their numeric identity."""
+    if terminal_method != "gordon_growth":
+        raise IngestionError("WACC/growth sensitivity requires gordon_growth")
+    if len(sensitivity) != 2 or not sensitivity[0] or not sensitivity[1]:
+        raise IngestionError("DCF sensitivity grids must not be empty")
+    values = (*sensitivity[0], *sensitivity[1])
+    if any(
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        for value in values
+    ):
+        raise IngestionError("DCF sensitivity values must be finite")
+    waccs = tuple(sorted({float(value) for value in sensitivity[0]}))
+    growths = tuple(sorted({float(value) for value in sensitivity[1]}))
+    if any(rate <= 0 for rate in waccs) or any(
+        growth_rate <= -1 or growth_rate >= rate
+        for rate in waccs
+        for growth_rate in growths
+    ):
+        raise IngestionError(
+            "each sensitivity terminal growth must be greater than -1 and below WACC"
+        )
+    return waccs, growths
+
+
 def _run_id(
-    input_bytes: bytes,
+    input_sha256: str,
     as_of: date,
     selected: tuple[str, ...],
     sensitivity: tuple[tuple[float, ...], tuple[float, ...]] | None,
@@ -866,7 +976,7 @@ def _run_id(
 ) -> str:
     return canonical_parameters_sha256(
         {
-            "input_sha256": hashlib.sha256(input_bytes).hexdigest(),
+            "input_sha256": input_sha256,
             "as_of": as_of.isoformat(),
             "scenario": list(selected),
             "sensitivity": sensitivity,
@@ -875,6 +985,859 @@ def _run_id(
             "input_hashes": [(item.path, item.sha256) for item in hashes],
         }
     )
+
+
+def _comps_run_id(
+    *,
+    input_artifact_id: str,
+    input_sha256: str,
+    as_of: date,
+    metrics: tuple[str, ...],
+    target: str,
+    register_hashes: tuple[InputFileHash, ...],
+) -> str:
+    """Return the canonical identity for one explicit comparable-company run."""
+    return canonical_parameters_sha256(
+        {
+            "input_artifact_id": input_artifact_id,
+            "input_sha256": input_sha256,
+            "as_of": as_of.isoformat(),
+            "metrics": list(metrics),
+            "target": target,
+            "producer": MODEL_PRODUCER,
+            "producer_version": MODEL_PRODUCER_VERSION,
+            "input_contract": MODEL_COMPS_INPUTS_V2.identifier,
+            "register_hashes": [(item.path, item.sha256) for item in register_hashes],
+        }
+    )
+
+
+@dataclass(frozen=True)
+class _RunArtifactSpec:
+    kind: str
+    label: str
+    schema_version: int
+    optional: bool = False
+
+
+_DCF_RUN_SPECS = (
+    _RunArtifactSpec("model.dcf-inputs", "inputs", 1),
+    _RunArtifactSpec("model.dcf-cashflows", "cashflows", 1),
+    _RunArtifactSpec("model.dcf-results", "results", 1),
+    _RunArtifactSpec("model.dcf-reconciliation", "reconciliation", 1),
+    _RunArtifactSpec("model.dcf-sensitivity", "sensitivity", 1, optional=True),
+)
+_COMPS_RUN_SPECS = (
+    _RunArtifactSpec("model.comps-inputs", "inputs", 2),
+    _RunArtifactSpec("model.comps-results", "results", 1),
+    _RunArtifactSpec("model.comps-summary", "summary", 1),
+    _RunArtifactSpec("model.comps-reconciliation", "reconciliation", 1),
+)
+
+
+def resolve_model_run(
+    case_dir: Path,
+    manifest: CaseManifest,
+    *,
+    family: Literal["dcf", "comps"],
+    run_id: str,
+    verify_hashes: bool = True,
+) -> AuthenticatedModelRun:
+    """Reproduce one registered DCF or comps run from authoritative case bytes.
+
+    Manifest timestamps are declarations, not evidence.  This verifier instead
+    derives a DCF cutoff from its registered TOML input and a comps cutoff from
+    a hash-bound typed `run_as_of`, then reproduces each run identity.
+    """
+    if manifest.manifest_version != MANIFEST_V2:
+        raise CaseContractError("model run authentication requires manifest v2")
+    try:
+        artifacts, tables = _resolve_model_artifacts(
+            case_dir,
+            manifest,
+            family,
+            run_id,
+            verify_hashes=verify_hashes,
+        )
+        _validate_model_run_graph(artifacts, family)
+        if family == "dcf":
+            as_of = _authenticate_dcf_run(
+                case_dir,
+                manifest,
+                artifacts,
+                tables,
+                run_id,
+                verify_hashes=verify_hashes,
+            )
+        else:
+            as_of = _authenticate_comps_run(
+                case_dir,
+                manifest,
+                artifacts,
+                tables,
+                run_id,
+                verify_hashes=verify_hashes,
+            )
+        _validate_authenticated_metadata(artifacts, run_id, as_of)
+    except CaseContractError:
+        raise
+    except IngestionError as exc:
+        raise CaseContractError(str(exc)) from exc
+    except Exception as exc:
+        # Authentication runs after the ordinary contract validator in audit
+        # mode.  A malformed Parquet table must add a deterministic identity
+        # issue, not leak a Polars selector error through the audit command.
+        raise CaseContractError(
+            "model run authentication encountered malformed data"
+        ) from exc
+    return AuthenticatedModelRun(family, run_id, as_of, artifacts, tables)
+
+
+def authenticate_model_run(
+    case_dir: Path,
+    manifest: CaseManifest,
+    *,
+    family: Literal["dcf", "comps"],
+    run_id: str,
+    verify_hashes: bool = True,
+) -> AuthenticatedModelRun:
+    """Backward-compatible name for the canonical model-run resolver."""
+    return resolve_model_run(
+        case_dir,
+        manifest,
+        family=family,
+        run_id=run_id,
+        verify_hashes=verify_hashes,
+    )
+
+
+def authenticate_case_model_runs(
+    case_dir: Path,
+    manifest: CaseManifest,
+    *,
+    verify_hashes: bool = True,
+) -> tuple[tuple[AuthenticatedModelRun, ...], tuple[ValidationIssue, ...]]:
+    """Authenticate every complete discoverable run without raising for one bad run."""
+    candidates: set[tuple[Literal["dcf", "comps"], str]] = set()
+    for family in ("dcf", "comps"):
+        result_spec = next(
+            item for item in _run_specs(family) if item.label == "results"
+        )
+        for artifact in manifest.artifacts:
+            if artifact.kind != result_spec.kind:
+                continue
+            prefix = f"{result_spec.kind}.{result_spec.label}."
+            canonical_identity = artifact.artifact_id.startswith(prefix)
+            if canonical_identity:
+                candidates.add(
+                    (
+                        family,
+                        artifact.artifact_id.removeprefix(prefix),
+                    )
+                )
+            try:
+                frame = _read_model_frame(case_dir, artifact)
+                run_ids = _one_text_values(frame, "run_id")
+            except CaseContractError:
+                continue
+            if not canonical_identity:
+                candidates.add((family, run_ids))
+    authenticated: list[AuthenticatedModelRun] = []
+    issues: list[ValidationIssue] = []
+    for family, run_id in sorted(candidates):
+        try:
+            authenticated.append(
+                resolve_model_run(
+                    case_dir,
+                    manifest,
+                    family=family,
+                    run_id=run_id,
+                    verify_hashes=verify_hashes,
+                )
+            )
+        except CaseContractError as exc:
+            issues.append(
+                ValidationIssue(
+                    "model_run_identity_invalid",
+                    f"{family} run {run_id}: {exc}",
+                )
+            )
+    return tuple(authenticated), tuple(issues)
+
+
+def model_run_is_declared(
+    manifest: CaseManifest, family: Literal["dcf", "comps"], run_id: str
+) -> bool:
+    """Return whether manifest identity claims the requested run family/id."""
+    return any(
+        artifact.artifact_id == _canonical_artifact_id(spec, run_id)
+        or artifact.artifact_id.endswith(f".{run_id}")
+        for spec in _run_specs(family)
+        for artifact in manifest.artifacts
+        if artifact.kind == spec.kind
+    )
+
+
+def _resolve_model_artifacts(
+    case_dir: Path,
+    manifest: CaseManifest,
+    family: Literal["dcf", "comps"],
+    run_id: str,
+    *,
+    verify_hashes: bool,
+) -> tuple[tuple[Artifact, ...], tuple[tuple[str, pl.DataFrame], ...]]:
+    """Resolve exact canonical artifact identities and their bound table ids."""
+    selected: list[Artifact] = []
+    tables: list[tuple[str, pl.DataFrame]] = []
+    for spec in _run_specs(family):
+        expected_id = _canonical_artifact_id(spec, run_id)
+        expected_path = _canonical_artifact_path(manifest, spec, run_id)
+        _reject_alternate_model_tables(
+            case_dir, manifest, spec, run_id, expected_id, expected_path
+        )
+        matches = [
+            artifact
+            for artifact in manifest.artifacts
+            if artifact.artifact_id == expected_id
+        ]
+        if len(matches) != 1:
+            if spec.optional and not matches:
+                continue
+            raise CaseContractError(
+                f"{family} run {run_id} must have exactly one canonical "
+                f"{spec.kind} artifact"
+            )
+        artifact = matches[0]
+        if artifact.kind != spec.kind or artifact.path != expected_path:
+            raise CaseContractError(
+                f"{family} run {run_id} has noncanonical {spec.kind} identity or path"
+            )
+        if artifact.schema_version != spec.schema_version:
+            if (
+                family == "comps"
+                and spec.kind == "model.comps-inputs"
+                and artifact.schema_version == 1
+            ):
+                raise CaseContractError(
+                    "comps run uses model.comps-inputs.v1; rerun model comps "
+                    "to create an authenticated v2 run"
+                )
+            raise CaseContractError(
+                f"{family} run {run_id} {spec.kind} must use schema v"
+                f"{spec.schema_version}"
+            )
+        frame = _read_validated_model_frame(
+            case_dir, artifact, verify_hashes=verify_hashes
+        )
+        if _one_text_values(frame, "run_id") != run_id:
+            raise CaseContractError(
+                f"{family} run {run_id} {spec.kind} table run_id does not match "
+                "its canonical identity"
+            )
+        selected.append(artifact)
+        tables.append((spec.kind, frame))
+    return tuple(selected), tuple(tables)
+
+
+def _run_specs(family: Literal["dcf", "comps"]) -> tuple[_RunArtifactSpec, ...]:
+    return _DCF_RUN_SPECS if family == "dcf" else _COMPS_RUN_SPECS
+
+
+def _canonical_artifact_id(spec: _RunArtifactSpec, run_id: str) -> str:
+    return f"{spec.kind}.{spec.label}.{run_id}"
+
+
+def _canonical_artifact_path(
+    manifest: CaseManifest, spec: _RunArtifactSpec, run_id: str
+) -> str:
+    return Path(
+        manifest.paths["derived"], "models", spec.kind, run_id, f"{run_id}.parquet"
+    ).as_posix()
+
+
+def _reject_alternate_model_tables(
+    case_dir: Path,
+    manifest: CaseManifest,
+    spec: _RunArtifactSpec,
+    run_id: str,
+    expected_id: str,
+    expected_path: str,
+) -> None:
+    for artifact in manifest.artifacts:
+        if artifact.kind != spec.kind or artifact.artifact_id == expected_id:
+            continue
+        if artifact.path == expected_path or artifact.artifact_id.endswith(
+            f".{run_id}"
+        ):
+            raise CaseContractError(
+                f"model run {run_id} has alternate noncanonical {spec.kind} artifact"
+            )
+        try:
+            frame = _read_model_frame(case_dir, artifact)
+            belongs = _one_text_values(frame, "run_id") == run_id
+        except CaseContractError:
+            belongs = False
+        if belongs:
+            raise CaseContractError(
+                f"model run {run_id} has alternate noncanonical {spec.kind} table"
+            )
+
+
+def _validate_model_run_graph(
+    artifacts: tuple[Artifact, ...], family: Literal["dcf", "comps"]
+) -> None:
+    by_kind = {artifact.kind: artifact for artifact in artifacts}
+    inputs = by_kind[f"model.{family}-inputs"]
+    results = by_kind[f"model.{family}-results"]
+    reconciliation = by_kind[f"model.{family}-reconciliation"]
+    if family == "dcf":
+        cashflows = by_kind["model.dcf-cashflows"]
+        if cashflows.input_artifact_ids != (inputs.artifact_id,) or (
+            results.input_artifact_ids != (cashflows.artifact_id,)
+        ):
+            raise CaseContractError(
+                "DCF model artifact lineage is incomplete or cross-run"
+            )
+    elif results.input_artifact_ids != (inputs.artifact_id,):
+        raise CaseContractError(
+            "comps model artifact lineage is incomplete or cross-run"
+        )
+    if reconciliation.input_artifact_ids != (results.artifact_id,):
+        raise CaseContractError(
+            "model reconciliation lineage is incomplete or cross-run"
+        )
+    if family == "comps":
+        summary = by_kind["model.comps-summary"]
+        if summary.input_artifact_ids != (results.artifact_id,):
+            raise CaseContractError("comps summary lineage is incomplete or cross-run")
+    if family == "dcf" and "model.dcf-sensitivity" in by_kind:
+        sensitivity = by_kind["model.dcf-sensitivity"]
+        if sensitivity.input_artifact_ids != (results.artifact_id,):
+            raise CaseContractError(
+                "DCF sensitivity lineage is incomplete or cross-run"
+            )
+
+
+def _read_validated_model_frame(
+    case_dir: Path,
+    artifact: Artifact,
+    *,
+    verify_hashes: bool,
+) -> pl.DataFrame:
+    if artifact.sha256 is None:
+        raise CaseContractError(
+            f"model artifact is missing sha256: {artifact.artifact_id}"
+        )
+    path = resolve_relative_path(case_dir, artifact.path, "model run artifact")
+    if not path.is_file():
+        raise CaseContractError(f"model artifact is missing: {artifact.artifact_id}")
+    if verify_hashes and _sha256(path) != artifact.sha256:
+        raise CaseContractError(
+            f"model artifact sha256 does not match: {artifact.artifact_id}"
+        )
+    frame = _read_model_frame(case_dir, artifact)
+    try:
+        get_contract(f"{artifact.kind}.v{artifact.schema_version}").validate(frame)
+    except DataContractError as exc:
+        raise CaseContractError(
+            f"model artifact fails its DatasetContract: {artifact.artifact_id}"
+        ) from exc
+    return frame
+
+
+def _table_for_kind(
+    tables: tuple[tuple[str, pl.DataFrame], ...], kind: str
+) -> pl.DataFrame:
+    for table_kind, frame in tables:
+        if table_kind == kind:
+            return frame
+    raise CaseContractError(f"resolved model run has no {kind} table")
+
+
+def _authenticate_dcf_run(
+    case_dir: Path,
+    manifest: CaseManifest,
+    artifacts: tuple[Artifact, ...],
+    tables: tuple[tuple[str, pl.DataFrame], ...],
+    run_id: str,
+    *,
+    verify_hashes: bool,
+) -> date:
+    inputs = next(
+        artifact for artifact in artifacts if artifact.kind == "model.dcf-inputs"
+    )
+    records = [
+        record
+        for record in inputs.input_file_hashes
+        if record.name == "file.dcf-inputs"
+    ]
+    if len(records) != 1:
+        raise CaseContractError("DCF run must declare exactly one file.dcf-inputs hash")
+    record = records[0]
+    input_path = resolve_relative_path(case_dir, record.path, "DCF run input")
+    if not input_path.is_file():
+        raise CaseContractError("DCF run input TOML is missing")
+    input_bytes = input_path.read_bytes()
+    if verify_hashes and hashlib.sha256(input_bytes).hexdigest() != record.sha256:
+        raise CaseContractError("DCF run input TOML sha256 does not match declaration")
+    config, parsed_bytes, parsed_path = load_dcf_input(case_dir, record.path)
+    if parsed_path != input_path or parsed_bytes != input_bytes:
+        raise CaseContractError("DCF run input TOML bytes changed while authenticating")
+    extra_hashes = _declared_dcf_input_hashes(
+        case_dir,
+        inputs.input_file_hashes,
+        verify_hashes=verify_hashes,
+    )
+    if inputs.input_file_hashes != extra_hashes:
+        raise CaseContractError(
+            "DCF input artifact hashes do not bind its TOML/registers"
+        )
+    input_frame = _table_for_kind(tables, "model.dcf-inputs")
+    scenarios = _selected_dcf_scenarios(input_frame)
+    sensitivity = _dcf_sensitivity_parameters(tables)
+    if (
+        _run_id(record.sha256, config.as_of, scenarios, sensitivity, extra_hashes)
+        != run_id
+    ):
+        raise CaseContractError(
+            "DCF run id does not match TOML, registers, and outputs"
+        )
+    _require_exact_model_inputs(
+        case_dir,
+        manifest,
+        artifacts,
+        {
+            "model.dcf-inputs": (),
+            "model.dcf-cashflows": (inputs.artifact_id,),
+            "model.dcf-results": (
+                next(
+                    artifact.artifact_id
+                    for artifact in artifacts
+                    if artifact.kind == "model.dcf-cashflows"
+                ),
+            ),
+            "model.dcf-reconciliation": (
+                next(
+                    artifact.artifact_id
+                    for artifact in artifacts
+                    if artifact.kind == "model.dcf-results"
+                ),
+            ),
+            "model.dcf-sensitivity": (
+                next(
+                    artifact.artifact_id
+                    for artifact in artifacts
+                    if artifact.kind == "model.dcf-results"
+                ),
+            ),
+        },
+        extra_hashes,
+        "DCF",
+        verify_hashes=verify_hashes,
+    )
+    sources = load_model_sources(case_dir, as_of=config.as_of)
+    _validate_dcf_sources(config, sources)
+    expected_frames = _dcf_frame_map(
+        _build_dcf_frames(config, sources, run_id, scenarios, sensitivity)
+    )
+    _require_rebuilt_tables(tables, expected_frames, "DCF")
+    return config.as_of
+
+
+def _authenticate_comps_run(
+    case_dir: Path,
+    manifest: CaseManifest,
+    artifacts: tuple[Artifact, ...],
+    tables: tuple[tuple[str, pl.DataFrame], ...],
+    run_id: str,
+    *,
+    verify_hashes: bool,
+) -> date:
+    inputs = next(
+        artifact for artifact in artifacts if artifact.kind == "model.comps-inputs"
+    )
+    input_frame = _table_for_kind(tables, "model.comps-inputs")
+    as_of = _one_date_value(input_frame, "run_as_of")
+    if not inputs.input_artifact_ids:
+        raise CaseContractError("comps run has no source observation artifact")
+    source_id = inputs.input_artifact_ids[0]
+    source = next(
+        (
+            artifact
+            for artifact in manifest.artifacts
+            if artifact.artifact_id == source_id
+        ),
+        None,
+    )
+    if source is None or source.kind != MODEL_COMPS_OBSERVATIONS_V1.name:
+        raise CaseContractError("comps run source is not model.comps-observations.v1")
+    source_path = resolve_relative_path(case_dir, source.path, "comps run source")
+    if not source_path.is_file() or source.sha256 is None:
+        raise CaseContractError(
+            "comps run source artifact is missing a verifiable file"
+        )
+    if verify_hashes and _sha256(source_path) != source.sha256:
+        raise CaseContractError("comps run source artifact sha256 does not match")
+    metrics = _requested_comps_metrics(input_frame)
+    target = _one_text_values(input_frame, "target_company_id")
+    extra_hashes = _declared_comps_register_hashes(
+        case_dir,
+        inputs.input_file_hashes,
+        verify_hashes=verify_hashes,
+    )
+    expected = _comps_run_id(
+        input_artifact_id=source_id,
+        input_sha256=source.sha256,
+        as_of=as_of,
+        metrics=metrics,
+        target=target,
+        register_hashes=extra_hashes,
+    )
+    if expected != run_id:
+        raise CaseContractError(
+            "comps run id does not match source, cutoff, metrics, target, and registers"
+        )
+    _require_exact_model_inputs(
+        case_dir,
+        manifest,
+        artifacts,
+        {
+            "model.comps-inputs": (source_id, *source.input_artifact_ids),
+            "model.comps-results": (inputs.artifact_id,),
+            "model.comps-summary": (
+                next(
+                    artifact.artifact_id
+                    for artifact in artifacts
+                    if artifact.kind == "model.comps-results"
+                ),
+            ),
+            "model.comps-reconciliation": (
+                next(
+                    artifact.artifact_id
+                    for artifact in artifacts
+                    if artifact.kind == "model.comps-results"
+                ),
+            ),
+        },
+        extra_hashes,
+        "comps",
+        verify_hashes=verify_hashes,
+    )
+    source_frame = _read_validated_model_frame(
+        case_dir, source, verify_hashes=verify_hashes
+    )
+    sources = load_model_sources(case_dir, as_of=as_of)
+    selected_frame, declared_target = _prepare_comps_source(
+        source_frame, as_of, sources, error_type=CaseContractError
+    )
+    if target != declared_target:
+        raise CaseContractError("comps input target does not match source target")
+    expected_frames = _comps_frame_map(
+        _build_comps_frames(selected_frame, run_id, as_of, metrics, target)
+    )
+    _require_rebuilt_tables(tables, expected_frames, "comps")
+    return as_of
+
+
+def _validate_authenticated_metadata(
+    artifacts: tuple[Artifact, ...], run_id: str, as_of: date
+) -> None:
+    expected_time = (
+        datetime.combine(as_of, datetime.min.time(), tzinfo=UTC)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+    for artifact in artifacts:
+        if (
+            artifact.producer != MODEL_PRODUCER
+            or artifact.producer_version != MODEL_PRODUCER_VERSION
+            or artifact.parameters_sha256 != run_id
+        ):
+            raise CaseContractError(
+                f"model artifact {artifact.artifact_id} has inconsistent "
+                "producer identity"
+            )
+        if artifact.retrieved_at != expected_time:
+            raise CaseContractError(
+                f"model artifact {artifact.artifact_id} retrieved_at is not "
+                "the authenticated UTC-midnight run cutoff"
+            )
+
+
+def _require_exact_model_inputs(
+    case_dir: Path,
+    manifest: CaseManifest,
+    artifacts: tuple[Artifact, ...],
+    expected_parents: dict[str, tuple[str, ...]],
+    extra_hashes: tuple[InputFileHash, ...],
+    family: str,
+    *,
+    verify_hashes: bool,
+) -> None:
+    for artifact in artifacts:
+        parents = expected_parents.get(artifact.kind)
+        if parents is None:
+            raise CaseContractError(
+                f"{family} artifact {artifact.artifact_id} has unexpected kind"
+            )
+        if artifact.input_artifact_ids != parents:
+            raise CaseContractError(
+                f"{family} artifact {artifact.artifact_id} has noncanonical "
+                "direct parent lineage"
+            )
+        expected = _model_input_file_hashes(
+            case_dir,
+            manifest,
+            parents,
+            extra_hashes,
+            verify_hashes=verify_hashes,
+        )
+        if artifact.input_file_hashes != expected:
+            raise CaseContractError(
+                f"{family} artifact {artifact.artifact_id} does not bind "
+                "the exact authenticated case inputs"
+            )
+
+
+def _model_input_file_hashes(
+    case_dir: Path,
+    manifest: CaseManifest,
+    parent_ids: tuple[str, ...],
+    extra_hashes: tuple[InputFileHash, ...],
+    *,
+    verify_hashes: bool,
+) -> tuple[InputFileHash, ...]:
+    by_id = {artifact.artifact_id: artifact for artifact in manifest.artifacts}
+    parents: list[InputFileHash] = []
+    for parent_id in parent_ids:
+        parent = by_id.get(parent_id)
+        if parent is None or parent.sha256 is None:
+            raise CaseContractError(f"model parent is not verifiable: {parent_id}")
+        parent_path = resolve_relative_path(
+            case_dir, parent.path, f"model parent {parent_id}"
+        )
+        if not parent_path.is_file():
+            raise CaseContractError(f"model parent is missing: {parent_id}")
+        if verify_hashes and _sha256(parent_path) != parent.sha256:
+            raise CaseContractError(f"model parent sha256 does not match: {parent_id}")
+        parents.append(
+            InputFileHash(
+                name=f"artifact.{parent_id}",
+                path=parent.path,
+                sha256=parent.sha256,
+            )
+        )
+    return tuple(parents) + extra_hashes
+
+
+def _declared_dcf_input_hashes(
+    case_dir: Path,
+    records: tuple[InputFileHash, ...],
+    *,
+    verify_hashes: bool,
+) -> tuple[InputFileHash, ...]:
+    """Validate and reuse the v2 DCF file bindings without implicit rehashing."""
+    _validate_declared_input_files(case_dir, records, verify_hashes=verify_hashes)
+    by_name = {record.name: record for record in records}
+    dcf_records = [record for record in records if record.name == "file.dcf-inputs"]
+    if len(dcf_records) != 1:
+        raise CaseContractError("DCF run must declare exactly one file.dcf-inputs hash")
+    expected_registers = _expected_register_paths(case_dir)
+    if set(by_name) != {"file.dcf-inputs", *expected_registers}:
+        raise CaseContractError("DCF input artifact has unexpected input file hashes")
+    _require_register_paths(by_name, expected_registers)
+    return records
+
+
+def _declared_comps_register_hashes(
+    case_dir: Path,
+    records: tuple[InputFileHash, ...],
+    *,
+    verify_hashes: bool,
+) -> tuple[InputFileHash, ...]:
+    """Validate and reuse exact v2 comps register bindings without rehashing."""
+    _validate_declared_input_files(case_dir, records, verify_hashes=verify_hashes)
+    registers = tuple(
+        record for record in records if record.name.startswith("register.")
+    )
+    if len(registers) + sum(
+        record.name.startswith("artifact.") for record in records
+    ) != len(records):
+        raise CaseContractError("comps input artifact has unexpected input file hashes")
+    by_name = {record.name: record for record in registers}
+    expected_registers = _expected_register_paths(case_dir)
+    if set(by_name) != set(expected_registers):
+        raise CaseContractError("comps input artifact does not bind current registers")
+    _require_register_paths(by_name, expected_registers)
+    return registers
+
+
+def _validate_declared_input_files(
+    case_dir: Path,
+    records: tuple[InputFileHash, ...],
+    *,
+    verify_hashes: bool,
+) -> None:
+    """Require every declared model input file to be safe, present, and valid."""
+    for record in records:
+        path = resolve_relative_path(
+            case_dir, record.path, f"model input {record.name}"
+        )
+        if not path.is_file():
+            raise CaseContractError(f"model input file is missing: {record.name}")
+        if verify_hashes and _sha256(path) != record.sha256:
+            raise CaseContractError(
+                f"model input file sha256 does not match: {record.name}"
+            )
+
+
+def _expected_register_paths(case_dir: Path) -> dict[str, str]:
+    manifest = read_manifest(case_dir)
+    root = resolve_relative_path(
+        case_dir, manifest.paths["registers"], "paths.registers"
+    )
+    records: dict[str, str] = {}
+    for filename in ("evidence.csv", "assumptions.csv"):
+        path = root / filename
+        if path.is_file():
+            records[f"register.{filename[:-4]}"] = path.relative_to(case_dir).as_posix()
+    return records
+
+
+def _require_register_paths(
+    records: dict[str, InputFileHash], expected: dict[str, str]
+) -> None:
+    for name, path in expected.items():
+        if records[name].path != path:
+            raise CaseContractError(
+                f"model register hash has noncanonical path: {name}"
+            )
+
+
+def _dcf_frame_map(
+    frames: tuple[
+        pl.DataFrame,
+        pl.DataFrame,
+        pl.DataFrame,
+        pl.DataFrame,
+        pl.DataFrame | None,
+    ],
+) -> dict[str, pl.DataFrame]:
+    inputs, cashflows, results, reconciliation, sensitivity = frames
+    output = {
+        "model.dcf-inputs": inputs,
+        "model.dcf-cashflows": cashflows,
+        "model.dcf-results": results,
+        "model.dcf-reconciliation": reconciliation,
+    }
+    if sensitivity is not None:
+        output["model.dcf-sensitivity"] = sensitivity
+    return output
+
+
+def _comps_frame_map(
+    frames: tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame, pl.DataFrame],
+) -> dict[str, pl.DataFrame]:
+    inputs, results, summary, reconciliation = frames
+    return {
+        "model.comps-inputs": inputs,
+        "model.comps-results": results,
+        "model.comps-summary": summary,
+        "model.comps-reconciliation": reconciliation,
+    }
+
+
+def _require_rebuilt_tables(
+    tables: tuple[tuple[str, pl.DataFrame], ...],
+    expected: dict[str, pl.DataFrame],
+    family: str,
+) -> None:
+    actual = dict(tables)
+    if set(actual) != set(expected):
+        raise CaseContractError(f"{family} run has an unexpected typed artifact set")
+    for kind, expected_frame in expected.items():
+        contract = get_contract(f"{kind}.v{expected_frame['schema_version'][0]}")
+        left = contract.canonical_sort(actual[kind])
+        right = contract.canonical_sort(expected_frame)
+        if left.schema != right.schema or not left.equals(right):
+            raise CaseContractError(
+                f"{family} artifact table does not match recomputed output: {kind}"
+            )
+
+
+def _requested_comps_metrics(frame: pl.DataFrame) -> tuple[str, ...]:
+    value = _one_text_values(frame, "requested_metrics")
+    metrics = tuple(value.split(","))
+    if not metrics or tuple(sorted(set(metrics))) != metrics:
+        raise CaseContractError("comps input requested_metrics is not canonical")
+    return metrics
+
+
+def _read_model_frame(case_dir: Path, artifact: Artifact) -> pl.DataFrame:
+    path = resolve_relative_path(case_dir, artifact.path, "model run artifact")
+    if not path.is_file():
+        raise CaseContractError(f"model artifact is missing: {artifact.artifact_id}")
+    try:
+        return pl.read_parquet(path)
+    except Exception as exc:
+        raise CaseContractError(
+            f"model artifact is not readable Parquet: {artifact.artifact_id}"
+        ) from exc
+
+
+def _one_text_values(frame: pl.DataFrame, field: str) -> str:
+    values = _text_values(frame, field)
+    if len(values) != 1:
+        raise CaseContractError(f"model artifact must have one {field}")
+    return next(iter(values))
+
+
+def _text_values(frame: pl.DataFrame, field: str) -> set[str]:
+    if field not in frame.columns:
+        raise CaseContractError(f"model artifact is missing {field}")
+    values = frame[field].to_list()
+    if not values or any(not isinstance(value, str) for value in values):
+        raise CaseContractError(f"model artifact has invalid {field}")
+    return set(values)
+
+
+def _one_date_value(frame: pl.DataFrame, field: str) -> date:
+    if field not in frame.columns:
+        raise CaseContractError(f"model artifact is missing {field}")
+    values = frame[field].unique().to_list()
+    if len(values) != 1 or not isinstance(values[0], date):
+        raise CaseContractError(f"model artifact must have one valid {field}")
+    return values[0]
+
+
+def _selected_dcf_scenarios(frame: pl.DataFrame) -> tuple[str, ...]:
+    values = _text_values(frame, "scenario")
+    selected = tuple(scenario for scenario in _SCENARIOS if scenario in values)
+    if set(selected) != values:
+        raise CaseContractError("DCF input rows have unsupported scenarios")
+    return selected
+
+
+def _dcf_sensitivity_parameters(
+    tables: tuple[tuple[str, pl.DataFrame], ...],
+) -> tuple[tuple[float, ...], tuple[float, ...]] | None:
+    sensitivity = next(
+        (frame for kind, frame in tables if kind == "model.dcf-sensitivity"), None
+    )
+    if sensitivity is None:
+        return None
+    values: list[tuple[float, ...]] = []
+    for field in ("wacc", "terminal_growth"):
+        if field not in sensitivity.columns:
+            raise CaseContractError(f"DCF sensitivity artifact is missing {field}")
+        raw_values = sensitivity[field].to_list()
+        if not raw_values or any(
+            not isinstance(value, float) or not math.isfinite(value)
+            for value in raw_values
+        ):
+            raise CaseContractError(f"DCF sensitivity artifact has invalid {field}")
+        values.append(tuple(sorted(set(raw_values))))
+    return cast(tuple[tuple[float, ...], tuple[float, ...]], tuple(values))
 
 
 def _input_row(

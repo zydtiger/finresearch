@@ -66,13 +66,22 @@ three-statement model.
 
 Comparable observations use local import schema `model.comps-observations.v1`.
 `model comps` accepts only a declared observation artifact and explicit peers;
-it does not discover peers, invert FX, or convert fiscal periods. All selected
-observations must have row `as_of` exactly equal to the CLI cutoff and share one
-non-null currency. The source artifact preserves history by knowledge date and
-source id. For each company/metric, the run selects the one latest eligible
-knowledge date; tied latest observations are conflicts, not tie-broken. Older
-observations may use a different period. Every selected company for a metric
-used by a requested multiple must share the exact same basis and end date.
+it does not discover peers, invert FX, or convert fiscal periods. A source
+artifact must use one common observation snapshot no later than the explicit
+CLI cutoff. The typed model input preserves that source snapshot and records
+the actual CLI cutoff as hash-bound `run_as_of`; the latter is the model's
+authoritative point-in-time date. New runs publish `model.comps-inputs.v2`,
+which also records one canonical requested-metrics list and the one declared
+target company. Those fields are part of the run identity and allow the shared
+resolver to reproduce the selected PIT rows and every published comps output.
+The immutable `model.comps-inputs.v1` remains valid for historic tables but is
+not cutoff-authenticatable, so audit and reporting require rerunning it into a
+distinct v2 run. All selected observations share one non-null currency. The
+source artifact preserves history by knowledge date and source id. For each
+company/metric, the run selects the one latest eligible knowledge date; tied
+latest observations are conflicts, not tie-broken. Older observations may use
+a different period. Every selected company for a metric used by a requested
+multiple must share the exact same basis and end date.
 There is no fiscal-period conversion.
 
 `market_cap`, `net_debt`, `revenue`, `ebitda`, and `ebit` use only controlled

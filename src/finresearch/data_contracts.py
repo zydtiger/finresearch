@@ -6,6 +6,7 @@ import math
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import date
 from typing import Final
 
 import polars as pl
@@ -1316,6 +1317,84 @@ MODEL_COMPS_INPUTS_V1: Final = DatasetContract(
     semantic_validator=_validate_comps_observations_v1,
 )
 
+MODEL_COMPS_INPUTS_V2_FIELDS: Final = {
+    **MODEL_COMPS_OBSERVATIONS_V1_FIELDS,
+    "run_id": pl.String,
+    "run_as_of": pl.Date,
+    "requested_metrics": pl.String,
+    "target_company_id": pl.String,
+}
+
+
+def _validate_comps_inputs_v2(frame: pl.DataFrame) -> None:
+    _validate_comps_observations_v1(
+        frame.select(list(MODEL_COMPS_OBSERVATIONS_V1_FIELDS))
+    )
+    run_ids = frame["run_id"].unique().to_list()
+    run_as_ofs = frame["run_as_of"].unique().to_list()
+    if len(run_ids) != 1 or not isinstance(run_ids[0], str) or not run_ids[0]:
+        raise _semantic_error("model.comps-inputs.v2", "run_id must be one value")
+    if len(run_as_ofs) != 1 or not isinstance(run_as_ofs[0], date):
+        raise _semantic_error(
+            "model.comps-inputs.v2", "run_as_of must be one valid date"
+        )
+    as_ofs = frame["as_of"].unique().to_list()
+    if len(as_ofs) != 1 or not isinstance(as_ofs[0], date):
+        raise _semantic_error(
+            "model.comps-inputs.v2", "as_of must be one common valid date"
+        )
+    if as_ofs[0] > run_as_ofs[0]:
+        raise _semantic_error(
+            "model.comps-inputs.v2",
+            "source observation as_of must not be after run_as_of",
+        )
+    requested_metrics = frame["requested_metrics"].unique().to_list()
+    allowed_metrics = {"ev_revenue", "ev_ebitda", "ev_ebit", "pe"}
+    if len(requested_metrics) != 1 or not isinstance(requested_metrics[0], str):
+        raise _semantic_error(
+            "model.comps-inputs.v2", "requested_metrics must be one value"
+        )
+    metrics = tuple(requested_metrics[0].split(","))
+    if (
+        not metrics
+        or set(metrics) - allowed_metrics
+        or tuple(sorted(set(metrics))) != metrics
+    ):
+        raise _semantic_error(
+            "model.comps-inputs.v2",
+            "requested_metrics must be canonical controlled multiples",
+        )
+    targets = frame["target_company_id"].unique().to_list()
+    declared_targets = set(
+        frame.filter(pl.col("role") == "target")["company_id"].to_list()
+    )
+    if (
+        len(targets) != 1
+        or not isinstance(targets[0], str)
+        or declared_targets != {targets[0]}
+    ):
+        raise _semantic_error(
+            "model.comps-inputs.v2",
+            "target_company_id must equal the one declared target",
+        )
+
+
+MODEL_COMPS_INPUTS_V2: Final = DatasetContract(
+    name="model.comps-inputs",
+    version=2,
+    schema=pl.Schema(MODEL_COMPS_INPUTS_V2_FIELDS),
+    non_nullable=(
+        *MODEL_COMPS_OBSERVATIONS_V1.non_nullable,
+        "run_id",
+        "run_as_of",
+        "requested_metrics",
+        "target_company_id",
+    ),
+    unique_key=(*MODEL_COMPS_OBSERVATIONS_V1.unique_key, "run_id"),
+    sort_key=(*MODEL_COMPS_OBSERVATIONS_V1.sort_key, "run_id"),
+    semantic_validator=_validate_comps_inputs_v2,
+)
+
 
 def _validate_comps_outputs_v1(frame: pl.DataFrame, contract: str) -> None:
     _validate_finite_model_values(frame, contract)
@@ -1446,6 +1525,7 @@ CONTRACTS: Final = {
     MODEL_DCF_RECONCILIATION_V1.identifier: MODEL_DCF_RECONCILIATION_V1,
     MODEL_COMPS_OBSERVATIONS_V1.identifier: MODEL_COMPS_OBSERVATIONS_V1,
     MODEL_COMPS_INPUTS_V1.identifier: MODEL_COMPS_INPUTS_V1,
+    MODEL_COMPS_INPUTS_V2.identifier: MODEL_COMPS_INPUTS_V2,
     MODEL_COMPS_RESULTS_V1.identifier: MODEL_COMPS_RESULTS_V1,
     MODEL_COMPS_SUMMARY_V1.identifier: MODEL_COMPS_SUMMARY_V1,
     MODEL_COMPS_RECONCILIATION_V1.identifier: MODEL_COMPS_RECONCILIATION_V1,

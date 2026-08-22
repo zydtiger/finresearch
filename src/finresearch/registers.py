@@ -8,7 +8,7 @@ summarizes them; ordinary editing stays with the user's CSV tooling.
 from __future__ import annotations
 
 import csv
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
@@ -136,6 +136,14 @@ class ModelSource:
     effective_date: date
 
 
+@dataclass(frozen=True)
+class _ParsedRegisterRow:
+    """One private parsed CSV row paired with its physical file line number."""
+
+    values: dict[str, str]
+    line_number: int
+
+
 def load_model_sources(case_dir: Path, *, as_of: date) -> dict[str, ModelSource]:
     """Load strict evidence/assumption ids and reject invalid records.
 
@@ -168,7 +176,8 @@ def load_model_sources(case_dir: Path, *, as_of: date) -> dict[str, ModelSource]
         rows, issues = _validate_register(path)
         if issues:
             raise CaseContractError(f"model source register is invalid: {filename}")
-        for row in rows:
+        for parsed_row in rows:
+            row = parsed_row.values
             source_id = row.get("id", "")
             if not source_id:
                 continue
@@ -217,50 +226,51 @@ def _registers_directory(workspace: Path, case_id: str) -> Path:
 
 def _validate_register(
     path: Path,
-) -> tuple[list[dict[str, str]], list[ValidationIssue]]:
+) -> tuple[list[_ParsedRegisterRow], list[ValidationIssue]]:
     spec = REGISTER_SPECS[path.name]
     issues: list[ValidationIssue] = []
     try:
         with path.open(newline="", encoding="utf-8") as file_handle:
-            reader = csv.DictReader(file_handle)
-            raw_rows = list(reader)
-    except (OSError, csv.Error) as exc:
+            reader = csv.DictReader(file_handle, strict=True)
+            fieldnames = list(reader.fieldnames or ())
+            header_issue = _strict_header_issue(spec, path.name, fieldnames)
+            if header_issue is not None:
+                return [], [header_issue]
+            raw_rows = [(reader.line_num, row) for row in reader]
+    except (OSError, UnicodeDecodeError, csv.Error) as exc:
         return [], [ValidationIssue("register_unreadable", f"{path.name}: {exc}")]
 
-    if raw_rows and any(row is None for row in raw_rows):
+    # DictReader represents an over-wide row as ``{None: [extra, ...]}`` and
+    # a short row as a ``None`` value.  Validate those parser-level shapes
+    # before string normalization so malformed user CSV cannot escape through
+    # a permissive ``or ""`` conversion (or raise a TypeError in audit/report).
+    malformed_line = next(
+        (
+            line_number
+            for line_number, row in raw_rows
+            if not isinstance(row, dict)
+            or any(
+                not isinstance(key, str) or not isinstance(value, str)
+                for key, value in row.items()
+            )
+        ),
+        None,
+    )
+    if malformed_line is not None:
         return [], [
             ValidationIssue(
                 "register_malformed",
-                f"{path.name}: inconsistent column count in a row",
+                f"{path.name}:{malformed_line} inconsistent column count in a row",
             )
         ]
 
-    header = list(raw_rows[0]) if raw_rows else []
-    if header:
-        expected = set(spec.columns)
-        actual = set(header)
-        missing = sorted(expected - actual)
-        unexpected = sorted(actual - expected)
-        details: list[str] = []
-        if missing:
-            details.append(f"missing columns: {', '.join(missing)}")
-        if unexpected:
-            details.append(f"unexpected columns: {', '.join(unexpected)}")
-        if details:
-            issues.append(
-                ValidationIssue(
-                    "register_schema",
-                    f"{path.name} invalid columns ({'; '.join(details)})",
-                )
-            )
-
-    rows: list[dict[str, str]] = []
+    rows: list[_ParsedRegisterRow] = []
     seen_ids: set[str] = set()
-    for line_number, raw_row in enumerate(raw_rows, start=2):
+    for line_number, raw_row in raw_rows:
         if not any(raw_row.values()):
             continue
-        row = {key: (value or "").strip() for key, value in raw_row.items()}
-        rows.append(row)
+        row = {key: value.strip() for key, value in raw_row.items()}
+        rows.append(_ParsedRegisterRow(row, line_number))
         row_issues = _validate_row(spec, row, path.name, line_number)
         issues.extend(row_issues)
         if "id" in spec.columns:
@@ -275,6 +285,32 @@ def _validate_register(
                     )
                 seen_ids.add(identifier)
     return rows, issues
+
+
+def _strict_header_issue(
+    spec: RegisterSpec,
+    filename: str,
+    fieldnames: Sequence[object],
+) -> ValidationIssue | None:
+    """Reject non-exact CSV projections before DictReader can drop fields."""
+    if any(not isinstance(fieldname, str) for fieldname in fieldnames):
+        return ValidationIssue("register_malformed", f"{filename}: invalid CSV header")
+    header = tuple(str(fieldname) for fieldname in fieldnames)
+    expected = tuple(spec.columns)
+    duplicate_names = sorted(name for name in set(header) if header.count(name) > 1)
+    if duplicate_names:
+        return ValidationIssue(
+            "register_schema",
+            f"{filename} invalid header (duplicate columns: "
+            f"{', '.join(duplicate_names)})",
+        )
+    if header != expected:
+        return ValidationIssue(
+            "register_schema",
+            f"{filename} invalid header (expected ordered columns: "
+            f"{', '.join(expected)})",
+        )
+    return None
 
 
 def _validate_row(
@@ -327,31 +363,27 @@ def _validate_references(registers_dir: Path) -> list[ValidationIssue]:
     assumptions_path = registers_dir / "assumptions.csv"
     if not evidence_path.is_file() or not assumptions_path.is_file():
         return []
-    try:
-        with evidence_path.open(newline="", encoding="utf-8") as file_handle:
-            evidence_ids = {
-                row["id"] for row in csv.DictReader(file_handle) if row.get("id")
-            }
-    except (OSError, csv.Error):
+    evidence_rows, evidence_issues = _validate_register(evidence_path)
+    assumptions_rows, assumptions_issues = _validate_register(assumptions_path)
+    if evidence_issues or assumptions_issues:
         return []
+    evidence_ids = {
+        parsed_row.values["id"]
+        for parsed_row in evidence_rows
+        if parsed_row.values.get("id")
+    }
     issues: list[ValidationIssue] = []
-    try:
-        with assumptions_path.open(newline="", encoding="utf-8") as file_handle:
-            for line_number, row in enumerate(
-                csv.DictReader(file_handle),
-                start=2,
-            ):
-                reference = (row.get("source_evidence") or "").strip()
-                if reference and reference not in evidence_ids:
-                    issues.append(
-                        ValidationIssue(
-                            "register_dangling_reference",
-                            f"assumptions.csv:{line_number} source_evidence "
-                            f"{reference!r} is not a declared evidence id",
-                        )
-                    )
-    except (OSError, csv.Error):
-        return []
+    for parsed_row in assumptions_rows:
+        row = parsed_row.values
+        reference = row.get("source_evidence", "")
+        if reference and reference not in evidence_ids:
+            issues.append(
+                ValidationIssue(
+                    "register_dangling_reference",
+                    f"assumptions.csv:{parsed_row.line_number} source_evidence "
+                    f"{reference!r} is not a declared evidence id",
+                )
+            )
     return issues
 
 
@@ -360,21 +392,21 @@ def _validate_scenario_completeness(registers_dir: Path) -> list[ValidationIssue
     if not path.is_file():
         return []
     parameters: dict[str, dict[str, str]] = {}
-    try:
-        with path.open(newline="", encoding="utf-8") as file_handle:
-            for _line_number, row in enumerate(csv.DictReader(file_handle), start=2):
-                scenario = (row.get("scenario") or "").strip()
-                parameter = (row.get("parameter") or "").strip()
-                value = (row.get("value") or "").strip()
-                if not scenario or not parameter:
-                    continue
-                if scenario not in SCENARIOS:
-                    continue
-                if scenario in parameters.setdefault(parameter, {}):
-                    continue
-                parameters[parameter][scenario] = value
-    except (OSError, csv.Error):
+    rows, validation_issues = _validate_register(path)
+    if validation_issues:
         return []
+    for parsed_row in rows:
+        row = parsed_row.values
+        scenario = row.get("scenario", "")
+        parameter = row.get("parameter", "")
+        value = row.get("value", "")
+        if not scenario or not parameter:
+            continue
+        if scenario not in SCENARIOS:
+            continue
+        if scenario in parameters.setdefault(parameter, {}):
+            continue
+        parameters[parameter][scenario] = value
     issues: list[ValidationIssue] = []
     for parameter, values in sorted(parameters.items()):
         missing = [s for s in SCENARIOS if s not in values]

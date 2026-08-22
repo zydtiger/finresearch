@@ -9,6 +9,7 @@ from typing import Annotated, Literal, NoReturn, cast
 
 import typer
 
+from finresearch.auditing import audit_case
 from finresearch.cases import (
     CaseContractError,
     CaseStatus,
@@ -46,6 +47,7 @@ from finresearch.normalization import (
 )
 from finresearch.providers import ProviderError
 from finresearch.registers import REGISTER_FILES, inspect_registers
+from finresearch.reporting import generate_report
 
 app = typer.Typer(
     add_completion=False,
@@ -55,10 +57,12 @@ app = typer.Typer(
 case_app = typer.Typer(help="Inspect and manage research cases.")
 data_app = typer.Typer(help="Ingest and inspect research data.")
 model_app = typer.Typer(help="Run auditable deterministic valuation models.")
+report_app = typer.Typer(help="Render deterministic reports from validated model runs.")
 register_app = typer.Typer(help="Validate and summarize research registers.")
 app.add_typer(case_app, name="case")
 app.add_typer(data_app, name="data")
 app.add_typer(model_app, name="model")
+app.add_typer(report_app, name="report")
 data_app.add_typer(register_app, name="registers")
 
 WorkspaceOption = Annotated[
@@ -190,6 +194,24 @@ MetricsOption = Annotated[
 TargetOption = Annotated[
     str | None, typer.Option("--target", help="Declared target company_id.")
 ]
+ModelRunIdOption = Annotated[
+    str,
+    typer.Option("--model-run-id", help="Complete registered DCF or comps run id."),
+]
+MaxPriceAgeDaysOption = Annotated[
+    int,
+    typer.Option("--max-price-age-days", min=0, help="Maximum allowed price age."),
+]
+VerifyHashesOption = Annotated[
+    bool,
+    typer.Option(
+        "--verify-hashes",
+        help=(
+            "Additionally digest-check every registered artifact and input file "
+            "(full-case I/O)."
+        ),
+    ),
+]
 
 
 @dataclass(frozen=True)
@@ -278,6 +300,33 @@ def migrate_case_command(ctx: typer.Context, case_id: CaseIdArgument) -> None:
         typer.echo(f"migrated case manifest to v2: {case_id}")
     else:
         typer.echo(f"case manifest already at v2: {case_id}")
+
+
+@case_app.command("audit")
+def audit_case_command(
+    ctx: typer.Context,
+    case_id: CaseIdArgument,
+    as_of: AsOfOption,
+    max_price_age_days: MaxPriceAgeDaysOption,
+    verify_hashes: VerifyHashesOption = False,
+) -> None:
+    """Run read-only point-in-time and registered-byte audit gates."""
+    try:
+        audit = audit_case(
+            state_from_context(ctx).workspace,
+            case_id,
+            as_of=parse_iso_date(as_of, "as_of"),
+            max_price_age_days=max_price_age_days,
+            verify_hashes=verify_hashes,
+        )
+    except (CaseContractError, DataContractError, IngestionError, OSError) as exc:
+        fail(str(exc))
+    typer.echo(f"case: {audit.case_id}")
+    typer.echo(f"as_of: {audit.as_of.isoformat()}")
+    typer.echo(f"valid: {'yes' if audit.valid else 'no'}")
+    if not audit.valid:
+        print_issues(audit.issues)
+        raise typer.Exit(1)
 
 
 @data_app.command("ingest-yfinance-prices")
@@ -607,6 +656,22 @@ def model_projection_assess_command(
     print_model_run(receipt)
 
 
+@report_app.command("markdown")
+def report_markdown_command(
+    ctx: typer.Context, case_id: CaseIdArgument, model_run_id: ModelRunIdOption
+) -> None:
+    """Render an immutable portable Markdown report from one model run."""
+    _render_report_command(ctx, case_id, model_run_id, "markdown")
+
+
+@report_app.command("html")
+def report_html_command(
+    ctx: typer.Context, case_id: CaseIdArgument, model_run_id: ModelRunIdOption
+) -> None:
+    """Render an immutable self-contained HTML report from one model run."""
+    _render_report_command(ctx, case_id, model_run_id, "html")
+
+
 @register_app.command("status")
 def show_registers_status(ctx: typer.Context, case_id: CaseIdArgument) -> None:
     """Validate and summarize the case research registers."""
@@ -699,6 +764,31 @@ def print_model_run(run: object) -> None:
     typer.echo(f"run_id: {run.run_id}")
     for receipt in run.receipts:
         typer.echo(f"artifact: {receipt.artifact_id}")
+
+
+def _render_report_command(
+    ctx: typer.Context,
+    case_id: str,
+    model_run_id: str,
+    format: Literal["markdown", "html"],
+) -> None:
+    try:
+        receipt = generate_report(
+            state_from_context(ctx).workspace,
+            case_id,
+            model_run_id=model_run_id,
+            format=format,
+        )
+    except (
+        CaseContractError,
+        DataContractError,
+        IngestionError,
+        OSError,
+    ) as exc:
+        fail(str(exc))
+    typer.echo(f"artifact: {receipt.artifact_id}")
+    typer.echo(f"path: {receipt.path}")
+    typer.echo(f"sha256: {receipt.sha256}")
 
 
 def print_artifact_inspection(inspection: ArtifactInspection) -> None:

@@ -13,9 +13,22 @@ import pytest
 from typer.testing import CliRunner
 
 import finresearch.modeling as modeling_module
-from finresearch.cases import initialize_case, read_manifest, write_manifest
+from finresearch.auditing import audit_case
+from finresearch.cases import (
+    canonical_parameters_sha256,
+    initialize_case,
+    read_manifest,
+    write_manifest,
+)
 from finresearch.cli import app
-from finresearch.data_contracts import MODEL_DCF_RESULTS_V1, DataContractError
+from finresearch.data_contracts import (
+    MODEL_COMPS_INPUTS_V1,
+    MODEL_COMPS_RECONCILIATION_V1,
+    MODEL_COMPS_RESULTS_V1,
+    MODEL_COMPS_SUMMARY_V1,
+    MODEL_DCF_RESULTS_V1,
+    DataContractError,
+)
 from finresearch.data_validation import validate_artifact
 from finresearch.ingestion import ArtifactIntegrityError, IngestionError
 from finresearch.local_import import IMPORT_SCHEMAS, import_parquet
@@ -35,6 +48,7 @@ from finresearch.model import (
     wacc_from_components,
 )
 from finresearch.modeling import projection_assessment, run_comps, run_dcf
+from finresearch.reporting import ReportError, generate_report, load_report_context
 
 runner = CliRunner()
 
@@ -177,6 +191,29 @@ def _complete_comps_rows(*, amount_unit: str = "USDm") -> list[dict[str, object]
                 )
             )
     return rows
+
+
+def _legacy_comps_run_id(case_dir: Path, source_id: str) -> str:
+    source = next(
+        item
+        for item in read_manifest(case_dir).artifacts
+        if item.artifact_id == source_id
+    )
+    return canonical_parameters_sha256(
+        {
+            "input_artifact_id": source_id,
+            "input_sha256": source.sha256,
+            "as_of": "2026-06-30",
+            "metrics": ["ev_revenue"],
+            "target": "target",
+            "producer": modeling_module.MODEL_PRODUCER,
+            "producer_version": modeling_module.MODEL_PRODUCER_VERSION,
+            "register_hashes": [
+                (item.path, item.sha256)
+                for item in modeling_module._register_hashes(case_dir)
+            ],
+        }
+    )
 
 
 def test_dated_dcf_uses_actual_365_and_mid_year() -> None:
@@ -1198,6 +1235,183 @@ def test_comps_partial_publish_recovers_without_duplicate_model_outputs(
         metrics=("ev_revenue",),
     )
     assert validate_artifact(tmp_path, "demo") == ()
+
+
+def test_legacy_comps_v1_partial_is_valid_and_v2_rerun_uses_distinct_identity(
+    tmp_path: Path,
+) -> None:
+    case_dir = initialize_case(tmp_path, "demo")
+    _write_sources(case_dir)
+    source_id = _import_comps_rows(tmp_path, "demo", _complete_comps_rows())
+    manifest = read_manifest(case_dir)
+    source = next(item for item in manifest.artifacts if item.artifact_id == source_id)
+    legacy_id = _legacy_comps_run_id(case_dir, source_id)
+    legacy = modeling_module._publish(
+        case_dir,
+        manifest,
+        MODEL_COMPS_INPUTS_V1,
+        legacy_id,
+        "inputs",
+        pl.read_parquet(case_dir / source.path),
+        (source_id, *source.input_artifact_ids),
+        date(2026, 6, 30),
+        modeling_module._register_hashes(case_dir),
+    )
+    assert legacy.artifact_id.endswith(legacy_id)
+    assert validate_artifact(tmp_path, "demo") == ()
+    assert audit_case(
+        tmp_path, "demo", as_of=date(2026, 6, 30), max_price_age_days=1
+    ).valid
+
+    recovered = run_comps(
+        tmp_path,
+        "demo",
+        input_artifact_id=source_id,
+        as_of=date(2026, 6, 30),
+        metrics=("ev_revenue",),
+    )
+    assert recovered.run_id != legacy_id
+    assert recovered == run_comps(
+        tmp_path,
+        "demo",
+        input_artifact_id=source_id,
+        as_of=date(2026, 6, 30),
+        metrics=("ev_revenue",),
+    )
+    assert validate_artifact(tmp_path, "demo") == ()
+
+
+def test_legacy_comps_v1_full_run_is_rejected_as_unverifiable_but_v2_reruns(
+    tmp_path: Path,
+) -> None:
+    case_dir = initialize_case(tmp_path, "demo")
+    _write_sources(case_dir)
+    source_id = _import_comps_rows(tmp_path, "demo", _complete_comps_rows())
+    manifest = read_manifest(case_dir)
+    source = next(item for item in manifest.artifacts if item.artifact_id == source_id)
+    legacy_id = _legacy_comps_run_id(case_dir, source_id)
+    extra = modeling_module._register_hashes(case_dir)
+    selected = modeling_module._select_comps_pit(
+        pl.read_parquet(case_dir / source.path), date(2026, 6, 30)
+    )
+    required_components = modeling_module._required_comps_components(("ev_revenue",))
+    basis = modeling_module._validate_comps_periods(selected, required_components)
+    rows, checks = modeling_module._comps_rows(
+        selected,
+        legacy_id,
+        ("ev_revenue",),
+        "target",
+        "USD",
+        basis,
+        required_components,
+    )
+    legacy_input = modeling_module._publish(
+        case_dir,
+        manifest,
+        MODEL_COMPS_INPUTS_V1,
+        legacy_id,
+        "inputs",
+        pl.read_parquet(case_dir / source.path),
+        (source_id, *source.input_artifact_ids),
+        date(2026, 6, 30),
+        extra,
+    )
+    legacy_results = modeling_module._publish(
+        case_dir,
+        read_manifest(case_dir),
+        MODEL_COMPS_RESULTS_V1,
+        legacy_id,
+        "results",
+        pl.DataFrame(rows, schema=MODEL_COMPS_RESULTS_V1.schema),
+        (legacy_input.artifact_id,),
+        date(2026, 6, 30),
+        extra,
+    )
+    summary = pl.DataFrame(
+        modeling_module._comps_summary(rows, legacy_id, "USD", ("ev_revenue",)),
+        schema=MODEL_COMPS_SUMMARY_V1.schema,
+    )
+    checks_frame = pl.DataFrame(checks, schema=MODEL_COMPS_RECONCILIATION_V1.schema)
+    for contract, label, frame in (
+        (MODEL_COMPS_SUMMARY_V1, "summary", summary),
+        (MODEL_COMPS_RECONCILIATION_V1, "reconciliation", checks_frame),
+    ):
+        modeling_module._publish(
+            case_dir,
+            read_manifest(case_dir),
+            contract,
+            legacy_id,
+            label,
+            frame,
+            (legacy_results.artifact_id,),
+            date(2026, 6, 30),
+            extra,
+        )
+    assert validate_artifact(tmp_path, "demo") == ()
+    audit = audit_case(tmp_path, "demo", as_of=date(2026, 6, 30), max_price_age_days=1)
+    assert any("model.comps-inputs.v1" in issue.message for issue in audit.issues)
+    with pytest.raises(ReportError, match="model.comps-inputs.v1"):
+        load_report_context(tmp_path, "demo", legacy_id)
+    current = run_comps(
+        tmp_path,
+        "demo",
+        input_artifact_id=source_id,
+        as_of=date(2026, 6, 30),
+        metrics=("ev_revenue",),
+    )
+    assert current.run_id != legacy_id
+    assert current == run_comps(
+        tmp_path,
+        "demo",
+        input_artifact_id=source_id,
+        as_of=date(2026, 6, 30),
+        metrics=("ev_revenue",),
+    )
+    assert generate_report(
+        tmp_path, "demo", model_run_id=current.run_id, format="markdown"
+    ).path.is_file()
+    assert validate_artifact(tmp_path, "demo") == ()
+
+
+def test_comps_v2_partial_run_audit_is_stable_and_rerun_recovers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    case_dir = initialize_case(tmp_path, "demo")
+    _write_sources(case_dir)
+    source_id = _import_comps_rows(tmp_path, "demo", _complete_comps_rows())
+    original = modeling_module._publish
+    calls = 0
+
+    def interrupted(*args: Any, **kwargs: Any) -> Any:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("injected publication interruption")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(modeling_module, "_publish", interrupted)
+    with pytest.raises(OSError, match="injected"):
+        run_comps(
+            tmp_path,
+            "demo",
+            input_artifact_id=source_id,
+            as_of=date(2026, 6, 30),
+            metrics=("ev_revenue",),
+        )
+    monkeypatch.setattr(modeling_module, "_publish", original)
+    audit = audit_case(tmp_path, "demo", as_of=date(2026, 6, 30), max_price_age_days=1)
+    assert audit.valid
+    recovered = run_comps(
+        tmp_path,
+        "demo",
+        input_artifact_id=source_id,
+        as_of=date(2026, 6, 30),
+        metrics=("ev_revenue",),
+    )
+    assert len(recovered.receipts) == 4
+    assert audit_case(
+        tmp_path, "demo", as_of=date(2026, 6, 30), max_price_age_days=1
+    ).valid
 
 
 def test_model_cli_help_distinguishes_dcf_path_and_comps_artifact() -> None:
