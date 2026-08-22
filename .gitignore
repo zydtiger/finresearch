@@ -10,4 +10,13 @@ htmlcov/
 build/
 dist/
 .env
+.env.*
+!.env.example
 .DS_Store
+
+# Local-only research state; canonical source, tests, docs, and fixtures stay tracked.
+/.finresearch-cache/
+/provider-cache/
+/research-workspaces/
+/licensed-documents/
+/generated-artifacts/

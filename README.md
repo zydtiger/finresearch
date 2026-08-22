@@ -159,6 +159,26 @@ artifact and declared input file. See the
 [reporting and audit contract](docs/reporting.md) for the required model
 artifact sets, deterministic identity, and point-in-time checks.
 
+## Offline end-to-end milestone
+
+The repository includes a deterministic offline CLI integration test covering a
+v2 case initialization, strict local CSV imports for daily prices and
+fundamental facts, data validation, audited registers, a three-scenario DCF
+with a 2×2 sensitivity grid, projection assessment, full hash audit, and
+Markdown/HTML reports. It uses only temporary local files and public CLI
+commands; it neither contacts providers nor needs credentials.
+
+## Repository hygiene
+
+Keep provider caches, licensed source documents, secrets, research workspaces,
+and disposable generated outputs outside Git and outside the repository's
+canonical source tree. The checked-in `.gitignore` excludes local `.env` files
+and root-anchored tool/cache directories only; it intentionally does not
+exclude source code, tests, documentation, contracts, or fixtures. For
+example, root `provider-cache/` is ignored while `tests/provider-cache/` and
+`docs/provider-cache/` remain trackable (verify with `git check-ignore
+--no-index`).
+
 Validate and summarize the human-edited research registers (evidence,
 assumptions, scenarios, catalysts, open questions):
 

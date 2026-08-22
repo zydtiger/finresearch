@@ -55,6 +55,16 @@ delimiters, backslashes, and link/image delimiters; C0, DEL, and C1 control
 characters are rendered as visible `U+` escapes. A DCF sensitivity grid, when
 registered, is included as a deterministic inline table.
 
+For a DCF run whose authenticated sensitivity data contains a complete 2D grid
+for every rendered scenario (at least two WACC values and two terminal-growth
+values), HTML additionally includes one dependency-free inline SVG heatmap per
+scenario. Each figure has an accessible title and description, keeps the
+semantic sensitivity table, uses only finite authenticated frame values, and
+names the exact `model.dcf-sensitivity` artifact plus its canonical `model dcf`
+producing command in the caption. It has no external assets. One-dimensional
+or incomplete grids retain the table without a heatmap. Markdown deliberately
+keeps the portable table only.
+
 Reports are immutable `report.markdown.v1` or `report.html.v1` artifacts under
 the case `reports` role. Their identity is the canonical format, run id,
 ordered model-parent ids and checksums, and report producer version. The report
@@ -63,6 +73,14 @@ are produced by the common publisher. Rendering has no wall-clock field: the
 artifact timestamp is the model `as_of` at UTC midnight. An identical rerun
 returns the existing receipt. A different byte sequence or declaration at the
 same identity is an integrity error and is never overwritten.
+
+The Markdown renderer remains `finresearch.report` producer version `1`.
+HTML producer version `1` is frozen for reverse authentication of existing
+Phase 3 reports; current HTML publication uses producer version `2` for the
+heatmap/CSS contract. Producer version is part of the immutable identity and
+the v2 filename is explicitly prefixed with `v2.`, so it selects a distinct
+report path; audit rejects unknown renderer versions rather than interpreting
+them as either contract.
 
 ## Case audit
 

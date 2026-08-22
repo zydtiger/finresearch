@@ -28,11 +28,18 @@ from finresearch.ingestion import publish_artifact_bytes
 from finresearch.local_import import IMPORT_SCHEMAS, import_parquet
 from finresearch.modeling import resolve_model_run, run_comps, run_dcf
 from finresearch.registers import load_model_sources
+from finresearch.report_contract import (
+    REPORT_HTML_LEGACY_PRODUCER_VERSION,
+    REPORT_HTML_PRODUCER_VERSION,
+    REPORT_PRODUCER,
+    build_report_publication,
+)
 from finresearch.reporting import (
     ReportContext,
     ReportError,
     generate_report,
     load_report_context,
+    render_html,
     render_markdown,
 )
 
@@ -284,6 +291,151 @@ def test_dcf_report_is_repeated_byte_identical_and_cli_visible(tmp_path: Path) -
     )
     assert cli.exit_code == 0, cli.output
     assert first.artifact_id in cli.output
+
+
+def test_dcf_html_sensitivity_heatmaps_are_deterministic_and_traceable(
+    tmp_path: Path,
+) -> None:
+    case_dir = initialize_case(tmp_path, "demo")
+    _write_sources(case_dir)
+    _write_dcf_input(case_dir)
+    model = run_dcf(
+        tmp_path,
+        "demo",
+        sensitivity=((0.08, 0.1), (0.01, 0.02)),
+    )
+    context = load_report_context(tmp_path, "demo", model.run_id)
+    sensitivity_id = _model_artifact_id(case_dir, "model.dcf-sensitivity")
+
+    first_render = render_html(context)
+    second_render = render_html(context)
+    report = generate_report(tmp_path, "demo", model_run_id=model.run_id, format="html")
+    repeated = generate_report(
+        tmp_path, "demo", model_run_id=model.run_id, format="html"
+    )
+    content = report.path.read_bytes()
+
+    assert first_render == second_render == content
+    assert report == repeated
+    assert content.count(b'<figure class="sensitivity-heatmap">') == 3
+    assert content.count(b'<svg role="img"') == 3
+    assert b"Bear DCF per-share sensitivity heatmap" in content
+    assert b"Base DCF per-share sensitivity heatmap" in content
+    assert b"Bull DCF per-share sensitivity heatmap" in content
+    assert sensitivity_id.encode() in content
+    assert b"producing command: <code>finresearch --workspace PATH model dcf" in content
+    assert b"--sensitivity 0.08,0.1;0.01,0.02" in content
+    assert b"<img" not in content
+    assert b"http://" not in content and b"https://" not in content
+    assert audit_case(
+        tmp_path,
+        "demo",
+        as_of=date(2026, 6, 30),
+        max_price_age_days=1,
+        verify_hashes=True,
+    ).valid
+
+    escaped = render_html(replace(context, case_id="demo<script>&"))
+    assert b"demo&lt;script&gt;&amp;" in escaped
+    assert b"<script>" not in escaped
+
+
+def test_dcf_html_keeps_table_but_omits_one_dimensional_heatmap(tmp_path: Path) -> None:
+    case_dir = initialize_case(tmp_path, "demo")
+    _write_sources(case_dir)
+    _write_dcf_input(case_dir)
+    model = run_dcf(tmp_path, "demo", sensitivity=((0.08,), (0.02,)))
+
+    content = generate_report(
+        tmp_path,
+        "demo",
+        model_run_id=model.run_id,
+        format="html",
+    ).path.read_bytes()
+
+    assert b"<h2>Sensitivity</h2>" in content
+    assert b"model.dcf-sensitivity" in content
+    assert b"<svg" not in content
+
+
+def test_legacy_html_v1_audits_and_current_html_v2_is_distinct(
+    tmp_path: Path,
+) -> None:
+    case_dir = initialize_case(tmp_path, "demo")
+    _write_sources(case_dir)
+    _write_dcf_input(case_dir)
+    model = run_dcf(
+        tmp_path,
+        "demo",
+        sensitivity=((0.08, 0.1), (0.01, 0.02)),
+    )
+    manifest = read_manifest(case_dir)
+    context = load_report_context(tmp_path, "demo", model.run_id)
+    legacy = build_report_publication(
+        manifest,
+        context,
+        "html",
+        producer_version=REPORT_HTML_LEGACY_PRODUCER_VERSION,
+    )
+    legacy_receipt = publish_artifact_bytes(
+        case_dir=case_dir,
+        manifest=manifest,
+        path_role="reports",
+        kind=legacy.kind,
+        schema_version=1,
+        path_parts=(context.family, context.run_id),
+        filename=Path(legacy.path).name,
+        entity_key=context.run_id,
+        identity=legacy.identity,
+        content=legacy.content,
+        producer=REPORT_PRODUCER,
+        producer_version=legacy.producer_version,
+        parameters_sha256=legacy.identity,
+        input_artifact_ids=legacy.parents,
+        produced_at=legacy.produced_at,
+    )
+    legacy_artifact = next(
+        item
+        for item in read_manifest(case_dir).artifacts
+        if item.artifact_id == legacy_receipt.artifact_id
+    )
+
+    assert legacy_artifact.producer_version == REPORT_HTML_LEGACY_PRODUCER_VERSION
+    assert legacy_receipt.path.read_bytes() == legacy.content
+    assert b"sensitivity-heatmap" not in legacy.content
+    assert audit_case(
+        tmp_path,
+        "demo",
+        as_of=date(2026, 6, 30),
+        max_price_age_days=1,
+        verify_hashes=True,
+    ).valid
+
+    current = generate_report(
+        tmp_path, "demo", model_run_id=model.run_id, format="html"
+    )
+    repeated = generate_report(
+        tmp_path, "demo", model_run_id=model.run_id, format="html"
+    )
+    current_artifact = next(
+        item
+        for item in read_manifest(case_dir).artifacts
+        if item.artifact_id == current.artifact_id
+    )
+
+    assert current == repeated
+    assert current.artifact_id != legacy_receipt.artifact_id
+    assert current.path != legacy_receipt.path
+    assert current.path.name.startswith("v2.")
+    assert current_artifact.producer_version == REPORT_HTML_PRODUCER_VERSION
+    assert b"sensitivity-heatmap" in current.path.read_bytes()
+    assert audit_case(
+        tmp_path,
+        "demo",
+        as_of=date(2026, 6, 30),
+        max_price_age_days=1,
+        verify_hashes=True,
+    ).valid
 
 
 def test_comps_html_report_escapes_content_and_keeps_source_artifact(

@@ -72,7 +72,7 @@ def generate_report(
         identity=publication.identity,
         content=publication.content,
         producer=REPORT_PRODUCER,
-        producer_version=REPORT_PRODUCER_VERSION,
+        producer_version=publication.producer_version,
         parameters_sha256=publication.identity,
         input_artifact_ids=publication.parents,
         produced_at=publication.produced_at,
