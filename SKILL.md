@@ -21,11 +21,15 @@ user is explicitly working inside the finresearch repository.
 Require the caller to identify an existing workspace directory. Never discover
 or infer it from the current directory, home directory, environment, or a
 previous case. Keep research workspaces outside the finresearch source tree.
+The CLI rejects a missing workspace path, so create a newly named workspace
+explicitly at the caller's request before running.
 
-Use the caller's stable case ID exactly. Initialize a new case with `case init`;
-do not reuse an existing ID or silently normalize it. New cases use manifest v2.
-Run `case migrate` only as an explicit v1-to-v2 migration when a v2-only model,
-audit, or report workflow requires it.
+Use the caller's stable case ID exactly. Case IDs are 1-64 lowercase ASCII
+letters, digits, or hyphens and start and end with a letter or digit.
+Initialize a new case with `case init`; do not reuse an existing ID or
+silently normalize it. New cases use manifest v2. Run `case migrate` only as
+an explicit v1-to-v2 migration when a v2-only model, audit, or report
+workflow requires it.
 
 Treat `manifest.toml` and files registered below `data/raw`, `data/normalized`,
 `data/derived`, and `reports` as CLI-owned immutable state. Do not edit, rename,
@@ -66,7 +70,31 @@ Registers are strict human-auditable CSVs below `registers/`: `evidence.csv`,
 `open_questions.csv`. Missing registers are allowed. Validate every present
 register with `data registers status CASE_ID`. Keep reported facts, estimates,
 external evidence, and analyst assumptions explicitly classified, dated, and
-linked; do not manufacture rows merely to satisfy a model.
+linked; do not manufacture rows merely to satisfy a model. Each file has one
+exact ordered header:
+
+```text
+evidence.csv       id,claim,source_type,source_ref,observed_at,notes
+assumptions.csv    id,parameter,value,unit,rationale,source_evidence,updated_at
+scenarios.csv      scenario,parameter,value,unit,rationale
+catalysts.csv      id,event,expected_date,impact,notes
+open_questions.csv id,question,context,importance,status,answered_at
+```
+
+Enums and reference rules: `source_type` is `filing`/`estimate`/`external`/
+`assumption`; `assumptions.source_evidence` must reference an existing
+evidence id; `scenarios.scenario` is `bear`/`base`/`bull` and every parameter
+must define all three with pairwise-distinct values; `impact` is
+`positive`/`negative`/`neutral`; `importance` is `high`/`medium`/`low`;
+`status` is `open`/`answered`.
+
+Registers freeze at the first model run in a case: model runs and reports pin
+the byte hashes of `evidence.csv` and `assumptions.csv`, so any later edit to
+those two files — including appending a row — invalidates every prior run's
+identity and fails `case audit --verify-hashes`. Rerun freely over unchanged
+registers; changed evidence or assumptions open a new dated case in the same
+workspace, carrying the prior register content forward as explicitly dated
+rows.
 
 ## Run auditable models
 
@@ -76,7 +104,42 @@ DCF economic inputs belong in the case-relative strict TOML file, normally
 WACC components, capitalization, and complete bear/base/bull scenarios. Every
 economic leaf must contain `value`, controlled `unit`, and a `source_id` that
 resolves to valid `evidence.csv` or `assumptions.csv` content dated no later
-than the model cutoff.
+than the model cutoff. A minimal complete input (scenario blocks repeat for
+bear, base, and bull):
+
+```toml
+version = 1
+as_of = "2026-06-30"
+currency = "USD"
+value_unit = "USDm"
+share_unit = "shares_m"
+discount_convention = "year_end"   # or mid_year
+terminal_method = "gordon_growth"  # or exit_multiple
+projection_needs = []
+[wacc]
+cost_equity = { value = 0.10, unit = "ratio", source_id = "a1" }
+cost_debt = { value = 0.05, unit = "ratio", source_id = "a2" }
+tax_rate = { value = 0.25, unit = "ratio", source_id = "a3" }
+debt_weight = { value = 0.20, unit = "ratio", source_id = "a4" }
+[capitalization]
+market_cap = { value = 1000, unit = "USDm", source_id = "e1" }
+debt = { value = 200, unit = "USDm", source_id = "e2" }
+cash = { value = 50, unit = "USDm", source_id = "e3" }
+diluted_shares = { value = 100, unit = "shares_m", source_id = "e4" }
+[scenario.base]
+forecast = [{ period_end = "2027-12-31", free_cash_flow = { value = 80, unit = "USDm", source_id = "a5" } }]
+terminal = { terminal_growth = { value = 0.02, unit = "ratio", source_id = "a6" } }
+```
+
+Units are controlled: amounts use `CURRENCY`/`CURRENCYk`/`CURRENCYm`/
+`CURRENCYb`, shares use `shares`/`shares_k`/`shares_m`/`shares_b`, plus
+`ratio`, `multiple`, and `CURRENCY/share`; output per-share values normalize
+to `CURRENCY/share`. An `exit_multiple` terminal requires separately sourced
+`terminal_metric` and `exit_multiple` leaves — never the final FCF.
+`projection_needs` is a gate recording disclosed structural needs, not a
+three-statement model; its values are `working-capital`, `capex-depreciation`,
+`tax`, `cash-debt-interest`, `dilution`, `liquidity-covenant`, and
+`balance-sheet-reconciliation`.
 
 Run:
 
@@ -96,6 +159,18 @@ Comparable-company analysis requires a validated
 metrics, and optional declared target. finresearch does not discover peers,
 invert FX, convert fiscal periods, or default missing net debt. Do not proceed
 until the peer observations and requested multiples are explicitly supported.
+
+Observation files use the exact ordered header `company_id,company_name,role,
+metric,period_basis,period_end,knowledge_date,as_of,value,unit,currency,
+source_id`, and every row's `source_id` must already resolve to an
+`evidence.csv` or `assumptions.csv` row before `model comps` runs — write that
+register first. All selected observations must come from one common snapshot
+no later than the cutoff; the run selects the latest `knowledge_date` per
+company/metric and treats tied latest observations as conflicts; companies
+sharing one requested multiple must share the same basis and period end; EV
+multiples require both `market_cap` and `net_debt`; every requested metric
+needs at least one valid peer, and missing, zero, or negative denominators
+become explicit exclusions.
 
 ```text
 finresearch --workspace WORKSPACE model comps CASE_ID --input ARTIFACT_ID \
@@ -135,3 +210,5 @@ finresearch --workspace WORKSPACE case audit CASE_ID --as-of YYYY-MM-DD \
 Stop on any nonzero exit. Do not bypass validation or repair registered state by
 hand. Report the workspace, case ID, cutoff, important input artifact IDs,
 model run ID, generated report artifact and path, and final audit result.
+`--max-price-age-days` is required even when a case declares no price
+artifacts; the stale-price gate is vacuous then.
