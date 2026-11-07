@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from datetime import UTC, date, datetime
 from pathlib import Path
 
 from finresearch.captures import CaptureReceipt, case_context, publish_capture
 from finresearch.data_contracts import QUOTE_ASSETS
 from finresearch.ingestion import IngestionError
-from finresearch.providers import ProviderError, coingecko, hyperliquid
+from finresearch.providers import ProviderError, coingecko, defillama, hyperliquid
 from finresearch.providers.http import RequestFetcher, fetch_json
 
 
@@ -182,4 +183,39 @@ def ingest_hyperliquid_info(
         if next_cursor <= cursor or next_cursor > retrieval_ms:
             break
         cursor = next_cursor
+    return tuple(receipts)
+
+
+def ingest_defillama(
+    workspace: Path,
+    case_id: str,
+    slug: str,
+    datasets: tuple[str, ...],
+    *,
+    fetcher: RequestFetcher | None = None,
+    retrieved_at: datetime | None = None,
+    report: Callable[[CaptureReceipt], None] | None = None,
+) -> tuple[CaptureReceipt, ...]:
+    """Capture DefiLlama datasets in order, keeping captures already completed."""
+    if not datasets or len(set(datasets)) != len(datasets):
+        raise IngestionError("pass each --dataset at least once and at most once")
+    urls = [defillama.summary_url(slug, dataset) for dataset in datasets]
+    case_context(workspace, case_id)
+    retrieval = _retrieval_time(retrieved_at)
+    active = fetcher or defillama.default_fetcher()
+    receipts: list[CaptureReceipt] = []
+    for url in urls:
+        receipt = _record(
+            workspace,
+            case_id,
+            provider="defillama",
+            method="GET",
+            url=url,
+            request_body=None,
+            fetcher=active,
+            retrieved_at=retrieval,
+        )
+        receipts.append(receipt)
+        if report is not None:
+            report(receipt)
     return tuple(receipts)

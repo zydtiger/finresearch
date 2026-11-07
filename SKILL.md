@@ -79,6 +79,18 @@ financial values, peers, evidence, assumptions, or source IDs.
   chose and why). Which definition is authoritative is your judgment; an
   unresolved `conflict` is reported by `case audit` as `token_supply_conflict`,
   so record a resolution instead of ignoring it.
+- Protocol metrics: `data ingest-defillama SLUG --dataset ...` (repeatable;
+  per-protocol keyless summaries) and
+  `data ingest-hyperliquid-info --request meta-and-asset-ctxs` capture the
+  provider responses; `data normalize-protocol-metrics --capture-artifact-id ID
+  ... --entity-id ID [--instrument-id ID]` writes
+  `normalized.protocol-metrics.v1` plus the provider's metric definitions.
+  Select one level yourself: `sub_protocol IS NULL` is the provider aggregate
+  and child rows must never be added to it. `is_complete = false` marks a period
+  that ends on or after the capture's UTC date; do not annualize it as a full
+  day. A changed provider methodology yields a new `provider_definition_id`, so
+  compare periods only under one id. Perp volume has no free daily history: it
+  accumulates from repeated `metaAndAssetCtxs` captures.
 - `fundamental-facts.v2` accepts units `tokens`, `<FIAT>/token`, and `bps`
   (fixed `unit_kind` and `currency` pairings) and categories `token-supply`
   and `protocol-metric`. Stablecoins are `quote_asset` values (`USDC`, `USDT`,

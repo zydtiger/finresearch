@@ -174,6 +174,19 @@ uv run finresearch --workspace /path/to/research-artifacts \
   --policy analysis/token-supply-policy.toml
 ```
 
+Capture DefiLlama or Hyperliquid protocol metrics and normalize them together
+with the provider's metric definitions:
+
+```bash
+uv run finresearch --workspace /path/to/research-artifacts \
+  data ingest-defillama hype-2026-11-07 hyperliquid \
+  --dataset fees --dataset holders-revenue
+uv run finresearch --workspace /path/to/research-artifacts \
+  data normalize-protocol-metrics hype-2026-11-07 \
+  --capture-artifact-id CAPTURE_ID --capture-artifact-id CAPTURE_ID \
+  --entity-id hyperliquid --instrument-id hype.hyperliquid.l1
+```
+
 Build an explicit as-of current-state master only when the provider-scoped v2
 observations are already present:
 

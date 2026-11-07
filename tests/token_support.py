@@ -35,3 +35,21 @@ def ok(content: bytes) -> FetchedResponse:
 
 def new_case(workspace: Path, case_id: str = "hype") -> Path:
     return initialize_case(workspace, case_id)
+
+
+def register_json(workspace: Path, tmp_path: Path, name: str, url: str) -> str:
+    """Register a fixture as an agent capture and return its capture id."""
+    from finresearch.captures import register_capture
+
+    source = tmp_path / name
+    source.write_bytes(fixture_bytes(name))
+    return register_capture(
+        workspace,
+        "hype",
+        source,
+        provider="defillama",
+        kind="api-response",
+        url=url,
+        retrieved_at=RETRIEVED_AT,
+        http_status=200,
+    ).capture_id

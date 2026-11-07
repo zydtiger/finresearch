@@ -13,6 +13,7 @@ from finresearch.auditing import audit_case
 from finresearch.capture_ingestion import (
     ingest_coingecko_markets,
     ingest_coingecko_token,
+    ingest_defillama,
     ingest_hyperliquid_info,
 )
 from finresearch.captures import CaptureReceipt, register_capture
@@ -51,6 +52,7 @@ from finresearch.normalization import (
     normalize_fundamental_facts,
     reconcile_instrument_master,
 )
+from finresearch.protocol_normalization import normalize_protocol_metrics
 from finresearch.providers import ProviderError
 from finresearch.registers import REGISTER_FILES, inspect_registers
 from finresearch.reporting import generate_report
@@ -644,6 +646,74 @@ def ingest_hyperliquid_info_command(
         fail(str(exc))
     for receipt in receipts:
         print_capture_receipt(receipt)
+
+
+@data_app.command("ingest-defillama")
+def ingest_defillama_command(
+    ctx: typer.Context,
+    case_id: CaseIdArgument,
+    slug: Annotated[str, typer.Argument(help="DefiLlama protocol slug.")],
+    dataset: Annotated[
+        list[str],
+        typer.Option(
+            "--dataset",
+            help=(
+                "fees, revenue, holders-revenue, dex-volume, or open-interest; "
+                "repeat to capture several, fetched in order."
+            ),
+        ),
+    ],
+) -> None:
+    """Capture DefiLlama per-protocol summaries (keyless endpoints)."""
+    try:
+        ingest_defillama(
+            state_from_context(ctx).workspace,
+            case_id,
+            slug,
+            tuple(dataset),
+            report=print_capture_receipt,
+        )
+    except (
+        CaseContractError,
+        DataContractError,
+        IngestionError,
+        OSError,
+        ProviderError,
+    ) as exc:
+        fail(str(exc))
+
+
+@data_app.command("normalize-protocol-metrics")
+def normalize_protocol_metrics_command(
+    ctx: typer.Context,
+    case_id: CaseIdArgument,
+    capture_artifact_ids: Annotated[
+        list[str],
+        typer.Option(
+            "--capture-artifact-id", help="Declared raw.capture.v1 id; repeatable."
+        ),
+    ],
+    entity_id: Annotated[str, typer.Option("--entity-id", help="Protocol entity id.")],
+    instrument_id: Annotated[
+        str | None,
+        typer.Option("--instrument-id", help="Value-receiving token, if declared."),
+    ] = None,
+) -> None:
+    """Parse captures into protocol-metrics and metric-definitions tables."""
+    try:
+        receipt = normalize_protocol_metrics(
+            state_from_context(ctx).workspace,
+            case_id,
+            capture_artifact_ids=tuple(capture_artifact_ids),
+            entity_id=entity_id,
+            instrument_id=instrument_id,
+        )
+    except (CaseContractError, DataContractError, IngestionError, OSError) as exc:
+        fail(str(exc))
+    typer.echo("normalized provider-metric-definitions:")
+    print_ingestion_receipt(receipt.definitions)
+    typer.echo("normalized protocol-metrics:")
+    print_ingestion_receipt(receipt.metrics)
 
 
 @data_app.command("normalize-token-supply")

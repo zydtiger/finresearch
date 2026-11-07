@@ -385,6 +385,14 @@ def _cutoff_issues(
                 if _has_date_schema(frame, "observed_at")
                 else []
             )
+    if kind == "normalized.protocol-metrics":
+        for field in ("period_end", "observed_at"):
+            if _has_date_schema(frame, field):
+                issues.extend(
+                    _datetime_cutoff_issues(
+                        artifact_id, frame, field, as_of, "protocol_metric_after_as_of"
+                    )
+                )
     check = checks.get(kind)
     if check is None or not _has_date_schema(frame, check[0]):
         return issues

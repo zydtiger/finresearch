@@ -240,9 +240,8 @@ belong in `token-inputs.toml`, not in `scenarios.csv`.
 > data" (contracts, free endpoints, ingest, normalization, import,
 > reconciliation, and audit codes `token_supply_conflict`,
 > `token_supply_after_as_of`, `token_market_after_as_of`, and
-> `capture_metadata_mismatch`). Everything below under "Token supply" through
-> "Cross-source reconciliation" except protocol metrics is shipped; protocol
-> metrics follow in phase 3.
+> `capture_metadata_mismatch`). "Token supply" and "Cross-source
+> reconciliation" below are shipped.
 
 #### `normalized.token-supply.v1`
 
@@ -398,6 +397,10 @@ Supply rows from web pages, such as CoinMarketCap, enter through
 the registered `tool-summary` or `web-page` capture.
 
 ### Protocol metrics
+
+> **Implemented (phase 3)**: see `data-ingestion.md`, "Protocol metrics"
+> (contracts, `ingest-defillama`, `normalize-protocol-metrics`, `is_complete`,
+> definitions, and audit code `protocol_metric_after_as_of`).
 
 #### `normalized.protocol-metrics.v1`
 
