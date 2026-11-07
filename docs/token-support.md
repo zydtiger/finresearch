@@ -48,7 +48,7 @@ captures:
 
 | Pipeline-log step | Gap | Section |
 | --- | --- | --- |
-| 1a, FX in `00700`/`nok` | One null bar or OHLC violation blocks normalization | [Null provider bars](#null-provider-bars-in-normalize-daily-prices), [FX](#fx-normalization-and-conversion) |
+| 1a; FX in equity cases | One null bar or OHLC violation blocks normalization | [Null provider bars](#null-provider-bars-in-normalize-daily-prices), [FX](#fx-normalization-and-conversion) |
 | 1c, 10 | Calendar-day staleness on 24/7 bars | [Price-age policy](#per-asset-class-price-age-policy) |
 | 2 | No chain, contract, or provider ids; yfinance master says `unknown` | [instrument-master.v3](#normalizedinstrument-masterv3) |
 | 3 | Supply from three sources, reconciled by hand | [Token supply](#token-supply), [Reconciliation](#cross-source-reconciliation) |
@@ -56,7 +56,7 @@ captures:
 | 5, 6 | Fees and holders revenue forced into SEC-shaped facts; `tokens` rejected | [Protocol metrics](#protocol-metrics), [Units](#units-and-stablecoin-quotes) |
 | 7 | Single-id `source_evidence`; captures without lineage | [Captures](#web-and-api-captures), [Registers](#multi-id-source_evidence) |
 | 8, 11 | Token model and report outside the CLI | [model token](#model-token) |
-| `ionq`/`rgti`/`qbts` | One share-count leaf for all scenarios | [DCF dilution](#scenario-specific-share-counts-and-issuance-in-the-dcf) |
+| Dilutive equity cases | One share-count leaf for all scenarios | [DCF dilution](#scenario-specific-share-counts-and-issuance-in-the-dcf) |
 
 ## Shared foundations
 
@@ -900,7 +900,8 @@ same cutoff needs `--max-price-age-days 1`.
 
 ### FX normalization and conversion
 
-The `00700` and `nok` cases could not normalize `CNYHKD=X` and `EURUSD=X`:
+Equity cases priced in one currency and reporting in another could not
+normalize `CNYHKD=X` and `EURUSD=X`:
 yfinance FX rows have NULL OHLC on holidays and low values above open or
 close. FX does not need OHLC.
 
@@ -952,7 +953,7 @@ cumulative issued shares. `model.dcf-results.v2` adds
 `opening_diluted_shares`, `issued_shares`, `ending_diluted_shares`, and
 `issuance_pv`; a new reconciliation check verifies the share roll-forward.
 The unit-count roll-forward is the same code path as the token supply path.
-This removes the need in `ionq`, `rgti`, and `qbts` to fold dilution into
+This removes the need in heavily dilutive equity cases to fold dilution into
 cash flows.
 
 ## Nice-to-have
@@ -1021,28 +1022,13 @@ The HYPE trial case is not modified by this work. A new case, or a successor
 The equity cases need no migration: their v1 DCF inputs keep working, and
 they can adopt version 2 and `normalize-fx-rates` in a new run.
 
-## Skill updates (nix-config, list only)
+## Agent usage skill
 
-In `config/agents/skills/investment-research/`:
-
-- `references/methods/crypto.md`: replace "do not route token models through
-  finresearch's equity DCF/comps contracts" with the `model token` route for
-  tokenholder cash flow and holders-revenue multiples; keep the rule against
-  the equity DCF. Add the capture-first evidence rule, the supply
-  reconciliation step with policy resolutions, the `held_buyback_treatment`
-  and `fully_diluted_metric` decisions, and the UTC complete-bar cutoff.
-- `references/integrations/finresearch.md`: list the token commands in the
-  handoff and move crypto out of "other economic methods remain outside".
-- `references/vendor/finresearch.md`: refresh from this repository's root
-  `SKILL.md` after it documents the new commands, contracts, issue codes, and
-  `token-inputs.toml`.
-- `references/workflow-guide.md`: route token cases to the CLI path and point
-  stablecoin and unlock questions to the agent-owned table above.
-- `assets/research-manifest.md`: add capture ids and the supply policy to the
-  input record.
-
-This repository's root `SKILL.md` gets the matching usage sections in the same
-change as each phase.
+Each phase updates the repository-root `SKILL.md` in the same change: the new
+commands, contracts, issue codes, `token-inputs.toml`, the capture-first
+evidence rule, supply reconciliation with policy resolutions, the
+`held_buyback_treatment` and fully diluted denominator choices, and the
+complete-UTC-bar price cutoff for crypto.
 
 ## Implementation plan
 
