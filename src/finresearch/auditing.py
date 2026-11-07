@@ -26,7 +26,7 @@ from finresearch.modeling import (
     authenticate_case_model_runs,
     resolve_model_run,
 )
-from finresearch.registers import load_model_sources
+from finresearch.registers import capture_reference_issues, load_model_sources
 from finresearch.report_contract import authenticate_report_artifact
 
 
@@ -75,6 +75,7 @@ def audit_case(
         case_dir, manifest.artifacts, as_of
     )
     issues.extend(frame_issues)
+    issues.extend(capture_reference_issues(workspace, case_id))
 
     authenticated_runs, authentication_issues = authenticate_case_model_runs(
         case_dir, manifest, verify_hashes=verify_hashes

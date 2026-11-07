@@ -10,6 +10,7 @@ from typing import Annotated, Literal, NoReturn, cast
 import typer
 
 from finresearch.auditing import audit_case
+from finresearch.captures import CaptureReceipt, register_capture
 from finresearch.cases import (
     CaseContractError,
     CaseStatus,
@@ -154,6 +155,17 @@ ImportProviderOption = Annotated[
 ImportRetrievedAtOption = Annotated[
     str,
     typer.Option("--retrieved-at", help="Explicit RFC3339 UTC source retrieval time."),
+]
+CaptureFileArgument = Annotated[
+    Path,
+    typer.Argument(
+        exists=True,
+        file_okay=True,
+        dir_okay=False,
+        readable=True,
+        resolve_path=True,
+        help="Explicit local file holding the exact fetched bytes.",
+    ),
 ]
 AsOfOption = Annotated[
     str,
@@ -457,6 +469,70 @@ def import_parquet_command(
     print_local_import_receipt(receipt)
 
 
+@data_app.command("register-capture")
+def register_capture_command(
+    ctx: typer.Context,
+    case_id: CaseIdArgument,
+    capture_file: CaptureFileArgument,
+    provider: Annotated[
+        str, typer.Option("--provider", help="web, coingecko, hyperliquid, defillama.")
+    ],
+    kind: Annotated[
+        str,
+        typer.Option(
+            "--kind", help="api-response, web-page, document, or tool-summary."
+        ),
+    ],
+    url: Annotated[str, typer.Option("--url", help="Absolute https source URL.")],
+    retrieved_at: Annotated[
+        str,
+        typer.Option("--retrieved-at", help="RFC3339 UTC time the bytes were fetched."),
+    ],
+    method: Annotated[str, typer.Option("--method", help="GET or POST.")] = "GET",
+    request_body: Annotated[
+        Path | None,
+        typer.Option(
+            "--request-body",
+            exists=True,
+            dir_okay=False,
+            readable=True,
+            resolve_path=True,
+            help="JSON file holding the POST body.",
+        ),
+    ] = None,
+    http_status: Annotated[
+        int | None, typer.Option("--http-status", help="2xx status of the fetch.")
+    ] = None,
+    media_type: Annotated[
+        str | None,
+        typer.Option("--media-type", help="Defaults from the file extension."),
+    ] = None,
+    expect_sha256: Annotated[
+        str | None,
+        typer.Option("--expect-sha256", help="Fail unless the bytes hash to this."),
+    ] = None,
+) -> None:
+    """Register fetched bytes as a hashed capture with request provenance."""
+    try:
+        receipt = register_capture(
+            state_from_context(ctx).workspace,
+            case_id,
+            capture_file,
+            provider=provider,
+            kind=kind,
+            url=url,
+            retrieved_at=parse_import_timestamp(retrieved_at),
+            method=method,
+            request_body_file=request_body,
+            http_status=http_status,
+            media_type=media_type,
+            expect_sha256=expect_sha256,
+        )
+    except (CaseContractError, DataContractError, IngestionError, OSError) as exc:
+        fail(str(exc))
+    print_capture_receipt(receipt)
+
+
 @data_app.command("validate")
 def validate_data_command(
     ctx: typer.Context,
@@ -714,6 +790,14 @@ def print_ingestion_receipt(receipt: IngestionReceipt) -> None:
     typer.echo(f"path: {receipt.path}")
     typer.echo(f"rows: {receipt.row_count}")
     typer.echo(f"sha256: {receipt.sha256}")
+
+
+def print_capture_receipt(receipt: CaptureReceipt) -> None:
+    """Print the stable identifiers of one registered capture."""
+    typer.echo(f"capture: {receipt.capture_id}")
+    typer.echo(f"body: {receipt.body_artifact_id}")
+    typer.echo(f"path: {receipt.body_path}")
+    typer.echo(f"sha256: {receipt.content_sha256}")
 
 
 def print_local_import_receipt(receipt: LocalImportReceipt) -> None:

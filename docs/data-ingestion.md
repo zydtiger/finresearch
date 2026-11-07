@@ -271,7 +271,19 @@ part of its unique identity),
 currencies `AUD,CAD,CHF,CNY,EUR,GBP,HKD,JPY,KRW,SGD,USD`; price bases
 `unadjusted,split-adjusted,total-return`; asset classes
 `commodity,crypto,derivative,equity,etf,fixed-income,fund,fx,index,other,unknown`;
-and fact categories `balance-sheet,cash-flow,entity,income-statement,other,share-data`.
+and fact categories
+`balance-sheet,cash-flow,entity,income-statement,other,protocol-metric,share-data,token-supply`.
+Token support widens `normalized.fundamental-facts.v2` in place with units
+`tokens`, `<FIAT>/token` (one per currency code, singular `token`), and `bps`,
+unit kind `tokens`, and the two categories above. Each new unit has a fixed
+pairing: `tokens` requires `unit_kind = "tokens"` and NULL `currency`;
+`<FIAT>/token` requires `unit_kind = "currency"` and the matching `currency`;
+`bps` requires `unit_kind = "ratio"` and NULL `currency`. Pre-existing units
+are not re-validated, so existing artifacts stay valid; older CLIs reject rows
+that use the new values. Stablecoins are not currencies: `CURRENCY_CODES` is
+unchanged and provider values quoted in a stablecoin carry a separate
+controlled `quote_asset` from `QUOTE_ASSETS` (`CURRENCY_CODES` plus `USDC`,
+`USDT`, `USDH`); a row whose `quote_asset` is a stablecoin has NULL `currency`.
 Canonical publication applies each contract's declared deterministic sort key;
 contracts enforce exact schemas,
 nullability, unique keys, UTC timestamps, and semantic invariants such as
@@ -361,6 +373,54 @@ Rules:
   explicit currency column is deferred until a mixed-unit normalization is
   needed.
 
+## Captures
+
+A capture is the exact response or document bytes plus request provenance. It
+is the raw layer for token and protocol providers (JSON responses are not
+flattened to Parquet) and for agent-fetched material such as web pages. One
+capture registers two artifacts, both in manifest v2 cases only:
+
+1. `raw.capture-body`: the exact bytes, non-Parquet, at
+   `data/raw/captures/<provider>/<capture-key>/<retrieved-at>.<ext>`. Its
+   manifest `sha256` is the content hash.
+2. `raw.capture.v1`: a one-row Parquet metadata table at the same stem whose
+   only parent is the body artifact. `capture_id` is this artifact's id.
+
+| Field | Meaning |
+| --- | --- |
+| `capture_id`, `body_artifact_id` | Metadata artifact id and its body parent |
+| `provider` | `coingecko`, `hyperliquid`, `defillama`, or `web` |
+| `capture_kind` | `api-response`, `web-page`, `document`, `tool-summary` |
+| `recorded_by` | `cli` for ingest commands, `agent` for `register-capture` |
+| `request_method`, `url`, `request_body` | `GET`/`POST`; absolute `https` URL; canonical JSON text for POST (compact, `type` first, other keys sorted) |
+| `http_status` | Required for `api-response`; 2xx whenever present |
+| `media_type`, `content_sha256`, `content_bytes` | Body type, SHA-256, size |
+| `retrieved_at` | Provider retrieval time (also the manifest `retrieved_at`) |
+
+The unique key is `capture_id`. Validation rejects URLs with userinfo or a
+query parameter whose name contains `key`, `token`, or `secret`, so provider
+API keys are never persisted. The capture key is a readable host slug plus the
+first 12 hex digits of `sha256(method, url, request_body)`; identity is the key
+plus retrieval time, so repeated captures append. `tool-summary` labels text an
+agent tool returned instead of raw bytes.
+
+```text
+finresearch --workspace PATH data register-capture CASE_ID FILE \
+  --provider web|coingecko|hyperliquid|defillama \
+  --kind api-response|web-page|document|tool-summary \
+  --url URL --retrieved-at RFC3339_UTC [--method GET|POST] \
+  [--request-body FILE] [--http-status N] [--media-type TYPE] \
+  [--expect-sha256 HEX]
+```
+
+The CLI computes the SHA-256 itself; `--expect-sha256` fails the command when
+the bytes differ from a hash the agent recorded at fetch time. `--media-type`
+defaults from the file extension (`.json`, `.html`, `.htm`, `.md`, `.txt`,
+`.pdf`) and is required otherwise; `--http-status` is required for
+`api-response`. Absolute input paths never enter the manifest. A rerun with the
+same bytes and metadata returns the existing receipt; different bytes or
+metadata at the same identity are an integrity error.
+
 ## Research registers
 
 Registers store the explicit judgments and open items of a research process in
@@ -376,10 +436,16 @@ Five versioned register contracts are validated and summarized:
 | File | Rows | Key rules |
 | --- | --- | --- |
 | `evidence.csv` | one claim per row | unique `id`; `source_type` is `filing`/`estimate`/`external`/`assumption`; `observed_at` date |
-| `assumptions.csv` | one analyst assumption per row | unique `id`; optional `source_evidence` must reference an existing evidence id |
+| `assumptions.csv` | one analyst assumption per row | unique `id`; optional `source_evidence` is one evidence id or a `;`-separated list of existing ids (no spaces, no duplicates, ascending order); a missing id is named in the error |
 | `scenarios.csv` | one scenario parameter value per row | `scenario` is `bear`/`base`/`bull`; every parameter must define all three with pairwise-distinct values |
 | `catalysts.csv` | one event per row | unique `id`; `impact` is `positive`/`negative`/`neutral`; optional `expected_date` |
 | `open_questions.csv` | one open item per row | unique `id`; `importance` `high`/`medium`/`low`; `status` `open`/`answered` |
+
+`evidence.csv` `source_ref` may contain `capture:<capture_id>` tokens beside
+free text. `data registers status` and `case audit` report
+`register_capture_reference_invalid` when a referenced capture is not a
+declared `raw.capture.v1`, and `register_capture_after_observed` when the
+capture's `retrieved_at` date is after the evidence `observed_at`.
 
 Missing registers are not errors; a case may have none yet. The command
 reports per-register row counts and exits nonzero on any schema, enum, date,

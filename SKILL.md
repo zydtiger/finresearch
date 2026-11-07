@@ -57,6 +57,17 @@ financial values, peers, evidence, assumptions, or source IDs.
   `data normalize-fundamental-facts` only after the corresponding raw snapshot
   exists. When several eligible raw artifacts exist, select a specific
   `--raw-artifact-id` from CLI output or inspection; never guess one.
+- Register every web page, document, tool summary, or API response you fetched
+  yourself with `data register-capture` (record the fetch time and the sha256
+  at retrieval; pass them as `--retrieved-at` and `--expect-sha256`) before
+  deriving numbers from it, and cite it in `evidence.csv` `source_ref` as
+  `capture:<capture_id>`. Never hand-edit CLI-owned files. URLs must be https
+  and carry no credentials: userinfo or query names containing `key`,
+  `token`, or `secret` are rejected.
+- `fundamental-facts.v2` accepts units `tokens`, `<FIAT>/token`, and `bps`
+  (fixed `unit_kind` and `currency` pairings) and categories `token-supply`
+  and `protocol-metric`. Stablecoins are `quote_asset` values (`USDC`, `USDT`,
+  `USDH`), never currencies.
 - Use `data reconcile-instrument-master --as-of YYYY-MM-DD` only for explicit
   current-state reconciliation from v2 observations.
 
@@ -82,8 +93,8 @@ open_questions.csv id,question,context,importance,status,answered_at
 ```
 
 Enums and reference rules: `source_type` is `filing`/`estimate`/`external`/
-`assumption`; `assumptions.source_evidence` must reference an existing
-evidence id; `scenarios.scenario` is `bear`/`base`/`bull` and every parameter
+`assumption`; `assumptions.source_evidence` is one existing evidence id or a
+`;`-joined list of them (no spaces or duplicates, ascending order); `scenarios.scenario` is `bear`/`base`/`bull` and every parameter
 must define all three with pairwise-distinct values; `impact` is
 `positive`/`negative`/`neutral`; `importance` is `high`/`medium`/`low`;
 `status` is `open`/`answered`.

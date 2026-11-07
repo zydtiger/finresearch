@@ -144,6 +144,17 @@ uv run finresearch --workspace /path/to/research-artifacts \
   --schema fundamental-facts.v2 --provider manual --retrieved-at 2026-08-11T04:00:00Z
 ```
 
+Register fetched web or API bytes as a hashed capture (the CLI computes the
+SHA-256; `--expect-sha256` checks a hash recorded at fetch time), then cite it
+as `capture:<capture_id>` in `evidence.csv`:
+
+```bash
+uv run finresearch --workspace /path/to/research-artifacts \
+  data register-capture aapl-2026-08-11 ./response.json \
+  --provider web --kind api-response --url https://example.com/api \
+  --retrieved-at 2026-08-11T04:00:00Z --http-status 200
+```
+
 Build an explicit as-of current-state master only when the provider-scoped v2
 observations are already present:
 

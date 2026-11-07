@@ -8,14 +8,17 @@ summarizes them; ordinary editing stays with the user's CSV tooling.
 from __future__ import annotations
 
 import csv
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import date
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Final, Literal
 
+from finresearch.captures import CAPTURE_REFERENCE_PATTERN, declared_captures
 from finresearch.cases import (
     CaseContractError,
+    CaseManifest,
     ValidationIssue,
     case_directory,
     read_manifest,
@@ -190,7 +193,7 @@ def load_model_sources(case_dir: Path, *, as_of: date) -> dict[str, ModelSource]
 
 def inspect_registers(workspace: Path, case_id: str) -> RegisterStatus:
     """Validate every present register; missing registers are not errors."""
-    registers_dir = _registers_directory(workspace, case_id)
+    registers_dir, manifest = _registers_directory(workspace, case_id)
     row_counts: dict[str, int] = {}
     issues: list[ValidationIssue] = []
     if registers_dir.is_dir():
@@ -203,6 +206,7 @@ def inspect_registers(workspace: Path, case_id: str) -> RegisterStatus:
             issues.extend(file_issues)
         issues.extend(_validate_references(registers_dir))
         issues.extend(_validate_scenario_completeness(registers_dir))
+        issues.extend(_capture_reference_issues(registers_dir, manifest))
     return RegisterStatus(
         case_id=case_id,
         registers_present=len(row_counts),
@@ -212,15 +216,28 @@ def inspect_registers(workspace: Path, case_id: str) -> RegisterStatus:
     )
 
 
-def _registers_directory(workspace: Path, case_id: str) -> Path:
+def capture_reference_issues(
+    workspace: Path, case_id: str
+) -> tuple[ValidationIssue, ...]:
+    """Report evidence ``capture:<id>`` references that are not usable."""
+    registers_dir, manifest = _registers_directory(workspace, case_id)
+    if not registers_dir.is_dir():
+        return ()
+    return tuple(_capture_reference_issues(registers_dir, manifest))
+
+
+def _registers_directory(workspace: Path, case_id: str) -> tuple[Path, CaseManifest]:
     case_dir = case_directory(workspace, case_id)
     if not case_dir.is_dir():
         raise CaseContractError(f"case not found: {case_id}")
     manifest = read_manifest(case_dir)
-    return resolve_relative_path(
-        case_dir,
-        manifest.paths["registers"],
-        "paths.registers",
+    return (
+        resolve_relative_path(
+            case_dir,
+            manifest.paths["registers"],
+            "paths.registers",
+        ),
+        manifest,
     )
 
 
@@ -376,14 +393,74 @@ def _validate_references(registers_dir: Path) -> list[ValidationIssue]:
     for parsed_row in assumptions_rows:
         row = parsed_row.values
         reference = row.get("source_evidence", "")
-        if reference and reference not in evidence_ids:
+        if not reference:
+            continue
+        where = f"assumptions.csv:{parsed_row.line_number} source_evidence"
+        ids = reference.split(";")
+        if (
+            any(not item or re.search(r"\s", item) for item in ids)
+            or len(set(ids)) != len(ids)
+            or ids != sorted(ids)
+        ):
             issues.append(
                 ValidationIssue(
-                    "register_dangling_reference",
-                    f"assumptions.csv:{parsed_row.line_number} source_evidence "
-                    f"{reference!r} is not a declared evidence id",
+                    "register_bad_source_evidence",
+                    f"{where} must be evidence ids joined by ';' with no spaces, "
+                    f"no duplicates, in ascending order: {reference!r}",
                 )
             )
+            continue
+        for evidence_id in ids:
+            if evidence_id not in evidence_ids:
+                issues.append(
+                    ValidationIssue(
+                        "register_dangling_reference",
+                        f"{where} {evidence_id!r} is not a declared evidence id",
+                    )
+                )
+    return issues
+
+
+def _capture_reference_issues(
+    registers_dir: Path, manifest: CaseManifest
+) -> list[ValidationIssue]:
+    evidence_path = registers_dir / "evidence.csv"
+    if not evidence_path.is_file():
+        return []
+    rows, _ = _validate_register(evidence_path)
+    captures = declared_captures(manifest)
+    issues: list[ValidationIssue] = []
+    for parsed_row in rows:
+        row = parsed_row.values
+        where = f"capture reference in evidence.csv:{parsed_row.line_number}"
+        for capture_id in sorted(
+            set(CAPTURE_REFERENCE_PATTERN.findall(row["source_ref"]))
+        ):
+            capture = captures.get(capture_id)
+            if capture is None:
+                issues.append(
+                    ValidationIssue(
+                        "register_capture_reference_invalid",
+                        f"{where}: undeclared capture {capture_id!r}",
+                    )
+                )
+                continue
+            try:
+                observed = date.fromisoformat(row["observed_at"])
+                retrieved = datetime.fromisoformat(
+                    (capture.retrieved_at or "").removesuffix("Z") + "+00:00"
+                ).astimezone(UTC)
+            except ValueError:
+                continue
+            if retrieved.date() > observed:
+                issues.append(
+                    ValidationIssue(
+                        "register_capture_after_observed",
+                        f"{where}: capture {capture_id} was retrieved on "
+                        f"{retrieved.date().isoformat()}, after observed_at "
+                        f"{observed.isoformat()}",
+                    )
+                )
     return issues
 
 
