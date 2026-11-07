@@ -121,6 +121,8 @@ The audit then applies deterministic point-in-time checks:
   `as_of` on or before the cutoff must have no `conflict` metric
   (`token_supply_conflict`), and token supply and market observations cannot
   be dated after it (`token_supply_after_as_of`, `token_market_after_as_of`);
+- protocol metrics cannot have `period_end` or `observed_at` after the cutoff
+  (`protocol_metric_after_as_of`);
 - a capture's `content_sha256` must equal its body artifact checksum
   (`capture_metadata_mismatch`); and
 - evidence `source_ref` tokens `capture:<id>` must name a declared

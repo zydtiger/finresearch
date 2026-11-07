@@ -1,0 +1,44 @@
+[
+  {
+    "universe": [
+      {
+        "name": "BTC",
+        "szDecimals": 5,
+        "maxLeverage": 40
+      },
+      {
+        "name": "HYPE",
+        "szDecimals": 2,
+        "maxLeverage": 10
+      },
+      {
+        "name": "DEAD",
+        "szDecimals": 0,
+        "maxLeverage": 3,
+        "isDelisted": true
+      }
+    ]
+  },
+  [
+    {
+      "funding": "0.0000125",
+      "openInterest": "25000.5",
+      "dayNtlVlm": "4000000000.0",
+      "markPx": "100000.0",
+      "oraclePx": "100001.0"
+    },
+    {
+      "funding": "-0.00002",
+      "openInterest": "12000000.0",
+      "dayNtlVlm": "350000000.0",
+      "markPx": "78.44",
+      "oraclePx": "78.45"
+    },
+    {
+      "funding": "0.0",
+      "openInterest": "0.0",
+      "dayNtlVlm": "0.0",
+      "markPx": "1.0"
+    }
+  ]
+]

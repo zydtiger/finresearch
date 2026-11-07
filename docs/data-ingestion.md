@@ -583,6 +583,86 @@ observations dated after the cutoff, and `capture_metadata_mismatch` when a
 capture's `content_sha256` differs from its body artifact checksum, or its
 `capture_id` or `body_artifact_id` does not match the artifact id and parent.
 
+## Protocol metrics
+
+Protocol metrics describe the economics of a protocol (fees, revenue, volume,
+open interest, funding) with the provider's definition attached. They use
+captures like token data and are keyed by `entity_id` (the existing entity key
+of `fundamental-facts.v2`, for example `hyperliquid`); the value-receiving token
+is linked by an optional `instrument_id`.
+
+```text
+finresearch --workspace PATH data ingest-defillama CASE_ID SLUG \
+  --dataset fees|revenue|holders-revenue|dex-volume|open-interest \
+  [--dataset ...]
+finresearch --workspace PATH data normalize-protocol-metrics CASE_ID \
+  --capture-artifact-id ID [--capture-artifact-id ID ...] \
+  --entity-id ID [--instrument-id ID]
+```
+
+Each dataset is one capture of
+`https://api.llama.fi/summary/fees/{SLUG}?dataType=dailyFees|dailyRevenue|dailyHoldersRevenue`,
+`/summary/dexs/{SLUG}?dataType=dailyVolume`, or
+`/summary/open-interest/{SLUG}` (keyless endpoints; per-protocol summaries only,
+never the large aggregate endpoints). Datasets are fetched in the given order;
+a failure stops the command, keeps the captures already completed (each
+independently valid), and prints the provider error verbatim.
+
+### normalized.protocol-metrics.v1
+
+One row per provider value of one metric for one period: `provider`,
+`entity_id`, `instrument_id`, `provider_protocol_id` (for example the DefiLlama
+slug), `sub_protocol` (child protocol or perp market; NULL for the provider
+aggregate), `metric`, `period_type` (`duration` or `instant`), `period_start`
+(required for `duration`, NULL for `instant`), `period_end` (inclusive UTC
+date), `value`, `unit`, `currency`, `is_complete`, `provider_definition_id`,
+`observed_at`, `capture_artifact_id`, `source_artifact_id`, `normalized_at`.
+
+| Metric | Unit | Period |
+| --- | --- | --- |
+| `volume_perp`, `volume_spot` | fiat | duration |
+| `fees`, `revenue`, `holders_revenue`, `supply_side_revenue` | fiat | duration |
+| `buybacks`, `burns`, `distributions`, `incentives` | fiat or `tokens` | duration |
+| `open_interest` | fiat (notional) | instant |
+| `funding_rate_1h` | `bps` | instant |
+
+Volume, fees, and open interest are nonnegative; revenue metrics and funding
+may be negative. `currency` equals a fiat `unit` and is NULL for `tokens` and
+`bps`. `is_complete` is false exactly when `period_end` is on or after the UTC
+date of `normalized_at` (the capture's retrieval time). Unique key
+`(provider, provider_protocol_id, sub_protocol, metric, period_start,
+period_end, observed_at, source_artifact_id)`. Parent and child rows are never
+summed: consumers select one level explicitly (`sub_protocol IS NULL` is the
+provider aggregate).
+
+### normalized.provider-metric-definitions.v1
+
+Written with every protocol-metrics artifact so the provider's definition at
+retrieval time travels with the numbers: `provider_definition_id`
+(`<provider>.<protocol>.<field>.<text-hash-12>`), `metric`, `provider_field`,
+`methodology_text`, `methodology_url`, `definition_sha256` (hash of the
+canonical field, text, and URL), `observed_at`, `source_artifact_id`. Because the
+id embeds the hash, a changed methodology produces a new id. `data validate`
+reports `protocol_metric_definition_missing` when a protocol-metrics artifact
+cites a `provider_definition_id` that no declared definitions artifact holds.
+
+### Normalization
+
+| Capture | Output rows |
+| --- | --- |
+| DefiLlama `totalDataChart` | Aggregate daily rows (`sub_protocol` NULL); a day is the UTC date of the bucket timestamp with `period_start = period_end` and `observed_at` the bucket timestamp. Metric: `fees`, `revenue`, `holders_revenue` by `dataType`; `volume_spot` for `dexs` |
+| DefiLlama `totalDataChartBreakdown` | The same rows with `sub_protocol` set to each child (for example `Hyperliquid Perps`); a nested value or a null child value is not turned into a row (nested values fail) |
+| DefiLlama `open-interest` | `open_interest` `instant` rows observed at the bucket timestamp |
+| Hyperliquid `metaAndAssetCtxs` | Per non-delisted perp market (`sub_protocol` = market name): `open_interest` as `openInterest * markPx` notional USD, `funding_rate_1h` as `funding * 10,000` bps, and a `volume_perp` row from `dayNtlVlm` for the 24 hours ending at retrieval (UTC dates of the window start and end); all observed at retrieval |
+
+Several captures for one entity produce one artifact pair (metrics plus
+definitions) with the captures as ordered parents. The Hyperliquid
+derivations are recorded as parser-declared definitions (fields
+`openInterest_x_markPx`, `funding`, `dayNtlVlm`). `case audit` reports
+`protocol_metric_after_as_of` for a `period_end` or `observed_at` after the
+cutoff. Perp volume has no free daily series: history accumulates from
+repeated `metaAndAssetCtxs` snapshots.
+
 ## Research registers
 
 Registers store the explicit judgments and open items of a research process in

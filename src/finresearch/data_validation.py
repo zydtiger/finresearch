@@ -315,6 +315,8 @@ def _validate_parquet_artifact(
                         f"{undeclared_sources!r} are not in {scope}",
                     )
                 )
+    if contract_valid and artifact.kind == "normalized.protocol-metrics":
+        issues.extend(_protocol_definition_issues(case_dir, artifact, frame, manifest))
     if contract_valid:
         issues.extend(
             _validate_master_currency(
@@ -325,6 +327,39 @@ def _validate_parquet_artifact(
             )
         )
     return issues
+
+
+def _protocol_definition_issues(
+    case_dir: Path,
+    artifact: Artifact,
+    frame: pl.DataFrame,
+    manifest: CaseManifest,
+) -> list[ValidationIssue]:
+    """Require every cited provider definition in a declared definitions table."""
+    declared: set[str] = set()
+    for candidate in manifest.artifacts:
+        if candidate.kind != "normalized.provider-metric-definitions":
+            continue
+        try:
+            definitions = pl.read_parquet(
+                resolve_relative_path(
+                    case_dir, candidate.path, f"artifact {candidate.artifact_id}"
+                )
+            )
+            declared.update(definitions.get_column("provider_definition_id").to_list())
+        except Exception:
+            continue
+    missing = sorted(
+        set(frame.get_column("provider_definition_id").to_list()) - declared
+    )
+    return [
+        ValidationIssue(
+            "protocol_metric_definition_missing",
+            f"artifact {artifact.artifact_id} cites provider_definition_id "
+            f"{definition_id} with no declared definitions row",
+        )
+        for definition_id in missing
+    ]
 
 
 def _validate_input_file_hashes(

@@ -3,11 +3,9 @@
 from __future__ import annotations
 
 import json
-import math
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Final
 from urllib.parse import parse_qs, unquote, urlsplit
@@ -29,6 +27,7 @@ from finresearch.ingestion import (
     publish_snapshot,
     symbol_key,
 )
+from finresearch.json_values import json_number, json_object
 
 TOKEN_PRODUCER: Final = "finresearch.data.normalize-token"
 TOKEN_PRODUCER_VERSION: Final = "1"
@@ -240,27 +239,6 @@ def _select_parser(capture: LoadedCapture) -> Parser:
     )
 
 
-def _number(value: object, label: str) -> float | None:
-    """Parse a JSON number or numeric string; null means absent."""
-    if value is None:
-        return None
-    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
-        raise IngestionError(f"{label} must be a number: {value!r}")
-    try:
-        parsed = float(Decimal(str(value)))
-    except (InvalidOperation, ValueError) as exc:
-        raise IngestionError(f"{label} must be a number: {value!r}") from exc
-    if not math.isfinite(parsed):
-        raise IngestionError(f"{label} must be finite: {value!r}")
-    return parsed
-
-
-def _mapping(value: object, label: str) -> Mapping[str, object]:
-    if not isinstance(value, dict):
-        raise IngestionError(f"{label} must be a JSON object")
-    return value
-
-
 def _timestamp(value: object, label: str) -> datetime:
     if not isinstance(value, str):
         raise IngestionError(f"{label} must be an ISO 8601 timestamp: {value!r}")
@@ -308,7 +286,7 @@ def _coingecko_asset(
     quote, _ = _quote_from_url(capture.url)
     asset = ParsedAsset()
     for metric, name in _COINGECKO_SUPPLY:
-        amount = _number(supply_source.get(name), f"{label}.{name}")
+        amount = json_number(supply_source.get(name), f"{label}.{name}")
         if amount is not None:
             asset.supply.append(
                 {
@@ -325,7 +303,7 @@ def _coingecko_asset(
         ("fdv", "fully_diluted_valuation", "total"),
         ("volume_24h", "total_volume", None),
     ):
-        value = _number(value_of(name), f"{label}.{name}")
+        value = json_number(value_of(name), f"{label}.{name}")
         if value is None or (value == 0 and metric in {"market_cap", "fdv"}):
             continue
         asset.market.append(
@@ -344,12 +322,12 @@ def _coingecko_asset(
 def _parse_coingecko_coin(
     capture: LoadedCapture, payload: object
 ) -> dict[str, ParsedAsset]:
-    document = _mapping(payload, "CoinGecko /coins/{id} response")
+    document = json_object(payload, "CoinGecko /coins/{id} response")
     coin_id = document.get("id")
     expected = unquote(urlsplit(capture.url).path.rsplit("/", 1)[1])
     if coin_id != expected:
         raise IngestionError(f"CoinGecko response id {coin_id!r} is not {expected!r}")
-    market_data = _mapping(document.get("market_data"), "market_data")
+    market_data = json_object(document.get("market_data"), "market_data")
     quote = _quote_from_url(capture.url)[0].lower()
 
     def value_of(name: str) -> object:
@@ -376,7 +354,7 @@ def _parse_coingecko_markets(
         raise IngestionError("CoinGecko /coins/markets response must be a JSON array")
     assets: dict[str, ParsedAsset] = {}
     for index, entry in enumerate(payload):
-        item = _mapping(entry, f"markets[{index}]")
+        item = json_object(entry, f"markets[{index}]")
         coin_id = item.get("id")
         if not isinstance(coin_id, str) or not coin_id:
             raise IngestionError(f"markets[{index}].id must be a non-empty string")
@@ -397,7 +375,7 @@ def _parse_coingecko_markets(
 def _parse_hyperliquid_token_details(
     capture: LoadedCapture, payload: object
 ) -> dict[str, ParsedAsset]:
-    document = _mapping(payload, "Hyperliquid tokenDetails response")
+    document = json_object(payload, "Hyperliquid tokenDetails response")
     request = json.loads(capture.request_body or "{}")
     token_id = request.get("tokenId")
     if not isinstance(token_id, str):
@@ -413,7 +391,7 @@ def _parse_hyperliquid_token_details(
         ("max", "maxSupply"),
         ("future_emissions", "futureEmissions"),
     ):
-        amount = _number(document.get(name), f"tokenDetails.{name}")
+        amount = json_number(document.get(name), f"tokenDetails.{name}")
         if amount is not None:
             asset.supply.append(
                 {
@@ -433,7 +411,7 @@ def _parse_hyperliquid_token_details(
             raise IngestionError(
                 f"nonCirculatingUserBalances[{index}] must be [address, amount]"
             )
-        amount = _number(entry[1], f"nonCirculatingUserBalances[{index}]")
+        amount = json_number(entry[1], f"nonCirculatingUserBalances[{index}]")
         if amount is None:
             raise IngestionError(f"nonCirculatingUserBalances[{index}] has no amount")
         asset.supply.append(
@@ -455,7 +433,7 @@ def _parse_hyperliquid_validators(
         raise IngestionError("validatorSummaries response must be a non-empty array")
     total = 0
     for index, entry in enumerate(payload):
-        stake = _mapping(entry, f"validatorSummaries[{index}]").get("stake")
+        stake = json_object(entry, f"validatorSummaries[{index}]").get("stake")
         if isinstance(stake, bool) or not isinstance(stake, int) or stake < 0:
             raise IngestionError(
                 f"validatorSummaries[{index}].stake must be a nonnegative integer"

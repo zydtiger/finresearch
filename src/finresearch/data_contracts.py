@@ -1932,7 +1932,177 @@ DERIVED_TOKEN_SUPPLY_RECONCILIATION_V1: Final = DatasetContract(
     semantic_validator=_validate_token_supply_reconciliation_v1,
 )
 
+_FIAT_DURATION_METRICS: Final = frozenset(
+    {
+        "volume_perp",
+        "volume_spot",
+        "fees",
+        "revenue",
+        "holders_revenue",
+        "supply_side_revenue",
+    }
+)
+_FIAT_OR_TOKEN_DURATION_METRICS: Final = frozenset(
+    {"buybacks", "burns", "distributions", "incentives"}
+)
+PROTOCOL_METRICS: Final = (
+    _FIAT_DURATION_METRICS
+    | _FIAT_OR_TOKEN_DURATION_METRICS
+    | frozenset({"open_interest", "funding_rate_1h"})
+)
+_NONNEGATIVE_PROTOCOL_METRICS: Final = frozenset(
+    {"volume_perp", "volume_spot", "fees", "open_interest"}
+)
+
+
+def _validate_protocol_metrics_v1(frame: pl.DataFrame) -> None:
+    contract = "normalized.protocol-metrics.v1"
+    _validate_enum(frame, contract, "metric", PROTOCOL_METRICS)
+    _validate_enum(frame, contract, "period_type", PERIOD_TYPES)
+    for row in frame.iter_rows(named=True):
+        metric, unit, value = row["metric"], row["unit"], row["value"]
+        if not math.isfinite(value):
+            raise _semantic_error(contract, "value must be finite")
+        if metric in _NONNEGATIVE_PROTOCOL_METRICS and value < 0:
+            raise _semantic_error(contract, f"{metric} must be nonnegative")
+        if metric in _FIAT_DURATION_METRICS:
+            allowed = unit in CURRENCY_CODES
+        elif metric in _FIAT_OR_TOKEN_DURATION_METRICS:
+            allowed = unit in CURRENCY_CODES or unit == "tokens"
+        elif metric == "open_interest":
+            allowed = unit in CURRENCY_CODES
+        else:
+            allowed = unit == "bps"
+        if not allowed:
+            raise _semantic_error(contract, f"unit {unit!r} is invalid for {metric}")
+        expected_currency = unit if unit in CURRENCY_CODES else None
+        if row["currency"] != expected_currency:
+            raise _semantic_error(
+                contract, "currency must equal a fiat unit and be NULL otherwise"
+            )
+        instant = metric in {"open_interest", "funding_rate_1h"}
+        if row["period_type"] != ("instant" if instant else "duration"):
+            raise _semantic_error(contract, f"{metric} has the wrong period_type")
+        start, end = row["period_start"], row["period_end"]
+        if instant != (start is None):
+            raise _semantic_error(
+                contract, "period_start is required for duration and NULL for instant"
+            )
+        if start is not None and start > end:
+            raise _semantic_error(contract, "period_start must not be after period_end")
+        if row["is_complete"] != (end < row["normalized_at"].date()):
+            raise _semantic_error(
+                contract,
+                "is_complete must be false exactly when period_end is on or after "
+                "the UTC date of normalized_at",
+            )
+
+
+def _validate_provider_metric_definitions_v1(frame: pl.DataFrame) -> None:
+    contract = "normalized.provider-metric-definitions.v1"
+    _validate_enum(frame, contract, "metric", PROTOCOL_METRICS)
+    for row in frame.iter_rows(named=True):
+        digest = row["definition_sha256"]
+        if _SHA256_HEX.fullmatch(digest) is None:
+            raise _semantic_error(contract, "definition_sha256 must be lowercase hex")
+        identifier = row["provider_definition_id"]
+        if not identifier.startswith(f"{row['provider']}.") or not identifier.endswith(
+            f".{row['provider_field']}.{digest[:12]}"
+        ):
+            raise _semantic_error(
+                contract,
+                "provider_definition_id must be "
+                "<provider>.<protocol>.<field>.<text-hash-12>",
+            )
+
+
+NORMALIZED_PROTOCOL_METRICS_V1_FIELDS: Final[
+    dict[str, pl.DataType | type[pl.DataType]]
+] = {
+    "schema_version": pl.UInt16,
+    "provider": pl.String,
+    "entity_id": pl.String,
+    "instrument_id": pl.String,
+    "provider_protocol_id": pl.String,
+    "sub_protocol": pl.String,
+    "metric": pl.String,
+    "period_type": pl.String,
+    "period_start": pl.Date,
+    "period_end": pl.Date,
+    "value": pl.Float64,
+    "unit": pl.String,
+    "currency": pl.String,
+    "is_complete": pl.Boolean,
+    "provider_definition_id": pl.String,
+    "observed_at": pl.Datetime("us", "UTC"),
+    "capture_artifact_id": pl.String,
+    "source_artifact_id": pl.String,
+    "normalized_at": pl.Datetime("us", "UTC"),
+}
+_PROTOCOL_METRICS_UNIQUE_KEY: Final = (
+    "provider",
+    "provider_protocol_id",
+    "sub_protocol",
+    "metric",
+    "period_start",
+    "period_end",
+    "observed_at",
+    "source_artifact_id",
+)
+NORMALIZED_PROTOCOL_METRICS_V1: Final = DatasetContract(
+    name="normalized.protocol-metrics",
+    version=1,
+    schema=pl.Schema(NORMALIZED_PROTOCOL_METRICS_V1_FIELDS),
+    non_nullable=tuple(
+        name
+        for name in NORMALIZED_PROTOCOL_METRICS_V1_FIELDS
+        if name
+        not in {
+            "instrument_id",
+            "sub_protocol",
+            "period_start",
+            "currency",
+            "capture_artifact_id",
+        }
+    ),
+    unique_key=_PROTOCOL_METRICS_UNIQUE_KEY,
+    sort_key=_PROTOCOL_METRICS_UNIQUE_KEY,
+    semantic_validator=_validate_protocol_metrics_v1,
+)
+
+NORMALIZED_PROVIDER_METRIC_DEFINITIONS_V1_FIELDS: Final[
+    dict[str, pl.DataType | type[pl.DataType]]
+] = {
+    "schema_version": pl.UInt16,
+    "provider": pl.String,
+    "provider_definition_id": pl.String,
+    "metric": pl.String,
+    "provider_field": pl.String,
+    "methodology_text": pl.String,
+    "methodology_url": pl.String,
+    "definition_sha256": pl.String,
+    "observed_at": pl.Datetime("us", "UTC"),
+    "source_artifact_id": pl.String,
+}
+NORMALIZED_PROVIDER_METRIC_DEFINITIONS_V1: Final = DatasetContract(
+    name="normalized.provider-metric-definitions",
+    version=1,
+    schema=pl.Schema(NORMALIZED_PROVIDER_METRIC_DEFINITIONS_V1_FIELDS),
+    non_nullable=tuple(
+        name
+        for name in NORMALIZED_PROVIDER_METRIC_DEFINITIONS_V1_FIELDS
+        if name not in {"methodology_text", "methodology_url"}
+    ),
+    unique_key=("provider_definition_id",),
+    sort_key=("provider_definition_id",),
+    semantic_validator=_validate_provider_metric_definitions_v1,
+)
+
 CONTRACTS: Final = {
+    NORMALIZED_PROTOCOL_METRICS_V1.identifier: NORMALIZED_PROTOCOL_METRICS_V1,
+    NORMALIZED_PROVIDER_METRIC_DEFINITIONS_V1.identifier: (
+        NORMALIZED_PROVIDER_METRIC_DEFINITIONS_V1
+    ),
     NORMALIZED_TOKEN_SUPPLY_V1.identifier: NORMALIZED_TOKEN_SUPPLY_V1,
     NORMALIZED_TOKEN_MARKET_V1.identifier: NORMALIZED_TOKEN_MARKET_V1,
     DERIVED_TOKEN_SUPPLY_RECONCILIATION_V1.identifier: (

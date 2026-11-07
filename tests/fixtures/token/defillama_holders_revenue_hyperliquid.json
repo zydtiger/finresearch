@@ -1,0 +1,57 @@
+{
+  "name": "Hyperliquid",
+  "slug": "hyperliquid",
+  "methodology": {
+    "Fees": "Perp and spot trading fees paid by users.",
+    "HoldersRevenue": "Share of fees used for Assistance Fund buybacks."
+  },
+  "methodologyURL": "https://github.com/DefiLlama/dimension-adapters/tree/master/fees/hyperliquid",
+  "totalDataChart": [
+    [
+      1793750400,
+      2200000.0
+    ],
+    [
+      1793836800,
+      2100000.0
+    ],
+    [
+      1793923200,
+      2300000.0
+    ],
+    [
+      1794009600,
+      1100000.0
+    ]
+  ],
+  "totalDataChartBreakdown": [
+    [
+      1793750400,
+      {
+        "Hyperliquid Perps": 1800000.0,
+        "Hyperliquid Spot Orderbook": 400000.0
+      }
+    ],
+    [
+      1793836800,
+      {
+        "Hyperliquid Perps": 1700000.0,
+        "Hyperliquid Spot Orderbook": 400000.0
+      }
+    ],
+    [
+      1793923200,
+      {
+        "Hyperliquid Perps": 1900000.0,
+        "Hyperliquid Spot Orderbook": 400000.0
+      }
+    ],
+    [
+      1794009600,
+      {
+        "Hyperliquid Perps": 900000.0,
+        "Hyperliquid Spot Orderbook": 200000.0
+      }
+    ]
+  ]
+}
