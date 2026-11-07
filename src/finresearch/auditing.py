@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import date, datetime
+from collections.abc import Mapping
+from dataclasses import dataclass, field
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Literal
 
@@ -20,6 +21,7 @@ from finresearch.cases import (
     read_manifest,
     resolve_relative_path,
 )
+from finresearch.data_contracts import ASSET_CLASSES, provider_id_pairs
 from finresearch.data_validation import validate_artifact
 from finresearch.modeling import (
     AuthenticatedModelRun,
@@ -44,6 +46,29 @@ class CaseAudit:
         return not self.issues
 
 
+@dataclass
+class _PriceFacts:
+    """Price and master observations collected for the freshness checks."""
+
+    latest: dict[str, date] = field(default_factory=dict)
+    prior: dict[str, date] = field(default_factory=dict)
+    instruments: set[str] = field(default_factory=set)
+    symbols: dict[str, set[str]] = field(default_factory=dict)
+    # (instrument_id, asset_class, provider_ids, observed date)
+    masters: list[tuple[str, str, str | None, date]] = field(default_factory=list)
+
+
+def parse_max_price_age(values: Mapping[str, int] | None) -> dict[str, int]:
+    """Validate per-asset-class price-age overrides."""
+    limits = dict(values or {})
+    for asset_class, limit in limits.items():
+        if asset_class not in ASSET_CLASSES:
+            raise CaseContractError(f"unknown asset class for price age: {asset_class}")
+        if limit < 0:
+            raise CaseContractError("per-class maximum price age must be non-negative")
+    return limits
+
+
 def audit_case(
     workspace: Path,
     case_id: str,
@@ -51,10 +76,12 @@ def audit_case(
     as_of: date,
     max_price_age_days: int,
     verify_hashes: bool = False,
+    max_price_age: Mapping[str, int] | None = None,
 ) -> CaseAudit:
     """Audit registered artifacts and point-in-time constraints without writing."""
     if max_price_age_days < 0:
         raise CaseContractError("max_price_age_days must be non-negative")
+    class_limits = parse_max_price_age(max_price_age)
     case_dir = case_directory(workspace, case_id)
     manifest = read_manifest(case_dir)
     if manifest.manifest_version != MANIFEST_V2:
@@ -71,9 +98,7 @@ def audit_case(
             validate_artifact(workspace, case_id, verify_hashes=verify_hashes)
         )
 
-    frame_issues, price_dates, price_instruments = _artifact_audit_issues(
-        case_dir, manifest.artifacts, as_of
-    )
+    frame_issues, facts = _artifact_audit_issues(case_dir, manifest.artifacts, as_of)
     issues.extend(frame_issues)
     issues.extend(capture_reference_issues(workspace, case_id))
 
@@ -101,9 +126,7 @@ def audit_case(
             issues.append(report_issue)
 
     issues.extend(
-        _price_freshness_issues(
-            price_dates, price_instruments, as_of, max_price_age_days
-        )
+        _price_freshness_issues(facts, as_of, max_price_age_days, class_limits)
     )
     return CaseAudit(case_id, as_of, _sorted_issues(issues))
 
@@ -116,6 +139,7 @@ def audit_model_run(
     run_id: str,
     max_price_age_days: int,
     verify_hashes: bool = False,
+    max_price_age: Mapping[str, int] | None = None,
 ) -> CaseAudit:
     """Audit one authenticated model run and only its transitive case inputs.
 
@@ -161,13 +185,14 @@ def audit_model_run(
                     verify_hashes=verify_hashes,
                 )
             )
-    frame_issues, price_dates, price_instruments = _artifact_audit_issues(
-        case_dir, artifacts, resolved.as_of
-    )
+    frame_issues, facts = _artifact_audit_issues(case_dir, artifacts, resolved.as_of)
     issues.extend(frame_issues)
     issues.extend(
         _price_freshness_issues(
-            price_dates, price_instruments, resolved.as_of, max_price_age_days
+            facts,
+            resolved.as_of,
+            max_price_age_days,
+            parse_max_price_age(max_price_age),
         )
     )
     return CaseAudit(case_id, resolved.as_of, _sorted_issues(issues))
@@ -194,13 +219,12 @@ def _artifact_audit_issues(
     case_dir: Path,
     artifacts: tuple[Artifact, ...],
     as_of: date,
-) -> tuple[list[ValidationIssue], dict[str, date], set[str]]:
+) -> tuple[list[ValidationIssue], _PriceFacts]:
     """Apply safe contract-dependent PIT checks to a declared artifact set."""
     issues: list[ValidationIssue] = []
     # Price freshness is point-in-time: future observations can prove a cutoff
     # violation but cannot make the historical price available at ``as_of``.
-    price_dates: dict[str, date] = {}
-    price_instruments: set[str] = set()
+    facts = _PriceFacts()
     by_id = {artifact.artifact_id: artifact for artifact in artifacts}
     # instrument -> (as_of, artifact id, conflicting metrics) of the latest
     # reconciliation dated on or before the cutoff.
@@ -221,18 +245,45 @@ def _artifact_audit_issues(
             instrument_id=pl.String,
             session_date=pl.Date,
         ):
-            for row in frame.select("instrument_id", "session_date").iter_rows(
-                named=True
-            ):
+            has_symbol = _has_schema(frame, provider_symbol=pl.String)
+            columns = ["instrument_id", "session_date"] + (
+                ["provider_symbol"] if has_symbol else []
+            )
+            for row in frame.select(columns).iter_rows(named=True):
                 instrument = row["instrument_id"]
                 session = row["session_date"]
                 if isinstance(instrument, str) and isinstance(session, date):
-                    price_instruments.add(instrument)
+                    facts.instruments.add(instrument)
+                    symbol = row.get("provider_symbol")
+                    if isinstance(symbol, str):
+                        facts.symbols.setdefault(instrument, set()).add(symbol)
                     if session > as_of:
                         continue
-                    current = price_dates.get(instrument)
-                    if current is None or session > current:
-                        price_dates[instrument] = session
+                    for bucket, cutoff in (
+                        (facts.latest, as_of),
+                        (facts.prior, as_of - timedelta(days=1)),
+                    ):
+                        current = bucket.get(instrument)
+                        if session <= cutoff and (current is None or session > current):
+                            bucket[instrument] = session
+        if artifact.kind == "normalized.instrument-master" and _has_schema(
+            frame,
+            instrument_id=pl.String,
+            asset_class=pl.String,
+            observed_at=pl.Datetime("us", "UTC"),
+        ):
+            has_ids = _has_schema(frame, provider_ids=pl.String)
+            for row in frame.iter_rows(named=True):
+                observed = row["observed_at"].date()
+                if observed <= as_of:
+                    facts.masters.append(
+                        (
+                            row["instrument_id"],
+                            row["asset_class"],
+                            row["provider_ids"] if has_ids else None,
+                            observed,
+                        )
+                    )
         issues.extend(_model_lookahead_issues(case_dir, artifact.kind, frame, as_of))
         issues.extend(_capture_issues(artifact, frame, by_id))
         if artifact.kind == "derived.token-supply-reconciliation":
@@ -246,7 +297,7 @@ def _artifact_audit_issues(
             )
             for metric in metrics
         )
-    return issues, price_dates, price_instruments
+    return issues, facts
 
 
 def _capture_issues(
@@ -319,32 +370,83 @@ def _track_reconciliation(
             latest[instrument] = (cutoff, artifact_id, conflicts)
 
 
+def _price_asset_class(
+    facts: _PriceFacts, instrument: str
+) -> tuple[str | None, list[str]]:
+    """Resolve one asset class from linked master observations.
+
+    Returns the class (or None) and the distinct non-``unknown`` classes found.
+    """
+    symbols = {f"yfinance:{symbol}" for symbol in facts.symbols.get(instrument, ())}
+    classes: set[str] = set()
+    for master_id, asset_class, provider_ids, _ in facts.masters:
+        linked = master_id == instrument
+        if not linked and provider_ids is not None:
+            try:
+                linked = bool(
+                    symbols & {f"{a}:{b}" for a, b in provider_id_pairs(provider_ids)}
+                )
+            except ValueError:
+                linked = False
+        if linked and asset_class != "unknown":
+            classes.add(asset_class)
+    found = sorted(classes)
+    return (found[0] if len(found) == 1 else None), found
+
+
 def _price_freshness_issues(
-    price_dates: dict[str, date],
-    price_instruments: set[str],
+    facts: _PriceFacts,
     as_of: date,
     max_price_age_days: int,
+    class_limits: Mapping[str, int],
 ) -> list[ValidationIssue]:
     issues: list[ValidationIssue] = []
-    for instrument, session in sorted(price_dates.items()):
-        age = (as_of - session).days
-        if age > max_price_age_days:
+    for instrument in sorted(facts.instruments):
+        asset_class, found = _price_asset_class(facts, instrument)
+        if len(found) > 1:
+            issues.append(
+                ValidationIssue(
+                    "asset_class_conflict",
+                    f"instrument {instrument} resolves to conflicting asset "
+                    f"classes: {', '.join(found)}",
+                )
+            )
+        limit = class_limits.get(asset_class or "", max_price_age_days)
+        latest = facts.latest.get(instrument)
+        if asset_class == "crypto":
+            # A UTC daily bar is complete at the end of its day, so the latest
+            # complete bar at cutoff D is D - 1.
+            if latest == as_of:
+                issues.append(
+                    ValidationIssue(
+                        "price_bar_incomplete",
+                        f"instrument {instrument} bar {as_of.isoformat()} is "
+                        "incomplete at the audit as_of",
+                    )
+                )
+            latest = facts.prior.get(instrument)
+            reference = as_of - timedelta(days=1)
+        else:
+            reference = as_of
+        if latest is None:
+            if instrument not in facts.latest:
+                issues.append(
+                    ValidationIssue(
+                        "price_no_valid_session",
+                        f"instrument {instrument} has no price session on or "
+                        f"before audit as_of {as_of.isoformat()}",
+                    )
+                )
+            continue
+        age = (reference - latest).days
+        if age > limit:
             issues.append(
                 ValidationIssue(
                     "price_stale",
-                    f"instrument {instrument} latest price {session.isoformat()} is "
-                    f"{age} days old at {as_of.isoformat()} (maximum "
-                    f"{max_price_age_days})",
+                    f"instrument {instrument} latest price {latest.isoformat()} "
+                    f"is {age} days old at {as_of.isoformat()} (maximum {limit})",
                 )
             )
-    for instrument in sorted(price_instruments - set(price_dates)):
-        issues.append(
-            ValidationIssue(
-                "price_no_valid_session",
-                f"instrument {instrument} has no price session on or before "
-                f"audit as_of {as_of.isoformat()}",
-            )
-        )
     return issues
 
 

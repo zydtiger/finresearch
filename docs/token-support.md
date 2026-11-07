@@ -832,6 +832,9 @@ and `token_unlocks_capture_missing` for an unresolved `capture:` reference.
 
 ### `normalized.instrument-master.v3`
 
+> **Implemented (phase 5 subset)**: contract, import, and reconciliation (see
+> `data-ingestion.md`). The yfinance raw v2 `quote_type` remains proposed.
+
 v2 fields plus:
 
 | Field | Type | Null | Meaning |
@@ -886,6 +889,8 @@ drop` on the 708-row snapshot would publish 707 bars and one gap row for
 2026-02-02, the null bar the trial found, replacing its second ingest.
 
 ### Per-asset-class price-age policy
+
+> **Implemented (phase 5 subset)**: see `reporting.md`, "Case audit".
 
 ```text
 finresearch --workspace PATH case audit CASE_ID --as-of YYYY-MM-DD \

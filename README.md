@@ -222,7 +222,7 @@ uv run finresearch --workspace /path/to/research-artifacts \
 
 uv run finresearch --workspace /path/to/research-artifacts \
   case audit aapl-2026-08-11 --as-of 2026-08-11 --max-price-age-days 7 \
-  --verify-hashes
+  --max-price-age crypto=0 --verify-hashes
 ```
 
 Reports and audit gates require a manifest v2 case. Report publication is
