@@ -295,22 +295,43 @@ source_artifact_id)`. CoinGecko's FDV for HYPE is price times total supply,
 not max, so its rows carry `fdv_supply_basis = "total"`; that is the parser's
 declared reading of the provider definition, not an inference from numbers.
 
+#### Free endpoints only
+
+Provider adapters use only endpoints that answer without an API key, and the
+CLI has no key option. Each provider gets a host-shared request lock like the
+SEC adapter; CoinGecko's keyless tier is throttled, so its requests start at
+least 6 seconds apart. Endpoint status, probed on 2026-11-07:
+
+| Need | Free endpoint (used) | Paid (not used) |
+| --- | --- | --- |
+| Token supply, price, market cap, FDV | CoinGecko `/coins/{id}`, `/coins/markets`; Hyperliquid `tokenDetails` | |
+| Price history | yfinance (existing adapter); CoinGecko `/coins/{id}/market_chart` and Hyperliquid `candleSnapshot` are free but not needed | |
+| Fees, revenue, holders revenue | DefiLlama `/summary/fees/{slug}?dataType=...` | |
+| Spot and outcomes volume | DefiLlama `/summary/dexs/{slug}` (children `Spot Orderbook`, `Outcomes`) | |
+| Perp volume | Hyperliquid `metaAndAssetCtxs` `dayNtlVlm` (rolling 24h notional, snapshot only) | DefiLlama `/summary/derivatives/{slug}`, `/overview/derivatives` (HTTP 402) |
+| Open interest history | DefiLlama `/summary/open-interest/{slug}` (daily, from 2024-12) | |
+| Open interest and funding now | Hyperliquid `metaAndAssetCtxs`; funding history from `fundingHistory` | |
+| Staking, vaults, treasury balances | Hyperliquid `validatorSummaries`, `vaultDetails`, `spotClearinghouseState` | |
+| Unlock schedules | none | DefiLlama `/emissions`, `/emission/{slug}` (HTTP 402) |
+
+Perp volume history therefore accumulates from repeated `metaAndAssetCtxs`
+snapshots; there is no free daily series. Unlock schedules stay agent-owned
+and enter through `token-unlocks.v1` imports.
+
 #### CoinGecko ingest
 
 ```text
 finresearch --workspace PATH data ingest-coingecko-token CASE_ID COIN_ID \
-  [--vs-currency usd] [--api-key-env NAME]
+  [--vs-currency usd]
 ```
 
 Fetches `/api/v3/coins/{COIN_ID}` with localization, tickers, community, and
-developer data disabled, and writes one capture. `--api-key-env` names an
-environment variable holding a demo or pro key, sent as a header; the key and
-the variable value are never stored. Without it the public endpoint is used.
-HTTP errors surface verbatim and write nothing.
+developer data disabled, and writes one capture. HTTP errors surface verbatim
+and write nothing.
 
 ```text
 finresearch --workspace PATH data ingest-coingecko-markets CASE_ID \
-  --ids COIN_ID[,COIN_ID...] [--vs-currency usd] [--api-key-env NAME]
+  --ids COIN_ID[,COIN_ID...] [--vs-currency usd]
 ```
 
 Fetches `/api/v3/coins/markets` for an explicit id list in one capture. This
@@ -321,14 +342,15 @@ shape.
 
 ```text
 finresearch --workspace PATH data ingest-hyperliquid-info CASE_ID \
-  --request token-details|validator-summaries|meta-and-asset-ctxs|spot-meta-and-asset-ctxs|vault-details|spot-clearinghouse-state \
-  [--token-id HEX] [--address HEX]
+  --request token-details|validator-summaries|meta-and-asset-ctxs|spot-meta-and-asset-ctxs|vault-details|spot-clearinghouse-state|funding-history \
+  [--token-id HEX] [--address HEX] [--coin NAME --start YYYY-MM-DD]
 ```
 
 POSTs `{"type": ...}` to `https://api.hyperliquid.xyz/info` and writes one
 capture. `token-details` requires `--token-id`; `vault-details` and
-`spot-clearinghouse-state` require `--address`. Other combinations are usage
-errors.
+`spot-clearinghouse-state` require `--address`; `funding-history` requires
+`--coin` and an explicit `--start` (UTC midnight) and pages until the
+retrieval time, one capture per page. Other combinations are usage errors.
 
 #### Normalization
 
@@ -435,17 +457,17 @@ definitions.
 
 ```text
 finresearch --workspace PATH data ingest-defillama CASE_ID SLUG \
-  --dataset fees|revenue|holders-revenue|dex-volume|derivatives-volume \
+  --dataset fees|revenue|holders-revenue|dex-volume|open-interest \
   [--dataset ...]
 ```
 
 Each dataset is one capture of
 `/summary/fees/{SLUG}?dataType=dailyFees|dailyRevenue|dailyHoldersRevenue`,
-`/summary/dexs/{SLUG}`, or `/summary/derivatives/{SLUG}`. Datasets are fetched
-in the given order; a failure stops the command and keeps captures already
-completed, each of which is independently valid. Provider errors are printed
-verbatim, for example the trial's HTTP 402 `Upgrade to the paid API plan...`
-for derivatives and HTTP 400 `Fees for aster not found...`.
+`/summary/dexs/{SLUG}?dataType=dailyVolume`, or
+`/summary/open-interest/{SLUG}`. Datasets are fetched in the given order; a
+failure stops the command and keeps captures already completed, each of which
+is independently valid. Provider errors are printed verbatim, for example the
+trial's HTTP 400 `Fees for aster not found...`.
 
 ```text
 finresearch --workspace PATH data normalize-protocol-metrics CASE_ID \
@@ -455,9 +477,12 @@ finresearch --workspace PATH data normalize-protocol-metrics CASE_ID \
 
 Parses `totalDataChart` into aggregate daily rows and
 `totalDataChartBreakdown` into `sub_protocol` rows. A DefiLlama day is the UTC
-date of the bucket timestamp, with `period_start = period_end`. Hyperliquid
-`metaAndAssetCtxs` captures produce `open_interest` and `funding_rate_1h` per
-perp market (`funding` times 10,000). Several captures for one entity produce
+date of the bucket timestamp, with `period_start = period_end`; DefiLlama
+open-interest points become `instant` rows observed at the bucket timestamp.
+Hyperliquid `metaAndAssetCtxs` captures produce per perp market
+`open_interest`, `funding_rate_1h` (`funding` times 10,000), and a
+`volume_perp` duration row for the 24 hours ending at retrieval from
+`dayNtlVlm`, with UTC dates of the window start and end. Several captures for one entity produce
 one artifact pair (metrics plus definitions) with the captures as ordered
 parents.
 
@@ -933,11 +958,9 @@ cash flows.
 - `case init` creates empty `registers/` and `analysis/` directories. It still
   creates no files. The case contract text changes; existing cases are
   unaffected because both directories are optional.
-- `data ingest-unlocks CASE_ID --provider defillama-emissions SLUG` writes a
-  capture of DefiLlama's emissions endpoint and normalizes it to
-  `token-unlocks.v1` with `source_ref` set to the capture. It depends on the
-  paid-plan question below and on whether the endpoint's schedule matches the
-  agent's chosen source.
+- An unlock-tracker ingest is dropped: the DefiLlama emissions endpoints
+  return HTTP 402 and no free structured source was found. Unlocks stay
+  agent-owned imports.
 
 ## What stays agent-owned
 
@@ -1033,28 +1056,50 @@ docs. Later phases depend on earlier ones only where stated.
 | 5. Identity and prices | `instrument-master.v3`, yfinance raw v2 `quote_type`, `--null-bars`, price gaps, `--max-price-age` | 1 |
 | 6. Unlocks | `token-unlocks.v1` import and model integration | 4 |
 | 7. Equity fixes | `normalize-fx-rates`, DCF input version 2 with translation and issuance | 5 for price gaps |
-| 8. Nice-to-have | `case init` directories, unlock ingest | as decided |
+| 8. Nice-to-have | `case init` directories | none |
 
 Phases 2, 3, and 5 can proceed in parallel after phase 1. Tests use recorded
 captures under `tests/fixtures/` trimmed from the HYPE case; no test contacts
 a provider.
 
+## Decisions
+
+Decided in review on 2026-11-07:
+
+1. **Fact units and categories** are widened in place in
+   `fundamental-facts.v2`; no v3.
+2. **Free endpoints only.** No API-key option; the endpoint table under
+   [Free endpoints only](#free-endpoints-only) lists what is used. Perp volume
+   history and unlock schedules have no free structured source.
+3. **Captures stay inside the case** under `data/raw/captures/`. A full HYPE
+   capture set is about 5 MB, small next to the reproducibility it buys.
+   Very large aggregate endpoints (DefiLlama `/overview/fees` is about 30 MB)
+   are not ingested; adapters fetch per-protocol summaries.
+4. **`provider_ids`** stays one sorted `provider:id;...` string so the
+   instrument master remains one flat, strictly importable row per
+   observation.
+
 ## Open decisions
 
-1. **Widen `fundamental-facts.v2` in place or add v3.** This design widens the
-   unit and category sets in place. A v3 would keep v2 byte-for-byte closed
-   at the cost of a parallel contract.
-2. **Paid provider access.** `--api-key-env` for CoinGecko is proposed.
-   DefiLlama derivatives volume, open interest, and emissions need the paid
-   API (HTTP 402 in the trial). Decide whether to support keyed DefiLlama
-   endpoints or leave those metrics to captures plus imports.
-3. **Captures inside the case.** Captures live under `data/raw/captures/`. The
-   trial's DefiLlama captures are about 5 MB of JSON; confirm that size is
-   acceptable in research workspaces.
-4. **Price-age default.** The per-class policy is opt-in. Decide whether a
-   later minor release should make `crypto` use complete UTC bars by default.
-5. **Peer data source for multiples.** Peers resolve only from normalized
-   token-market and protocol-metrics artifacts, so each peer must be ingested.
-   Decide whether an import schema for peer observations is also needed.
-6. **`provider_ids` encoding.** A sorted `provider:id;...` string keeps CSV
-   import strict; a separate long table would be more normalized.
+1. **Price-age default for crypto.** Today one calendar-day limit applies to
+   every instrument. A case mixing equities and tokens must set it to about 3
+   to survive weekends, which also lets a crypto price go 3 days stale, while
+   a crypto-only case must use 1 because the cutoff day's bar is never
+   complete. Opt-in (`--max-price-age crypto=N`) keeps every existing audit
+   result identical. A default would apply complete-UTC-bar age to `crypto`
+   whenever audit can resolve the asset class: crypto ages shrink by one day,
+   and a crypto session dated on the cutoff becomes a new
+   `price_bar_incomplete` issue, which could fail a case that ingested the
+   current day's partial bar. Recommendation: make it the default in the same
+   minor release, because only crypto changes and the current rule is wrong
+   for 24/7 bars.
+2. **Peer data source for multiples.** As designed, peers come only from
+   ingested artifacts: one `ingest-coingecko-markets` capture for all peers
+   plus three DefiLlama fee captures per peer. Every peer multiple is then
+   reproducible from captured bytes. The cost is coverage: a peer without a
+   DefiLlama holders-revenue series cannot be used, as with the exchange
+   tokens (BNB, OKB, BGB) the trial could not include. The alternative is an
+   import schema `model.token-peer-observations.v1` whose rows must cite a
+   capture, letting an agent add such peers by hand at the price of
+   agent-transcribed numbers. Recommendation: ship ingest-only in phase 4 and
+   add the import only when a needed peer lacks API data.
