@@ -127,6 +127,8 @@ def test_normalize_fees_and_holders_revenue_with_definitions(workspace: Path) ->
         "Hyperliquid Perps",
         "Hyperliquid Spot Orderbook",
     }
+    assert set(children["chain"]) == {"Hyperliquid L1"}
+    assert aggregate["chain"].null_count() == aggregate.height
     assert aggregate["observed_at"][0] == datetime(2026, 11, 4, tzinfo=UTC)
 
     definitions = read_artifact(workspace, receipt.definitions.artifact_id)
@@ -197,8 +199,38 @@ def test_open_interest_rows_are_instant(workspace: Path) -> None:
     metrics = read_artifact(workspace, receipt.metrics.artifact_id).sort("period_end")
     assert set(metrics["period_type"]) == {"instant"}
     assert metrics["period_start"].null_count() == metrics.height
-    assert metrics["value"].to_list() == [1.5e9, 1.6e9, 1.55e9, 1.7e9]
-    assert metrics["is_complete"].to_list() == [True, True, True, False]
+    aggregate = metrics.filter(pl.col("sub_protocol").is_null())
+    assert aggregate["value"].to_list() == [1.5e9, 1.6e9, 1.55e9, 1.7e9]
+    assert aggregate["is_complete"].to_list() == [True, True, True, False]
+    nested = metrics.filter(pl.col("sub_protocol") == "Hyperliquid Perps")
+    assert set(nested["chain"]) == {"Hyperliquid L1"}
+    assert nested.height == 4
+
+
+def test_flat_breakdown_has_no_chain_and_null_methodology(workspace: Path) -> None:
+    flat = json.loads(fixture_bytes("defillama_fees_hyperliquid.json"))
+    flat["methodology"] = None
+    for point in flat["totalDataChartBreakdown"]:
+        point[1] = point[1]["Hyperliquid L1"]
+    (receipt,) = ingest_defillama(
+        workspace,
+        "hype",
+        "hyperliquid",
+        ("fees",),
+        fetcher=FakeFetcher([ok(json.dumps(flat).encode())]),
+        retrieved_at=RETRIEVED_AT,
+    )
+    result = normalize_protocol_metrics(
+        workspace,
+        "hype",
+        capture_artifact_ids=(receipt.capture_id,),
+        entity_id="hyperliquid",
+    )
+    metrics = read_artifact(workspace, result.metrics.artifact_id)
+    assert metrics["chain"].null_count() == metrics.height
+    assert "Hyperliquid Perps" in set(metrics["sub_protocol"])
+    definitions = read_artifact(workspace, result.definitions.artifact_id)
+    assert definitions["methodology_text"].null_count() == 1
 
 
 def test_hyperliquid_asset_contexts(workspace: Path) -> None:
@@ -303,6 +335,7 @@ def test_protocol_metrics_contract_rules() -> None:
         "instrument_id": None,
         "provider_protocol_id": "p",
         "sub_protocol": None,
+        "chain": None,
         "metric": "fees",
         "period_type": "duration",
         "period_start": date(2026, 1, 1),

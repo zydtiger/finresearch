@@ -613,7 +613,7 @@ independently valid), and prints the provider error verbatim.
 One row per provider value of one metric for one period: `provider`,
 `entity_id`, `instrument_id`, `provider_protocol_id` (for example the DefiLlama
 slug), `sub_protocol` (child protocol or perp market; NULL for the provider
-aggregate), `metric`, `period_type` (`duration` or `instant`), `period_start`
+aggregate), `chain` (NULL for aggregate rows and providers without chains), `metric`, `period_type` (`duration` or `instant`), `period_start`
 (required for `duration`, NULL for `instant`), `period_end` (inclusive UTC
 date), `value`, `unit`, `currency`, `is_complete`, `provider_definition_id`,
 `observed_at`, `capture_artifact_id`, `source_artifact_id`, `normalized_at`.
@@ -630,8 +630,8 @@ Volume, fees, and open interest are nonnegative; revenue metrics and funding
 may be negative. `currency` equals a fiat `unit` and is NULL for `tokens` and
 `bps`. `is_complete` is false exactly when `period_end` is on or after the UTC
 date of `normalized_at` (the capture's retrieval time). Unique key
-`(provider, provider_protocol_id, sub_protocol, metric, period_start,
-period_end, observed_at, source_artifact_id)`. Parent and child rows are never
+`(provider, provider_protocol_id, sub_protocol, chain, metric, period_start,
+period_end, observed_at, source_artifact_id)`. Rows are never summed across chains or children. Parent and child rows are never
 summed: consumers select one level explicitly (`sub_protocol IS NULL` is the
 provider aggregate).
 
@@ -651,7 +651,7 @@ cites a `provider_definition_id` that no declared definitions artifact holds.
 | Capture | Output rows |
 | --- | --- |
 | DefiLlama `totalDataChart` | Aggregate daily rows (`sub_protocol` NULL); a day is the UTC date of the bucket timestamp with `period_start = period_end` and `observed_at` the bucket timestamp. Metric: `fees`, `revenue`, `holders_revenue` by `dataType`; `volume_spot` for `dexs` |
-| DefiLlama `totalDataChartBreakdown` | The same rows with `sub_protocol` set to each child (for example `Hyperliquid Perps`); a nested value or a null child value is not turned into a row (nested values fail) |
+| DefiLlama `totalDataChartBreakdown` | DefiLlama nests chain, then sub-protocol, then value (`{"Hyperliquid L1": {"Hyperliquid Perps": v}}`): one row per (`chain`, `sub_protocol`). A flat `{sub_protocol: value}` breakdown yields rows with NULL `chain`. Null values produce no row |
 | DefiLlama `open-interest` | `open_interest` `instant` rows observed at the bucket timestamp |
 | Hyperliquid `metaAndAssetCtxs` | Per non-delisted perp market (`sub_protocol` = market name): `open_interest` as `openInterest * markPx` notional USD, `funding_rate_1h` as `funding * 10,000` bps, and a `volume_perp` row from `dayNtlVlm` for the 24 hours ending at retrieval (UTC dates of the window start and end); all observed at retrieval |
 
