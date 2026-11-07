@@ -891,10 +891,12 @@ age_crypto = (D - 1) - latest_session_date   # in days
 ```
 
 A crypto session equal to `D` is incomplete and is reported as
-`price_bar_incomplete` rather than treated as fresh. Other classes keep
-calendar-day age. Without `--max-price-age`, audit behaves exactly as today.
-For HYPE at `--as-of 2026-11-07 --max-price-age crypto=0`, the 2026-11-06 bar
-has age 0 and passes; today the same cutoff needs `--max-price-age-days 1`.
+`price_bar_incomplete` rather than treated as fresh. Complete-bar age is the
+default for every price whose class resolves to `crypto`; the flags only
+change limits. Other classes keep calendar-day age, so an equity-only case
+audits exactly as today. For HYPE at `--as-of 2026-11-07
+--max-price-age crypto=0`, the 2026-11-06 bar has age 0 and passes; today the
+same cutoff needs `--max-price-age-days 1`.
 
 ### FX normalization and conversion
 
@@ -992,7 +994,7 @@ CLI does not cover, as the trial's `hype_model.py` did.
 | `dcf-inputs.toml` | Version 2 | Version 1 inputs and runs authenticate unchanged |
 | `assumptions.csv` `source_evidence` | Accepts `;` lists | Single ids unchanged |
 | `normalize-daily-prices` | `--null-bars`, default `fail` | Unchanged default |
-| `case audit` | New issue codes; `--max-price-age` opt-in | A case without token artifacts and without the flag gets the same result |
+| `case audit` | New issue codes; `--max-price-age CLASS=N`; complete-UTC-bar age for `crypto` by default | Equity-only cases get the same result. Crypto ages shrink by one day, and a crypto session dated on the cutoff is a new `price_bar_incomplete` issue; release notes name this behavior change |
 | `case init` | Creates two empty directories | Compatible |
 
 The release is a minor bump under the pre-1.0 policy because nothing is
@@ -1078,28 +1080,16 @@ Decided in review on 2026-11-07:
 4. **`provider_ids`** stays one sorted `provider:id;...` string so the
    instrument master remains one flat, strictly importable row per
    observation.
+5. **Crypto price age defaults to complete UTC bars** in the same minor
+   release as the per-class flags. Only crypto results change, and the
+   calendar-day rule is wrong for 24/7 bars: mixed cases would otherwise need
+   a limit loose enough for equity weekends, and crypto-only cases could
+   never use 0.
+6. **Peers are ingest-only in phase 4.** Peer multiples come only from
+   `ingest-coingecko-markets` and DefiLlama fee captures, so every multiple
+   reproduces from captured bytes. A peer without a free holders-revenue
+   series, such as the exchange tokens BNB, OKB, and BGB, is excluded. An
+   import schema `model.token-peer-observations.v1`, with rows that must cite
+   a capture, is added only when a needed peer lacks API data.
 
-## Open decisions
-
-1. **Price-age default for crypto.** Today one calendar-day limit applies to
-   every instrument. A case mixing equities and tokens must set it to about 3
-   to survive weekends, which also lets a crypto price go 3 days stale, while
-   a crypto-only case must use 1 because the cutoff day's bar is never
-   complete. Opt-in (`--max-price-age crypto=N`) keeps every existing audit
-   result identical. A default would apply complete-UTC-bar age to `crypto`
-   whenever audit can resolve the asset class: crypto ages shrink by one day,
-   and a crypto session dated on the cutoff becomes a new
-   `price_bar_incomplete` issue, which could fail a case that ingested the
-   current day's partial bar. Recommendation: make it the default in the same
-   minor release, because only crypto changes and the current rule is wrong
-   for 24/7 bars.
-2. **Peer data source for multiples.** As designed, peers come only from
-   ingested artifacts: one `ingest-coingecko-markets` capture for all peers
-   plus three DefiLlama fee captures per peer. Every peer multiple is then
-   reproducible from captured bytes. The cost is coverage: a peer without a
-   DefiLlama holders-revenue series cannot be used, as with the exchange
-   tokens (BNB, OKB, BGB) the trial could not include. The alternative is an
-   import schema `model.token-peer-observations.v1` whose rows must cite a
-   capture, letting an agent add such peers by hand at the price of
-   agent-transcribed numbers. Recommendation: ship ingest-only in phase 4 and
-   add the import only when a needed peer lacks API data.
+No decisions remain open.
