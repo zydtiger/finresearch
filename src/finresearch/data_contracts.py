@@ -1668,7 +1668,276 @@ RAW_CAPTURE_V1: Final = DatasetContract(
     semantic_validator=_validate_capture_v1,
 )
 
+SUPPLY_METRICS: Final = frozenset(
+    {
+        "burned",
+        "circulating",
+        "future_emissions",
+        "locked",
+        "max",
+        "non_circulating",
+        "staked",
+        "total",
+    }
+)
+SUPPLY_ADDRESS_METRICS: Final = frozenset(
+    {"burned", "locked", "non_circulating", "staked"}
+)
+OBSERVED_AT_BASES: Final = frozenset({"provider", "retrieval"})
+TOKEN_MARKET_METRICS: Final = frozenset({"fdv", "market_cap", "price", "volume_24h"})
+FDV_SUPPLY_BASES: Final = frozenset({"max", "total"})
+RECONCILIATION_STATUSES: Final = frozenset(
+    {"agree", "conflict", "resolved", "single-source"}
+)
+
+
+def _validate_token_supply_v1(frame: pl.DataFrame) -> None:
+    contract = "normalized.token-supply.v1"
+    _validate_enum(frame, contract, "supply_metric", SUPPLY_METRICS)
+    _validate_enum(frame, contract, "observed_at_basis", OBSERVED_AT_BASES)
+    _validate_finite_positive(frame, contract, "amount", allow_zero=True)
+    groups: dict[tuple[object, ...], dict[str, list[float]]] = {}
+    for row in frame.iter_rows(named=True):
+        if row["unit"] != "tokens":
+            raise _semantic_error(contract, "unit must be 'tokens'")
+        if row["observed_at"] > row["retrieved_at"]:
+            raise _semantic_error(
+                contract, "observed_at must not be after retrieved_at"
+            )
+        if (
+            row["observed_at_basis"] == "retrieval"
+            and row["observed_at"] != row["retrieved_at"]
+        ):
+            raise _semantic_error(
+                contract,
+                "observed_at_basis 'retrieval' requires observed_at "
+                "equal to retrieved_at",
+            )
+        if row["holder_address"] is None:
+            key = (
+                row["provider"],
+                row["instrument_id"],
+                row["observed_at"],
+                row["source_artifact_id"],
+            )
+            groups.setdefault(key, {}).setdefault(row["supply_metric"], []).append(
+                row["amount"]
+            )
+        elif row["supply_metric"] not in SUPPLY_ADDRESS_METRICS:
+            raise _semantic_error(
+                contract,
+                f"holder_address is not allowed for {row['supply_metric']!r} rows",
+            )
+    for group_key, metrics in groups.items():
+        single = {
+            name: values[0]
+            for name, values in metrics.items()
+            if name in {"circulating", "total", "max"} and len(values) == 1
+        }
+        ordered = [
+            single[name] for name in ("circulating", "total", "max") if name in single
+        ]
+        if ordered != sorted(ordered):
+            raise _semantic_error(
+                contract,
+                "circulating <= total <= max is violated for "
+                f"{group_key[0]}:{group_key[1]}: {single!r}",
+            )
+
+
+def _validate_token_market_v1(frame: pl.DataFrame) -> None:
+    contract = "normalized.token-market.v1"
+    _validate_enum(frame, contract, "metric", TOKEN_MARKET_METRICS)
+    _validate_enum(frame, contract, "quote_asset", QUOTE_ASSETS)
+    _validate_enum(frame, contract, "fdv_supply_basis", FDV_SUPPLY_BASES)
+    for row in frame.iter_rows(named=True):
+        value = row["value"]
+        if not math.isfinite(value) or value < 0:
+            raise _semantic_error(contract, "value must be finite and nonnegative")
+        if value == 0 and row["metric"] != "volume_24h":
+            raise _semantic_error(contract, f"{row['metric']} must be positive")
+        quote = row["quote_asset"]
+        expected_currency = quote if quote in CURRENCY_CODES else None
+        if row["currency"] != expected_currency:
+            raise _semantic_error(
+                contract,
+                "currency must equal a fiat quote_asset and be NULL for stablecoins",
+            )
+        if (row["metric"] == "fdv") != (row["fdv_supply_basis"] is not None):
+            raise _semantic_error(
+                contract, "fdv_supply_basis is required for, and only for, fdv"
+            )
+
+
+def _validate_token_supply_reconciliation_v1(frame: pl.DataFrame) -> None:
+    contract = "derived.token-supply-reconciliation.v1"
+    _validate_enum(frame, contract, "supply_metric", SUPPLY_METRICS)
+    _validate_enum(frame, contract, "status", RECONCILIATION_STATUSES)
+    for field in ("amount", "min_amount", "max_amount", "spread", "tolerance"):
+        _validate_finite_positive(frame, contract, field, allow_zero=True)
+    selected: dict[tuple[object, ...], int] = {}
+    statuses: dict[tuple[object, ...], set[object]] = {}
+    for row in frame.iter_rows(named=True):
+        key = (row["instrument_id"], row["as_of"], row["supply_metric"])
+        statuses.setdefault(key, set()).add(row["status"])
+        selected[key] = selected.get(key, 0) + int(row["selected"])
+        if not row["min_amount"] <= row["amount"] <= row["max_amount"]:
+            raise _semantic_error(contract, "amount must lie within min and max")
+        if (row["status"] == "resolved") != (row["resolution_source_id"] is not None):
+            raise _semantic_error(
+                contract, "resolution_source_id is required for, and only for, resolved"
+            )
+        if row["status"] == "conflict" and row["selected"]:
+            raise _semantic_error(contract, "a conflict must not select a row")
+    for metric_key, count in selected.items():
+        if len(statuses[metric_key]) != 1:
+            raise _semantic_error(
+                contract, f"status differs within metric {metric_key[2]}"
+            )
+        if count > 1 or (count == 0 and statuses[metric_key] != {"conflict"}):
+            raise _semantic_error(
+                contract,
+                f"metric {metric_key[2]} must select exactly one row "
+                "unless it conflicts",
+            )
+
+
+NORMALIZED_TOKEN_SUPPLY_V1_FIELDS: Final[dict[str, pl.DataType | type[pl.DataType]]] = {
+    "schema_version": pl.UInt16,
+    "provider": pl.String,
+    "instrument_id": pl.String,
+    "provider_asset_id": pl.String,
+    "supply_metric": pl.String,
+    "amount": pl.Float64,
+    "unit": pl.String,
+    "definition_id": pl.String,
+    "holder_address": pl.String,
+    "holder_label": pl.String,
+    "observed_at": pl.Datetime("us", "UTC"),
+    "observed_at_basis": pl.String,
+    "retrieved_at": pl.Datetime("us", "UTC"),
+    "capture_artifact_id": pl.String,
+    "source_artifact_id": pl.String,
+    "normalized_at": pl.Datetime("us", "UTC"),
+}
+_TOKEN_SUPPLY_UNIQUE_KEY: Final = (
+    "provider",
+    "instrument_id",
+    "supply_metric",
+    "definition_id",
+    "holder_address",
+    "observed_at",
+    "source_artifact_id",
+)
+NORMALIZED_TOKEN_SUPPLY_V1: Final = DatasetContract(
+    name="normalized.token-supply",
+    version=1,
+    schema=pl.Schema(NORMALIZED_TOKEN_SUPPLY_V1_FIELDS),
+    non_nullable=tuple(
+        name
+        for name in NORMALIZED_TOKEN_SUPPLY_V1_FIELDS
+        if name not in {"holder_address", "holder_label", "capture_artifact_id"}
+    ),
+    unique_key=_TOKEN_SUPPLY_UNIQUE_KEY,
+    # The documented sort key, completed with the remaining unique-key columns
+    # so the order is total and the published bytes are deterministic.
+    sort_key=(
+        "instrument_id",
+        "supply_metric",
+        "provider",
+        "observed_at",
+        "holder_address",
+        "definition_id",
+        "source_artifact_id",
+    ),
+    semantic_validator=_validate_token_supply_v1,
+)
+
+NORMALIZED_TOKEN_MARKET_V1_FIELDS: Final[dict[str, pl.DataType | type[pl.DataType]]] = {
+    "schema_version": pl.UInt16,
+    "provider": pl.String,
+    "instrument_id": pl.String,
+    "provider_asset_id": pl.String,
+    "metric": pl.String,
+    "value": pl.Float64,
+    "quote_asset": pl.String,
+    "currency": pl.String,
+    "fdv_supply_basis": pl.String,
+    "observed_at": pl.Datetime("us", "UTC"),
+    "retrieved_at": pl.Datetime("us", "UTC"),
+    "capture_artifact_id": pl.String,
+    "source_artifact_id": pl.String,
+    "normalized_at": pl.Datetime("us", "UTC"),
+}
+_TOKEN_MARKET_UNIQUE_KEY: Final = (
+    "provider",
+    "instrument_id",
+    "metric",
+    "quote_asset",
+    "observed_at",
+    "source_artifact_id",
+)
+NORMALIZED_TOKEN_MARKET_V1: Final = DatasetContract(
+    name="normalized.token-market",
+    version=1,
+    schema=pl.Schema(NORMALIZED_TOKEN_MARKET_V1_FIELDS),
+    non_nullable=tuple(
+        name
+        for name in NORMALIZED_TOKEN_MARKET_V1_FIELDS
+        if name not in {"currency", "fdv_supply_basis", "capture_artifact_id"}
+    ),
+    unique_key=_TOKEN_MARKET_UNIQUE_KEY,
+    sort_key=_TOKEN_MARKET_UNIQUE_KEY,
+    semantic_validator=_validate_token_market_v1,
+)
+
+DERIVED_TOKEN_SUPPLY_RECONCILIATION_V1_FIELDS: Final[
+    dict[str, pl.DataType | type[pl.DataType]]
+] = {
+    "schema_version": pl.UInt16,
+    "instrument_id": pl.String,
+    "as_of": pl.Date,
+    "supply_metric": pl.String,
+    "provider": pl.String,
+    "definition_id": pl.String,
+    "observed_at": pl.Datetime("us", "UTC"),
+    "amount": pl.Float64,
+    "min_amount": pl.Float64,
+    "max_amount": pl.Float64,
+    "spread": pl.Float64,
+    "tolerance": pl.Float64,
+    "status": pl.String,
+    "selected": pl.Boolean,
+    "resolution_source_id": pl.String,
+    "source_artifact_id": pl.String,
+}
+_TOKEN_SUPPLY_RECONCILIATION_KEY: Final = (
+    "instrument_id",
+    "as_of",
+    "supply_metric",
+    "provider",
+    "definition_id",
+)
+DERIVED_TOKEN_SUPPLY_RECONCILIATION_V1: Final = DatasetContract(
+    name="derived.token-supply-reconciliation",
+    version=1,
+    schema=pl.Schema(DERIVED_TOKEN_SUPPLY_RECONCILIATION_V1_FIELDS),
+    non_nullable=tuple(
+        name
+        for name in DERIVED_TOKEN_SUPPLY_RECONCILIATION_V1_FIELDS
+        if name != "resolution_source_id"
+    ),
+    unique_key=_TOKEN_SUPPLY_RECONCILIATION_KEY,
+    sort_key=_TOKEN_SUPPLY_RECONCILIATION_KEY,
+    semantic_validator=_validate_token_supply_reconciliation_v1,
+)
+
 CONTRACTS: Final = {
+    NORMALIZED_TOKEN_SUPPLY_V1.identifier: NORMALIZED_TOKEN_SUPPLY_V1,
+    NORMALIZED_TOKEN_MARKET_V1.identifier: NORMALIZED_TOKEN_MARKET_V1,
+    DERIVED_TOKEN_SUPPLY_RECONCILIATION_V1.identifier: (
+        DERIVED_TOKEN_SUPPLY_RECONCILIATION_V1
+    ),
     RAW_CAPTURE_V1.identifier: RAW_CAPTURE_V1,
     RAW_YFINANCE_DAILY_PRICES_V1.identifier: RAW_YFINANCE_DAILY_PRICES_V1,
     RAW_SEC_SUBMISSIONS_V1.identifier: RAW_SEC_SUBMISSIONS_V1,

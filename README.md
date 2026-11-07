@@ -155,6 +155,25 @@ uv run finresearch --workspace /path/to/research-artifacts \
   --retrieved-at 2026-08-11T04:00:00Z --http-status 200
 ```
 
+Capture token supply and market data from keyless provider endpoints, normalize
+it, and reconcile the providers under an explicit policy (see
+[`docs/data-ingestion.md`](docs/data-ingestion.md#token-supply-and-market-data)):
+
+```bash
+uv run finresearch --workspace /path/to/research-artifacts \
+  data ingest-coingecko-token hype-2026-11-07 hyperliquid
+uv run finresearch --workspace /path/to/research-artifacts \
+  data ingest-hyperliquid-info hype-2026-11-07 \
+  --request token-details --token-id 0x0d01dc56dcaaca66ad901c959b4011ec
+uv run finresearch --workspace /path/to/research-artifacts \
+  data normalize-token-supply hype-2026-11-07 \
+  --capture-artifact-id CAPTURE_ID --instrument-id hype.hyperliquid.l1
+uv run finresearch --workspace /path/to/research-artifacts \
+  data reconcile-token-supply hype-2026-11-07 \
+  --instrument-id hype.hyperliquid.l1 --as-of 2026-11-07 \
+  --policy analysis/token-supply-policy.toml
+```
+
 Build an explicit as-of current-state master only when the provider-scoped v2
 observations are already present:
 

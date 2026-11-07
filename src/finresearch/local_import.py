@@ -10,6 +10,7 @@ import os
 import re
 import stat
 import tempfile
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -17,6 +18,7 @@ from typing import Final, Literal
 
 import polars as pl
 
+from finresearch.captures import declared_captures
 from finresearch.cases import (
     MANIFEST_V1,
     MANIFEST_V2,
@@ -39,6 +41,7 @@ from finresearch.data_contracts import (
     NORMALIZED_FUNDAMENTAL_FACTS_V2,
     NORMALIZED_FX_RATES_V1,
     NORMALIZED_INSTRUMENT_MASTER_V2,
+    NORMALIZED_TOKEN_SUPPLY_V1,
     DataContractError,
     DatasetContract,
 )
@@ -66,6 +69,8 @@ class LocalImportSchema:
     contract: DatasetContract
     input_schema: pl.Schema
     generated_fields: frozenset[str]
+    # Case-dependent checks that a table contract cannot express.
+    check_references: Callable[[pl.DataFrame, CaseManifest], None] | None = None
 
 
 @dataclass(frozen=True)
@@ -93,13 +98,31 @@ def _schema(
     name: str,
     contract: DatasetContract,
     generated_fields: frozenset[str],
+    check_references: Callable[[pl.DataFrame, CaseManifest], None] | None = None,
 ) -> LocalImportSchema:
     return LocalImportSchema(
         name=name,
         contract=contract,
         input_schema=_projection_schema(contract, generated_fields),
         generated_fields=generated_fields,
+        check_references=check_references,
     )
+
+
+def _check_capture_references(frame: pl.DataFrame, manifest: CaseManifest) -> None:
+    """Require every cited ``capture_artifact_id`` to be a declared capture."""
+    declared = declared_captures(manifest)
+    missing = sorted(
+        {
+            value
+            for value in frame.get_column("capture_artifact_id").drop_nulls().to_list()
+            if value not in declared
+        }
+    )
+    if missing:
+        raise IngestionError(
+            f"capture_artifact_id is not a declared raw.capture.v1: {missing[0]}"
+        )
 
 
 IMPORT_SCHEMAS: Final[dict[str, LocalImportSchema]] = {
@@ -140,6 +163,20 @@ IMPORT_SCHEMAS: Final[dict[str, LocalImportSchema]] = {
         frozenset(
             {"schema_version", "provider", "source_artifact_id", "normalized_at"}
         ),
+    ),
+    "token-supply.v1": _schema(
+        "token-supply.v1",
+        NORMALIZED_TOKEN_SUPPLY_V1,
+        frozenset(
+            {
+                "schema_version",
+                "provider",
+                "retrieved_at",
+                "source_artifact_id",
+                "normalized_at",
+            }
+        ),
+        _check_capture_references,
     ),
     "model.comps-observations.v1": _schema(
         "model.comps-observations.v1",
@@ -286,6 +323,8 @@ def _import_local_file(
         raise CaseContractError(f"case not found: {case_id}")
     with case_write_lock(case_dir):
         manifest = read_manifest(case_dir)
+        if spec.check_references is not None:
+            spec.check_references(canonical, manifest)
         raw_path = Path(
             manifest.paths["raw"], "imports", spec.name, f"{raw_identity}.source"
         )

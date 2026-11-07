@@ -1,0 +1,22 @@
+{
+  "name": "HYPE",
+  "maxSupply": "1000000000.0",
+  "totalSupply": "998778474.0",
+  "circulatingSupply": "301819911.0",
+  "szDecimals": 2,
+  "weiDecimals": 8,
+  "midPx": "78.45",
+  "markPx": "78.44",
+  "prevDayPx": "77.9",
+  "nonCirculatingUserBalances": [
+    [
+      "0x43e9abea1910387c4a0b3cf2dc34ca6e2e9b95f0",
+      "238104720.0"
+    ],
+    [
+      "0xfefefefefefefefefefefefefefefefefefefefe",
+      "48742089.0"
+    ]
+  ],
+  "futureEmissions": "0.0"
+}

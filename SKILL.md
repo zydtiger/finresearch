@@ -64,6 +64,21 @@ financial values, peers, evidence, assumptions, or source IDs.
   `capture:<capture_id>`. Never hand-edit CLI-owned files. URLs must be https
   and carry no credentials: userinfo or query names containing `key`,
   `token`, or `secret` are rejected.
+- Token supply: `data ingest-coingecko-token`, `ingest-coingecko-markets`, and
+  `ingest-hyperliquid-info` write CLI captures from keyless endpoints (no API
+  keys; CoinGecko requests are throttled to one per 6 seconds). Normalize with
+  `data normalize-token-supply --capture-artifact-id ID` and either
+  `--instrument-id` (single-asset capture) or one
+  `--instrument-map PROVIDER_ASSET_ID=INSTRUMENT_ID` per asset; the instrument
+  id is always yours, never inferred. Put supplies read from web pages in a
+  `token-supply.v1` CSV (`data import-csv --schema token-supply.v1`) citing
+  the registered capture in `capture_artifact_id`. Reconcile providers with
+  `data reconcile-token-supply --policy analysis/token-supply-policy.toml`
+  (tolerances per metric, `provider_priority`, and a `[resolution.<metric>]`
+  with an evidence or assumption `source_id` that records which definition you
+  chose and why). Which definition is authoritative is your judgment; an
+  unresolved `conflict` is reported by `case audit` as `token_supply_conflict`,
+  so record a resolution instead of ignoring it.
 - `fundamental-facts.v2` accepts units `tokens`, `<FIAT>/token`, and `bps`
   (fixed `unit_kind` and `currency` pairings) and categories `token-supply`
   and `protocol-metric`. Stablecoins are `quote_asset` values (`USDC`, `USDT`,

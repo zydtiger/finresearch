@@ -1,0 +1,27 @@
+{
+  "id": "hyperliquid",
+  "symbol": "hype",
+  "name": "Hyperliquid",
+  "market_data": {
+    "current_price": {
+      "usd": 78.4549,
+      "eur": 67.9
+    },
+    "market_cap": {
+      "usd": 18783266430.5,
+      "eur": 16270000000
+    },
+    "fully_diluted_valuation": {
+      "usd": 74652000000,
+      "eur": 64700000000
+    },
+    "total_volume": {
+      "usd": 1234567890.0,
+      "eur": 1070000000
+    },
+    "circulating_supply": 239406814.37,
+    "total_supply": 951538272.91,
+    "max_supply": 1000000000.0,
+    "last_updated": "2026-11-07T20:28:57.123Z"
+  }
+}

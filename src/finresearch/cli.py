@@ -10,6 +10,11 @@ from typing import Annotated, Literal, NoReturn, cast
 import typer
 
 from finresearch.auditing import audit_case
+from finresearch.capture_ingestion import (
+    ingest_coingecko_markets,
+    ingest_coingecko_token,
+    ingest_hyperliquid_info,
+)
 from finresearch.captures import CaptureReceipt, register_capture
 from finresearch.cases import (
     CaseContractError,
@@ -49,6 +54,8 @@ from finresearch.normalization import (
 from finresearch.providers import ProviderError
 from finresearch.registers import REGISTER_FILES, inspect_registers
 from finresearch.reporting import generate_report
+from finresearch.token_normalization import normalize_token_supply
+from finresearch.token_reconciliation import reconcile_token_supply
 
 app = typer.Typer(
     add_completion=False,
@@ -533,6 +540,179 @@ def register_capture_command(
     print_capture_receipt(receipt)
 
 
+VsCurrencyOption = Annotated[
+    str, typer.Option("--vs-currency", help="Quote currency or stablecoin.")
+]
+
+
+@data_app.command("ingest-coingecko-token")
+def ingest_coingecko_token_command(
+    ctx: typer.Context,
+    case_id: CaseIdArgument,
+    coin_id: Annotated[
+        str, typer.Argument(help="CoinGecko coin id, e.g. hyperliquid.")
+    ],
+    vs_currency: VsCurrencyOption = "usd",
+) -> None:
+    """Capture CoinGecko /coins/{id} (keyless endpoint, throttled)."""
+    try:
+        receipt = ingest_coingecko_token(
+            state_from_context(ctx).workspace,
+            case_id,
+            coin_id,
+            vs_currency=vs_currency,
+        )
+    except (
+        CaseContractError,
+        DataContractError,
+        IngestionError,
+        OSError,
+        ProviderError,
+    ) as exc:
+        fail(str(exc))
+    print_capture_receipt(receipt)
+
+
+@data_app.command("ingest-coingecko-markets")
+def ingest_coingecko_markets_command(
+    ctx: typer.Context,
+    case_id: CaseIdArgument,
+    ids: Annotated[
+        str, typer.Option("--ids", help="Comma-separated explicit CoinGecko ids.")
+    ],
+    vs_currency: VsCurrencyOption = "usd",
+) -> None:
+    """Capture CoinGecko /coins/markets for an explicit id list."""
+    try:
+        receipt = ingest_coingecko_markets(
+            state_from_context(ctx).workspace,
+            case_id,
+            tuple(item.strip() for item in ids.split(",") if item.strip()),
+            vs_currency=vs_currency,
+        )
+    except (
+        CaseContractError,
+        DataContractError,
+        IngestionError,
+        OSError,
+        ProviderError,
+    ) as exc:
+        fail(str(exc))
+    print_capture_receipt(receipt)
+
+
+@data_app.command("ingest-hyperliquid-info")
+def ingest_hyperliquid_info_command(
+    ctx: typer.Context,
+    case_id: CaseIdArgument,
+    request: Annotated[
+        str,
+        typer.Option(
+            "--request",
+            help=(
+                "token-details, validator-summaries, meta-and-asset-ctxs, "
+                "spot-meta-and-asset-ctxs, vault-details, "
+                "spot-clearinghouse-state, or funding-history."
+            ),
+        ),
+    ],
+    token_id: Annotated[str | None, typer.Option("--token-id")] = None,
+    address: Annotated[str | None, typer.Option("--address")] = None,
+    coin: Annotated[str | None, typer.Option("--coin")] = None,
+    start: Annotated[
+        str | None, typer.Option("--start", help="UTC start date YYYY-MM-DD.")
+    ] = None,
+) -> None:
+    """Capture one Hyperliquid info request (keyless endpoint)."""
+    try:
+        receipts = ingest_hyperliquid_info(
+            state_from_context(ctx).workspace,
+            case_id,
+            request,
+            token_id=token_id,
+            address=address,
+            coin=coin,
+            start=None if start is None else parse_iso_date(start, "start"),
+        )
+    except (
+        CaseContractError,
+        DataContractError,
+        IngestionError,
+        OSError,
+        ProviderError,
+    ) as exc:
+        fail(str(exc))
+    for receipt in receipts:
+        print_capture_receipt(receipt)
+
+
+@data_app.command("normalize-token-supply")
+def normalize_token_supply_command(
+    ctx: typer.Context,
+    case_id: CaseIdArgument,
+    capture_artifact_id: Annotated[
+        str, typer.Option("--capture-artifact-id", help="Declared raw.capture.v1 id.")
+    ],
+    instrument_id: Annotated[
+        str | None, typer.Option("--instrument-id", help="For single-asset captures.")
+    ] = None,
+    instrument_map: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--instrument-map",
+            help="PROVIDER_ASSET_ID=INSTRUMENT_ID; repeat per asset.",
+        ),
+    ] = None,
+) -> None:
+    """Parse one capture into token-supply and token-market tables."""
+    try:
+        mapping = parse_instrument_map(instrument_map)
+        receipt = normalize_token_supply(
+            state_from_context(ctx).workspace,
+            case_id,
+            capture_artifact_id=capture_artifact_id,
+            instrument_id=instrument_id,
+            instrument_map=mapping,
+        )
+    except (CaseContractError, DataContractError, IngestionError, OSError) as exc:
+        fail(str(exc))
+    typer.echo("normalized token-supply:")
+    print_ingestion_receipt(receipt.supply)
+    if receipt.market is not None:
+        typer.echo("normalized token-market:")
+        print_ingestion_receipt(receipt.market)
+    if receipt.skipped_assets:
+        typer.echo(f"skipped unmapped assets: {', '.join(receipt.skipped_assets)}")
+
+
+@data_app.command("reconcile-token-supply")
+def reconcile_token_supply_command(
+    ctx: typer.Context,
+    case_id: CaseIdArgument,
+    instrument_id: Annotated[str, typer.Option("--instrument-id")],
+    as_of: AsOfOption,
+    policy: Annotated[
+        str,
+        typer.Option("--policy", help="Case-relative path to the strict policy TOML."),
+    ],
+    source_artifact_ids: SourceArtifactOption = None,
+) -> None:
+    """Reconcile token supply across providers under an explicit policy."""
+    try:
+        receipt = reconcile_token_supply(
+            state_from_context(ctx).workspace,
+            case_id,
+            instrument_id=instrument_id,
+            as_of=parse_iso_date(as_of, "as_of"),
+            policy_path=policy,
+            source_artifact_ids=tuple(source_artifact_ids or ()),
+        )
+    except (CaseContractError, DataContractError, IngestionError, OSError) as exc:
+        fail(str(exc))
+    typer.echo("reconciled token-supply:")
+    print_ingestion_receipt(receipt)
+
+
 @data_app.command("validate")
 def validate_data_command(
     ctx: typer.Context,
@@ -811,6 +991,23 @@ def print_local_import_receipt(receipt: LocalImportReceipt) -> None:
     typer.echo(f"path: {receipt.normalized.path}")
     typer.echo(f"rows: {receipt.normalized.row_count}")
     typer.echo(f"sha256: {receipt.normalized.sha256}")
+
+
+def parse_instrument_map(values: list[str] | None) -> dict[str, str] | None:
+    """Parse repeated PROVIDER_ASSET_ID=INSTRUMENT_ID options."""
+    if not values:
+        return None
+    mapping: dict[str, str] = {}
+    for item in values:
+        asset_id, separator, instrument = item.partition("=")
+        if not separator or not asset_id or not instrument:
+            raise IngestionError(
+                f"--instrument-map must be PROVIDER_ASSET_ID=INSTRUMENT_ID: {item!r}"
+            )
+        if asset_id in mapping:
+            raise IngestionError(f"--instrument-map repeats asset {asset_id!r}")
+        mapping[asset_id] = instrument
+    return mapping
 
 
 def cast_dcf_scenario(value: str) -> Literal["bear", "base", "bull", "all"]:
