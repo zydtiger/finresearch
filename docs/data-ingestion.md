@@ -291,7 +291,7 @@ OHLC ordering, positive FX rates, valid action amounts, and PIT timestamp order.
 
 ```text
 finresearch --workspace PATH data import-csv CASE_ID FILE \
-  --schema instrument-master.v2|daily-prices.v2|fundamental-facts.v2|estimates.v1|corporate-actions.v1|fx-rates.v1|token-supply.v1|model.comps-observations.v1 \
+  --schema instrument-master.v2|daily-prices.v2|fundamental-facts.v2|estimates.v1|corporate-actions.v1|fx-rates.v1|instrument-master.v3|token-supply.v1|instrument-master.v3|model.comps-observations.v1 \
   --provider PROVIDER --retrieved-at RFC3339_UTC
 
 finresearch --workspace PATH data import-parquet CASE_ID FILE \
@@ -329,6 +329,22 @@ artifacts in canonical artifact-id order; repeated source filters are treated
 as one sorted set. `data validate` also compares every non-null price/action
 currency by provider and instrument against a single
 matching v2 master currency when one is unambiguous.
+
+### normalized.instrument-master.v3
+
+The v2 fields plus `chain` (lowercase slug, e.g. `hyperliquid-l1`),
+`contract_address`, `token_standard` (`native`, `erc20`, `spl`, `hip1`,
+`other`), `provider_ids` (sorted `provider:id` pairs joined by `;`, unique
+providers, no empty ids, e.g. `coingecko:hyperliquid;yfinance:HYPE32196-USD`),
+and a required `asset_class_source` (`provider` or `import`). `chain`,
+`contract_address`, and `token_standard` are only allowed when
+`asset_class = "crypto"`, and `contract_address` requires `chain`. The token
+master is an import (`--schema instrument-master.v3`) because its ids are case
+declarations. `reconcile-instrument-master` reads v2 and v3 observations; when
+any v3 observation is present it writes
+`derived.instrument-master-current.v2` (the v3 fields plus `as_of`; v2
+observations contribute NULL token fields and `import`), otherwise it writes
+the unchanged v1 output.
 
 ## Normalized fundamental-facts v1 (legacy compatibility)
 

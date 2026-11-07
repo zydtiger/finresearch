@@ -41,6 +41,7 @@ from finresearch.data_contracts import (
     NORMALIZED_FUNDAMENTAL_FACTS_V2,
     NORMALIZED_FX_RATES_V1,
     NORMALIZED_INSTRUMENT_MASTER_V2,
+    NORMALIZED_INSTRUMENT_MASTER_V3,
     NORMALIZED_TOKEN_SUPPLY_V1,
     DataContractError,
     DatasetContract,
@@ -129,6 +130,11 @@ IMPORT_SCHEMAS: Final[dict[str, LocalImportSchema]] = {
     "instrument-master.v2": _schema(
         "instrument-master.v2",
         NORMALIZED_INSTRUMENT_MASTER_V2,
+        frozenset({"schema_version", "provider", "source_artifact_id"}),
+    ),
+    "instrument-master.v3": _schema(
+        "instrument-master.v3",
+        NORMALIZED_INSTRUMENT_MASTER_V3,
         frozenset({"schema_version", "provider", "source_artifact_id"}),
     ),
     "daily-prices.v2": _schema(

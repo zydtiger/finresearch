@@ -21,6 +21,7 @@ from finresearch.cases import (
 )
 from finresearch.data_contracts import (
     NORMALIZED_INSTRUMENT_MASTER_V2,
+    NORMALIZED_INSTRUMENT_MASTER_V3,
     DataContractError,
     DatasetContract,
     get_contract,
@@ -419,7 +420,11 @@ def _validate_master_currency(
         return []
     expected_by_key: dict[tuple[str, str], set[str]] = {}
     for master in manifest.artifacts:
-        if master.kind != "normalized.instrument-master" or master.schema_version != 2:
+        master_contract = {
+            2: NORMALIZED_INSTRUMENT_MASTER_V2,
+            3: NORMALIZED_INSTRUMENT_MASTER_V3,
+        }.get(master.schema_version)
+        if master.kind != "normalized.instrument-master" or master_contract is None:
             continue
         master_path = resolve_relative_path(
             case_dir,
@@ -433,7 +438,7 @@ def _validate_master_currency(
         except Exception:
             continue
         try:
-            NORMALIZED_INSTRUMENT_MASTER_V2.validate(master_frame)
+            master_contract.validate(master_frame)
         except DataContractError:
             continue
         for row in master_frame.iter_rows(named=True):

@@ -23,10 +23,12 @@ from finresearch.cases import (
 )
 from finresearch.data_contracts import (
     DERIVED_INSTRUMENT_MASTER_CURRENT_V1,
+    DERIVED_INSTRUMENT_MASTER_CURRENT_V2,
     NORMALIZED_CORPORATE_ACTIONS_V1,
     NORMALIZED_DAILY_PRICES_V2,
     NORMALIZED_FUNDAMENTAL_FACTS_V2,
     NORMALIZED_INSTRUMENT_MASTER_V2,
+    NORMALIZED_INSTRUMENT_MASTER_V3,
     RAW_SEC_COMPANYFACTS_V1,
     RAW_YFINANCE_DAILY_PRICES_V1,
     DataContractError,
@@ -229,20 +231,30 @@ def reconcile_instrument_master(
     as_of: date,
     source_artifact_ids: tuple[str, ...] = (),
 ) -> IngestionReceipt:
-    """Derive one deterministic current-state master from v2 observations."""
+    """Derive one deterministic current-state master from v2 and v3 observations.
+
+    V2-only inputs keep the v1 output; any v3 observation selects the v2 output,
+    in which v2 observations carry NULL token fields and ``import`` as source.
+    """
     case_dir, manifest, _ = _case_normalized_context(workspace, case_id)
     canonical_sources = tuple(sorted(set(source_artifact_ids)))
     selected_sources = set(canonical_sources)
     observations: list[dict[str, object]] = []
+    contracts = {
+        NORMALIZED_INSTRUMENT_MASTER_V2.version: NORMALIZED_INSTRUMENT_MASTER_V2,
+        NORMALIZED_INSTRUMENT_MASTER_V3.version: NORMALIZED_INSTRUMENT_MASTER_V3,
+    }
+    uses_v3 = False
     for artifact in manifest.artifacts:
+        input_contract = contracts.get(artifact.schema_version)
         if (
             artifact.kind != NORMALIZED_INSTRUMENT_MASTER_V2.name
-            or artifact.schema_version != NORMALIZED_INSTRUMENT_MASTER_V2.version
+            or input_contract is None
         ):
             continue
         frame = _read_raw_snapshot(case_dir, artifact)
         try:
-            NORMALIZED_INSTRUMENT_MASTER_V2.validate(frame)
+            input_contract.validate(frame)
         except DataContractError as exc:
             raise IngestionError(
                 f"instrument-master artifact {artifact.artifact_id} is invalid: {exc}"
@@ -254,13 +266,22 @@ def reconcile_instrument_master(
         ]
         if not rows:
             continue
+        uses_v3 = uses_v3 or artifact.schema_version == 3
         for row in rows:
             row["_master_artifact_id"] = artifact.artifact_id
+            for name in NORMALIZED_INSTRUMENT_MASTER_V3.schema:
+                if name not in row:
+                    row[name] = "import" if name == "asset_class_source" else None
         observations.extend(rows)
     if not observations:
         raise IngestionError(
-            "no v2 instrument-master observations match reconciliation"
+            "no v2 or v3 instrument-master observations match reconciliation"
         )
+    output_contract = (
+        DERIVED_INSTRUMENT_MASTER_CURRENT_V2
+        if uses_v3
+        else DERIVED_INSTRUMENT_MASTER_CURRENT_V1
+    )
 
     selected: list[dict[str, object]] = []
     contributing_parent_ids: set[str] = set()
@@ -282,7 +303,11 @@ def reconcile_instrument_master(
         raise IngestionError(
             "no instrument-master observations are valid at requested as_of"
         )
-    fields = tuple(NORMALIZED_INSTRUMENT_MASTER_V2.schema)
+    fields = tuple(
+        NORMALIZED_INSTRUMENT_MASTER_V3.schema
+        if uses_v3
+        else NORMALIZED_INSTRUMENT_MASTER_V2.schema
+    )
     for key, rows in by_instrument.items():
         latest = max(cast(datetime, row["observed_at"]) for row in rows)
         candidates = [row for row in rows if row["observed_at"] == latest]
@@ -304,16 +329,13 @@ def reconcile_instrument_master(
             contributing_parent_ids.add(str(candidate["_master_artifact_id"]))
             contributing_parent_ids.add(str(candidate["source_artifact_id"]))
         representative.pop("_master_artifact_id", None)
-        representative["schema_version"] = DERIVED_INSTRUMENT_MASTER_CURRENT_V1.version
+        representative["schema_version"] = output_contract.version
         representative["as_of"] = as_of
-        selected.append(representative)
-    output = pl.DataFrame(
-        selected,
-        schema=DERIVED_INSTRUMENT_MASTER_CURRENT_V1.schema,
-    )
-    output = DERIVED_INSTRUMENT_MASTER_CURRENT_V1.canonical_sort(output)
+        selected.append({name: representative[name] for name in output_contract.schema})
+    output = pl.DataFrame(selected, schema=output_contract.schema)
+    output = output_contract.canonical_sort(output)
     try:
-        DERIVED_INSTRUMENT_MASTER_CURRENT_V1.validate(output)
+        output_contract.validate(output)
     except DataContractError as exc:
         raise IngestionError(f"reconciled instrument-master is invalid: {exc}") from exc
 
@@ -321,7 +343,7 @@ def reconcile_instrument_master(
     identity = canonical_parameters_sha256(
         {
             "as_of": as_of.isoformat(),
-            "contract": DERIVED_INSTRUMENT_MASTER_CURRENT_V1.identifier,
+            "contract": output_contract.identifier,
             "input_artifact_ids": list(parent_ids),
             "producer": "finresearch.data.reconcile",
             "producer_version": "1",
@@ -333,7 +355,7 @@ def reconcile_instrument_master(
         manifest=manifest,
         path_role="derived",
         frame=output,
-        contract=DERIVED_INSTRUMENT_MASTER_CURRENT_V1,
+        contract=output_contract,
         path_parts=("derived.instrument-master-current", as_of.isoformat()),
         entity_key="current",
         identity=identity,

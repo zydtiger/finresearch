@@ -10,7 +10,7 @@ missing inputs. Every command requires the artifact workspace explicitly.
 finresearch --workspace PATH report markdown CASE_ID --model-run-id RUN_ID
 finresearch --workspace PATH report html CASE_ID --model-run-id RUN_ID
 finresearch --workspace PATH case audit CASE_ID --as-of YYYY-MM-DD \
-  --max-price-age-days N [--verify-hashes]
+  --max-price-age-days N [--max-price-age CLASS=N ...] [--verify-hashes]
 ```
 
 All three commands require a manifest v2 case. Migrate a valid legacy case
@@ -111,6 +111,16 @@ The audit then applies deterministic point-in-time checks:
   (a session on or before the cutoff) must not exceed
   `--max-price-age-days`; a future-only instrument has no valid session and is
   reported separately;
+- the latest price is checked against its asset class's limit: `--max-price-age
+  CLASS=N` (repeatable) overrides `--max-price-age-days` for one class.
+  A price's class resolves from every instrument-master observation on or
+  before the cutoff that has the price's `instrument_id`, or a v3 `provider_ids`
+  entry `yfinance:<provider_symbol>`; `unknown` is ignored, one remaining class
+  applies, two different classes are an `asset_class_conflict`, and none uses
+  the global limit. `crypto` prices age in complete UTC daily bars by default
+  (`age = (D - 1) - latest_session_date` at cutoff date `D`) and a crypto
+  session dated `D` is reported as `price_bar_incomplete`; other classes keep
+  calendar-day age;
 - authenticated model runs may be dated on or before the cutoff; only runs
   after the cutoff are issues; and
 - DCF/comps input rows must resolve to valid evidence or assumption ids whose

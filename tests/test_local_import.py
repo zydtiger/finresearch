@@ -119,7 +119,17 @@ TOKEN_SUPPLY_OVERRIDES: dict[str, object] = {
 
 
 def source_frame(spec: LocalImportSchema) -> pl.DataFrame:
-    overrides = TOKEN_SUPPLY_OVERRIDES if spec.name == "token-supply.v1" else {}
+    overrides: dict[str, object] = {}
+    if spec.name == "token-supply.v1":
+        overrides = TOKEN_SUPPLY_OVERRIDES
+    elif spec.name == "instrument-master.v3":
+        overrides = {
+            "chain": None,
+            "contract_address": None,
+            "token_standard": None,
+            "provider_ids": None,
+            "asset_class_source": "import",
+        }
     return pl.DataFrame(
         [
             {

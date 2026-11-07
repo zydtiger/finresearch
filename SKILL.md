@@ -79,6 +79,12 @@ financial values, peers, evidence, assumptions, or source IDs.
   chose and why). Which definition is authoritative is your judgment; an
   unresolved `conflict` is reported by `case audit` as `token_supply_conflict`,
   so record a resolution instead of ignoring it.
+- Token identity: import `instrument-master.v3` rows (chain, contract address,
+  `provider_ids` such as `coingecko:hyperliquid;yfinance:HYPE32196-USD`,
+  `asset_class_source`). Audit resolves a price's asset class from master
+  observations and applies `--max-price-age CLASS=N`; `crypto` prices age in
+  complete UTC daily bars, so at cutoff D the usable bar is D-1 and a bar dated
+  D is `price_bar_incomplete`. Equity-only cases audit as before.
 - Protocol metrics: `data ingest-defillama SLUG --dataset ...` (repeatable;
   per-protocol keyless summaries) and
   `data ingest-hyperliquid-info --request meta-and-asset-ctxs` capture the

@@ -223,6 +223,13 @@ MaxPriceAgeDaysOption = Annotated[
     int,
     typer.Option("--max-price-age-days", min=0, help="Maximum allowed price age."),
 ]
+MaxPriceAgeClassOption = Annotated[
+    list[str] | None,
+    typer.Option(
+        "--max-price-age",
+        help="Per asset-class maximum price age as CLASS=N, e.g. crypto=0; repeatable.",
+    ),
+]
 VerifyHashesOption = Annotated[
     bool,
     typer.Option(
@@ -330,15 +337,18 @@ def audit_case_command(
     as_of: AsOfOption,
     max_price_age_days: MaxPriceAgeDaysOption,
     verify_hashes: VerifyHashesOption = False,
+    max_price_age: MaxPriceAgeClassOption = None,
 ) -> None:
     """Run read-only point-in-time and registered-byte audit gates."""
     try:
+        limits = parse_class_limits(max_price_age)
         audit = audit_case(
             state_from_context(ctx).workspace,
             case_id,
             as_of=parse_iso_date(as_of, "as_of"),
             max_price_age_days=max_price_age_days,
             verify_hashes=verify_hashes,
+            max_price_age=limits,
         )
     except (CaseContractError, DataContractError, IngestionError, OSError) as exc:
         fail(str(exc))
@@ -1061,6 +1071,19 @@ def print_local_import_receipt(receipt: LocalImportReceipt) -> None:
     typer.echo(f"path: {receipt.normalized.path}")
     typer.echo(f"rows: {receipt.normalized.row_count}")
     typer.echo(f"sha256: {receipt.normalized.sha256}")
+
+
+def parse_class_limits(values: list[str] | None) -> dict[str, int]:
+    """Parse repeated CLASS=N price-age overrides."""
+    limits: dict[str, int] = {}
+    for item in values or ():
+        name, separator, number = item.partition("=")
+        if not separator or not name or not number.isdigit():
+            raise IngestionError(f"--max-price-age must be CLASS=N: {item!r}")
+        if name in limits:
+            raise IngestionError(f"--max-price-age repeats class {name!r}")
+        limits[name] = int(number)
+    return limits
 
 
 def parse_instrument_map(values: list[str] | None) -> dict[str, str] | None:

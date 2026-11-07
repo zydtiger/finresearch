@@ -2101,7 +2101,105 @@ NORMALIZED_PROVIDER_METRIC_DEFINITIONS_V1: Final = DatasetContract(
     semantic_validator=_validate_provider_metric_definitions_v1,
 )
 
+INSTRUMENT_MASTER_V3_NEW_FIELDS: Final[dict[str, pl.DataType | type[pl.DataType]]] = {
+    "chain": pl.String,
+    "contract_address": pl.String,
+    "token_standard": pl.String,
+    "provider_ids": pl.String,
+    "asset_class_source": pl.String,
+}
+TOKEN_STANDARDS: Final = frozenset({"native", "erc20", "spl", "hip1", "other"})
+ASSET_CLASS_SOURCES: Final = frozenset({"provider", "import"})
+_CHAIN_SLUG = re.compile(r"[a-z0-9][a-z0-9-]*")
+
+
+def provider_id_pairs(value: str) -> list[tuple[str, str]]:
+    """Split a ``provider:id;...`` string into pairs, rejecting malformed ones."""
+    pairs: list[tuple[str, str]] = []
+    for item in value.split(";"):
+        provider, separator, identifier = item.partition(":")
+        if not separator or not provider or not identifier:
+            raise DataContractError(f"provider_ids item must be provider:id: {item!r}")
+        pairs.append((provider, identifier))
+    return pairs
+
+
+def _validate_instrument_master_v3(frame: pl.DataFrame) -> None:
+    contract = "normalized.instrument-master.v3"
+    _validate_instrument_master_v2(
+        frame.select(list(NORMALIZED_INSTRUMENT_MASTER_V2_FIELDS))
+    )
+    _validate_enum(frame, contract, "token_standard", TOKEN_STANDARDS)
+    _validate_enum(frame, contract, "asset_class_source", ASSET_CLASS_SOURCES)
+    for row in frame.iter_rows(named=True):
+        token_fields = ("chain", "contract_address", "token_standard")
+        if row["asset_class"] != "crypto" and any(row[f] for f in token_fields):
+            raise _semantic_error(
+                contract, "chain, contract_address, and token_standard require crypto"
+            )
+        if row["contract_address"] is not None and row["chain"] is None:
+            raise _semantic_error(contract, "contract_address requires chain")
+        chain = row["chain"]
+        if chain is not None and _CHAIN_SLUG.fullmatch(chain) is None:
+            raise _semantic_error(contract, "chain must be a lowercase slug")
+        provider_ids = row["provider_ids"]
+        if provider_ids is not None:
+            try:
+                pairs = provider_id_pairs(provider_ids)
+            except DataContractError as exc:
+                raise _semantic_error(contract, str(exc)) from exc
+            providers = [provider for provider, _ in pairs]
+            if len(set(providers)) != len(providers):
+                raise _semantic_error(contract, "provider_ids providers must be unique")
+            if ";".join(f"{a}:{b}" for a, b in sorted(pairs)) != provider_ids:
+                raise _semantic_error(contract, "provider_ids must be sorted")
+
+
+NORMALIZED_INSTRUMENT_MASTER_V3_FIELDS: Final[
+    dict[str, pl.DataType | type[pl.DataType]]
+] = {**NORMALIZED_INSTRUMENT_MASTER_V2_FIELDS, **INSTRUMENT_MASTER_V3_NEW_FIELDS}
+NORMALIZED_INSTRUMENT_MASTER_V3: Final = DatasetContract(
+    name="normalized.instrument-master",
+    version=3,
+    schema=pl.Schema(NORMALIZED_INSTRUMENT_MASTER_V3_FIELDS),
+    non_nullable=(*NORMALIZED_INSTRUMENT_MASTER_V2.non_nullable, "asset_class_source"),
+    unique_key=NORMALIZED_INSTRUMENT_MASTER_V2.unique_key,
+    sort_key=NORMALIZED_INSTRUMENT_MASTER_V2.sort_key,
+    semantic_validator=_validate_instrument_master_v3,
+)
+
+DERIVED_INSTRUMENT_MASTER_CURRENT_V2_FIELDS: Final[
+    dict[str, pl.DataType | type[pl.DataType]]
+] = {**NORMALIZED_INSTRUMENT_MASTER_V3_FIELDS, "as_of": pl.Date}
+
+
+def _validate_reconciled_instrument_master_v2(frame: pl.DataFrame) -> None:
+    _validate_instrument_master_v3(
+        frame.select(list(NORMALIZED_INSTRUMENT_MASTER_V3_FIELDS))
+    )
+    _validate_reconciled_instrument_master_v1(
+        frame.select(list(DERIVED_INSTRUMENT_MASTER_CURRENT_V1_FIELDS))
+    )
+
+
+DERIVED_INSTRUMENT_MASTER_CURRENT_V2: Final = DatasetContract(
+    name="derived.instrument-master-current",
+    version=2,
+    schema=pl.Schema(DERIVED_INSTRUMENT_MASTER_CURRENT_V2_FIELDS),
+    non_nullable=(
+        *DERIVED_INSTRUMENT_MASTER_CURRENT_V1.non_nullable,
+        "asset_class_source",
+    ),
+    unique_key=DERIVED_INSTRUMENT_MASTER_CURRENT_V1.unique_key,
+    sort_key=DERIVED_INSTRUMENT_MASTER_CURRENT_V1.sort_key,
+    semantic_validator=_validate_reconciled_instrument_master_v2,
+)
+
 CONTRACTS: Final = {
+    NORMALIZED_INSTRUMENT_MASTER_V3.identifier: NORMALIZED_INSTRUMENT_MASTER_V3,
+    DERIVED_INSTRUMENT_MASTER_CURRENT_V2.identifier: (
+        DERIVED_INSTRUMENT_MASTER_CURRENT_V2
+    ),
     NORMALIZED_PROTOCOL_METRICS_V1.identifier: NORMALIZED_PROTOCOL_METRICS_V1,
     NORMALIZED_PROVIDER_METRIC_DEFINITIONS_V1.identifier: (
         NORMALIZED_PROVIDER_METRIC_DEFINITIONS_V1
