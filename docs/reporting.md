@@ -117,6 +117,12 @@ The audit then applies deterministic point-in-time checks:
   effective dates are not after the cutoff, while comps input rows must use the
   hash-bound model cutoff.
 
+- the latest `derived.token-supply-reconciliation.v1` per instrument with
+  `as_of` on or before the cutoff must have no `conflict` metric
+  (`token_supply_conflict`), and token supply and market observations cannot
+  be dated after it (`token_supply_after_as_of`, `token_market_after_as_of`);
+- a capture's `content_sha256` must equal its body artifact checksum
+  (`capture_metadata_mismatch`); and
 - evidence `source_ref` tokens `capture:<id>` must name a declared
   `raw.capture.v1` (`register_capture_reference_invalid`) retrieved on or before
   the evidence `observed_at` (`register_capture_after_observed`).

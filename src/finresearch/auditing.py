@@ -201,6 +201,10 @@ def _artifact_audit_issues(
     # violation but cannot make the historical price available at ``as_of``.
     price_dates: dict[str, date] = {}
     price_instruments: set[str] = set()
+    by_id = {artifact.artifact_id: artifact for artifact in artifacts}
+    # instrument -> (as_of, artifact id, conflicting metrics) of the latest
+    # reconciliation dated on or before the cutoff.
+    reconciliations: dict[str, tuple[date, str, list[str]]] = {}
     for artifact in artifacts:
         path = resolve_relative_path(
             case_dir, artifact.path, f"artifact {artifact.artifact_id}"
@@ -230,7 +234,89 @@ def _artifact_audit_issues(
                     if current is None or session > current:
                         price_dates[instrument] = session
         issues.extend(_model_lookahead_issues(case_dir, artifact.kind, frame, as_of))
+        issues.extend(_capture_issues(artifact, frame, by_id))
+        if artifact.kind == "derived.token-supply-reconciliation":
+            _track_reconciliation(artifact.artifact_id, frame, as_of, reconciliations)
+    for instrument, (_, artifact_id, metrics) in sorted(reconciliations.items()):
+        issues.extend(
+            ValidationIssue(
+                "token_supply_conflict",
+                f"instrument {instrument} supply metric {metric} is in conflict "
+                f"in reconciliation {artifact_id}",
+            )
+            for metric in metrics
+        )
     return issues, price_dates, price_instruments
+
+
+def _capture_issues(
+    artifact: Artifact,
+    frame: pl.DataFrame,
+    by_id: dict[str, Artifact],
+) -> list[ValidationIssue]:
+    """Bind a capture row to its own id and its body artifact's checksum."""
+    if artifact.kind != "raw.capture" or not _has_schema(
+        frame,
+        capture_id=pl.String,
+        body_artifact_id=pl.String,
+        content_sha256=pl.String,
+    ):
+        return []
+    issues: list[ValidationIssue] = []
+    for row in frame.iter_rows(named=True):
+        body = by_id.get(row["body_artifact_id"])
+        if row["capture_id"] != artifact.artifact_id:
+            problem = f"capture_id {row['capture_id']!r} is not the artifact id"
+        elif artifact.input_artifact_ids != (row["body_artifact_id"],):
+            problem = "body_artifact_id is not the artifact's only parent"
+        elif body is not None and body.sha256 != row["content_sha256"]:
+            problem = (
+                f"content_sha256 {row['content_sha256']} differs from body "
+                f"artifact checksum {body.sha256}"
+            )
+        else:
+            continue
+        issues.append(
+            ValidationIssue(
+                "capture_metadata_mismatch",
+                f"capture {artifact.artifact_id}: {problem}",
+            )
+        )
+    return issues
+
+
+def _track_reconciliation(
+    artifact_id: str,
+    frame: pl.DataFrame,
+    as_of: date,
+    latest: dict[str, tuple[date, str, list[str]]],
+) -> None:
+    if not _has_schema(
+        frame,
+        instrument_id=pl.String,
+        as_of=pl.Date,
+        supply_metric=pl.String,
+        status=pl.String,
+    ):
+        return
+    rows = frame.select("instrument_id", "as_of", "supply_metric", "status").unique()
+    for instrument in sorted(set(rows["instrument_id"].to_list())):
+        mine = rows.filter(pl.col("instrument_id") == instrument)
+        for cutoff in sorted(set(mine["as_of"].to_list())):
+            if cutoff > as_of:
+                continue
+            current = latest.get(instrument)
+            if current is not None and (current[0], current[1]) >= (
+                cutoff,
+                artifact_id,
+            ):
+                continue
+            conflicts = sorted(
+                mine.filter(
+                    (pl.col("as_of") == cutoff) & (pl.col("status") == "conflict")
+                )["supply_metric"].to_list()
+            )
+            latest[instrument] = (cutoff, artifact_id, conflicts)
 
 
 def _price_freshness_issues(
@@ -287,6 +373,18 @@ def _cutoff_issues(
                 "estimate_available_after_as_of",
             )
         )
+    for token_kind, token_code in (
+        ("normalized.token-supply", "token_supply_after_as_of"),
+        ("normalized.token-market", "token_market_after_as_of"),
+    ):
+        if kind == token_kind:
+            issues.extend(
+                _datetime_cutoff_issues(
+                    artifact_id, frame, "observed_at", as_of, token_code
+                )
+                if _has_date_schema(frame, "observed_at")
+                else []
+            )
     check = checks.get(kind)
     if check is None or not _has_date_schema(frame, check[0]):
         return issues

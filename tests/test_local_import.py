@@ -108,9 +108,25 @@ def _value(name: str, dtype: pl.DataType) -> object | None:
     raise AssertionError(f"missing fixture value for {name}: {dtype}")
 
 
+TOKEN_SUPPLY_OVERRIDES: dict[str, object] = {
+    "supply_metric": "circulating",
+    "unit": "tokens",
+    "observed_at_basis": "provider",
+    "holder_address": None,
+    "holder_label": None,
+    "capture_artifact_id": None,
+}
+
+
 def source_frame(spec: LocalImportSchema) -> pl.DataFrame:
+    overrides = TOKEN_SUPPLY_OVERRIDES if spec.name == "token-supply.v1" else {}
     return pl.DataFrame(
-        [{name: _value(name, dtype) for name, dtype in spec.input_schema.items()}],
+        [
+            {
+                name: overrides[name] if name in overrides else _value(name, dtype)
+                for name, dtype in spec.input_schema.items()
+            }
+        ],
         schema=spec.input_schema,
     )
 

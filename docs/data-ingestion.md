@@ -291,7 +291,7 @@ OHLC ordering, positive FX rates, valid action amounts, and PIT timestamp order.
 
 ```text
 finresearch --workspace PATH data import-csv CASE_ID FILE \
-  --schema instrument-master.v2|daily-prices.v2|fundamental-facts.v2|estimates.v1|corporate-actions.v1|fx-rates.v1|model.comps-observations.v1 \
+  --schema instrument-master.v2|daily-prices.v2|fundamental-facts.v2|estimates.v1|corporate-actions.v1|fx-rates.v1|token-supply.v1|model.comps-observations.v1 \
   --provider PROVIDER --retrieved-at RFC3339_UTC
 
 finresearch --workspace PATH data import-parquet CASE_ID FILE \
@@ -420,6 +420,168 @@ defaults from the file extension (`.json`, `.html`, `.htm`, `.md`, `.txt`,
 `api-response`. Absolute input paths never enter the manifest. A rerun with the
 same bytes and metadata returns the existing receipt; different bytes or
 metadata at the same identity are an integrity error.
+
+## Token supply and market data
+
+Token providers use captures (see [Captures](#captures)) instead of flattened
+Parquet: the CLI writes the exact response bytes, and normalization parses a
+declared capture with a parser selected by `provider` and the URL path or POST
+`type`. The same parser accepts a CLI capture and an agent-registered capture
+of the same endpoint. An unrecognized endpoint fails with the list of
+supported endpoints. All commands require a manifest v2 case and an explicit
+`CASE_ID`; no provider id is mapped to an instrument implicitly.
+
+### Free endpoints and fair access
+
+Adapters use only endpoints that answer without an API key, and the CLI has no
+key option. Each provider has a host-shared file lock that spaces request
+starts across CLI processes: CoinGecko at least 6 seconds, Hyperliquid 0.25
+seconds, DefiLlama 0.5 seconds. Redirects are rejected, timeouts are finite,
+and the response must be 2xx JSON. A provider error is printed verbatim
+(`HTTP <status>: <body>`) and writes nothing.
+
+| Need | Endpoint used |
+| --- | --- |
+| Token supply, price, market cap, FDV | CoinGecko `/coins/{id}`, `/coins/markets`; Hyperliquid `tokenDetails` |
+| Staking | Hyperliquid `validatorSummaries` |
+| Other Hyperliquid state | `metaAndAssetCtxs`, `spotMetaAndAssetCtxs`, `vaultDetails`, `spotClearinghouseState`, `fundingHistory` (capture only) |
+
+```text
+finresearch --workspace PATH data ingest-coingecko-token CASE_ID COIN_ID \
+  [--vs-currency usd]
+finresearch --workspace PATH data ingest-coingecko-markets CASE_ID \
+  --ids COIN_ID[,COIN_ID...] [--vs-currency usd]
+finresearch --workspace PATH data ingest-hyperliquid-info CASE_ID \
+  --request token-details|validator-summaries|meta-and-asset-ctxs|spot-meta-and-asset-ctxs|vault-details|spot-clearinghouse-state|funding-history \
+  [--token-id HEX] [--address HEX] [--coin NAME --start YYYY-MM-DD]
+```
+
+`ingest-coingecko-token` fetches `/api/v3/coins/{COIN_ID}` with localization,
+tickers, community, and developer data disabled and a `vs_currency` query
+parameter (any `QUOTE_ASSETS` code, lowercase on the wire; the parser reads the
+quote back from the URL and defaults to `usd`). `ingest-coingecko-markets`
+fetches `/api/v3/coins/markets` for the sorted, distinct id list (at most 250)
+in one capture. `ingest-hyperliquid-info` POSTs a canonical body to
+`https://api.hyperliquid.xyz/info`: `token-details` requires `--token-id`,
+`vault-details` and `spot-clearinghouse-state` require `--address`, and
+`funding-history` requires `--coin` and `--start` (UTC midnight) and pages
+(500 entries per page) until the retrieval time, one capture per page; every
+other combination fails before any request. All pages of one command share its
+retrieval time.
+
+### normalized.token-supply.v1
+
+One row per provider observation of one supply metric.
+
+| Field | Meaning |
+| --- | --- |
+| `provider`, `instrument_id`, `provider_asset_id` | Provider; case-declared token id; the provider's own id |
+| `supply_metric` | `circulating`, `total`, `max`, `non_circulating`, `staked`, `locked`, `burned`, `future_emissions` |
+| `amount`, `unit` | Finite nonnegative token count; always `tokens` |
+| `definition_id` | Provider field path, e.g. `coingecko.market_data.circulating_supply` |
+| `holder_address`, `holder_label` | Address-level rows only (`non_circulating`, `staked`, `locked`, `burned`); summary rows have NULL |
+| `observed_at`, `observed_at_basis` | Provider as-of time; `provider`, or `retrieval` when the response has no timestamp (then equal to `retrieved_at`) |
+| `retrieved_at`, `normalized_at` | Capture retrieval time, or `--retrieved-at` for imports; never the wall clock |
+| `capture_artifact_id`, `source_artifact_id` | Originating capture (NULL only for imports without one; when present it must be a declared `raw.capture.v1`); parent artifact |
+
+Unique key `(provider, instrument_id, supply_metric, definition_id,
+holder_address, observed_at, source_artifact_id)`; rows are sorted by
+`(instrument_id, supply_metric, provider, observed_at, holder_address,
+definition_id, source_artifact_id)`. Within one provider observation
+`circulating <= total <= max` where present; a violation fails with the values.
+
+### normalized.token-market.v1
+
+Provider market fields for reconciliation and peer multiples: `metric` is
+`price`, `market_cap`, `fdv`, or `volume_24h`; `value` is finite and positive
+(`volume_24h` may be zero); `quote_asset` is from `QUOTE_ASSETS` and `currency`
+is the fiat code or NULL for a stablecoin quote; `fdv_supply_basis` (`total` or
+`max`) is required for `fdv` and NULL otherwise. CoinGecko FDV rows carry
+`total`, the parser's declared reading of the provider definition. Unique key
+`(provider, instrument_id, metric, quote_asset, observed_at,
+source_artifact_id)`.
+
+### Normalization and import
+
+```text
+finresearch --workspace PATH data normalize-token-supply CASE_ID \
+  --capture-artifact-id ID \
+  (--instrument-id ID | --instrument-map PROVIDER_ASSET_ID=INSTRUMENT_ID ...)
+```
+
+`--instrument-id` is for single-asset captures. A multi-asset capture needs one
+`--instrument-map` per asset to normalize: unmapped assets are skipped and
+listed, and a map entry absent from the capture fails.
+
+| Capture | Output rows |
+| --- | --- |
+| CoinGecko `/coins/{id}` | supply `circulating`, `total`, `max` (`observed_at = market_data.last_updated`); market `price`, `market_cap`, `fdv`, `volume_24h` for the URL's quote |
+| CoinGecko `/coins/markets` | Per mapped coin: the same rows with `observed_at = last_updated`; null fields and zero market cap or FDV produce no row |
+| Hyperliquid `tokenDetails` | supply `circulating`, `total`, `max`, `future_emissions`, plus one `non_circulating` row per `nonCirculatingUserBalances` entry; `observed_at_basis = "retrieval"`; `provider_asset_id` is the request's token id |
+| Hyperliquid `validatorSummaries` | one `staked` summary row: the sum of validator `stake` divided by 10^8 (the staking token's wei decimals); `provider_asset_id` is `HYPE` |
+
+CoinGecko `/coins/{id}` and `/coins/markets` rows share the definition ids
+`coingecko.market_data.*`, so one reconciliation policy resolves either.
+Whether a non-circulating balance is burned or held is an agent judgment that
+enters through the model input, not the supply table. Supply rows from web
+pages (for example CoinMarketCap) enter through
+`data import-csv --schema token-supply.v1` with `capture_artifact_id` set to
+the registered `tool-summary` or `web-page` capture; the CSV columns are the
+contract fields except `schema_version`, `provider`, `retrieved_at`,
+`source_artifact_id`, and `normalized_at`, which the import generates.
+
+### Reconciliation
+
+```text
+finresearch --workspace PATH data reconcile-token-supply CASE_ID \
+  --instrument-id ID --as-of YYYY-MM-DD \
+  --policy analysis/token-supply-policy.toml [--source-artifact-id ID ...]
+```
+
+The policy is a strict case-relative TOML whose bytes are hashed into the
+output identity and recorded as the input file `token-supply-policy`:
+
+```toml
+version = 1
+provider_priority = ["hyperliquid", "coingecko", "coinmarketcap"]
+
+[tolerance]           # relative spread (max - min) / min per metric
+circulating = 0.02
+total = 0.01
+max = 0.0
+
+[resolution.circulating]
+provider = "coingecko"
+definition_id = "coingecko.market_data.circulating_supply"
+source_id = "a-circ-definition"
+```
+
+For each `supply_metric` the command takes each provider's latest observation
+with `observed_at` on or before the cutoff date (address-level rows excluded),
+computes `spread = (max - min) / min`, and assigns a status: `single-source`
+(one provider; that row), `agree` (`spread <= tolerance`; the first provider in
+`provider_priority`), `resolved` (`spread > tolerance` and a
+`[resolution.<metric>]` exists; the named provider and definition), or
+`conflict` (no resolution; no row is selected). Failures: a metric observed by
+two or more providers without a tolerance entry; a resolution that is used but
+names an absent observation or a `source_id` that does not resolve to an
+evidence or assumption dated on or before the cutoff; equal-time conflicting
+observations from one provider; a zero minimum with a positive maximum.
+
+`derived.token-supply-reconciliation.v1` has one row per provider observation
+(`instrument_id`, `as_of`, `supply_metric`, `provider`, `definition_id`,
+`observed_at`, `amount`, `min_amount`, `max_amount`, `spread`, `tolerance`,
+`status`, `selected`, `resolution_source_id`, `source_artifact_id`); at most one
+`selected` row per metric and none for a `conflict`. Its parents are the
+supply artifacts it observed; its timestamp is `as_of` at UTC midnight.
+
+`case audit` reports, for the latest reconciliation per instrument with
+`as_of` on or before the audit cutoff, `token_supply_conflict` for every metric
+with status `conflict` (a conflict that no model uses is still reported). It
+also reports `token_supply_after_as_of` and `token_market_after_as_of` for
+observations dated after the cutoff, and `capture_metadata_mismatch` when a
+capture's `content_sha256` differs from its body artifact checksum, or its
+`capture_id` or `body_artifact_id` does not match the artifact id and parent.
 
 ## Research registers
 

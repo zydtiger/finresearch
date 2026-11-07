@@ -236,6 +236,14 @@ belong in `token-inputs.toml`, not in `scenarios.csv`.
 
 ### Token supply
 
+> **Implemented (phase 2)**: see `data-ingestion.md`, "Token supply and market
+> data" (contracts, free endpoints, ingest, normalization, import,
+> reconciliation, and audit codes `token_supply_conflict`,
+> `token_supply_after_as_of`, `token_market_after_as_of`, and
+> `capture_metadata_mismatch`). Everything below under "Token supply" through
+> "Cross-source reconciliation" except protocol metrics is shipped; protocol
+> metrics follow in phase 3.
+
 #### `normalized.token-supply.v1`
 
 One row per provider observation of one supply metric.

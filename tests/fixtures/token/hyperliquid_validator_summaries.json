@@ -1,0 +1,23 @@
+[
+  {
+    "validator": "0x1111111111111111111111111111111111111111",
+    "name": "Alpha",
+    "stake": 20000000000000000,
+    "isJailed": false,
+    "isActive": true
+  },
+  {
+    "validator": "0x2222222222222222222222222222222222222222",
+    "name": "Beta",
+    "stake": 15000000000000000,
+    "isJailed": false,
+    "isActive": true
+  },
+  {
+    "validator": "0x3333333333333333333333333333333333333333",
+    "name": "Gamma",
+    "stake": 8912236100000000,
+    "isJailed": true,
+    "isActive": false
+  }
+]
