@@ -117,6 +117,10 @@ The audit then applies deterministic point-in-time checks:
   effective dates are not after the cutoff, while comps input rows must use the
   hash-bound model cutoff.
 
+- evidence `source_ref` tokens `capture:<id>` must name a declared
+  `raw.capture.v1` (`register_capture_reference_invalid`) retrieved on or before
+  the evidence `observed_at` (`register_capture_after_observed`).
+
 Issue codes and messages are deterministic (for example,
 `price_stale`, `fact_knowledge_after_as_of`, `model_source_after_as_of`,
 `report_identity_invalid`, and `checksum_mismatch`) and printed in code/message

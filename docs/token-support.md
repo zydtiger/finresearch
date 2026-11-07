@@ -1,7 +1,7 @@
 # Token Support Design
 
-Status: proposal for review. Nothing in this document is implemented. Once a
-part ships, its normative text moves into `case-contract.md`,
+Status: partly implemented. Sections marked "Implemented" are normative in
+the docs they point to; the rest remains a proposal. Once a part ships, its normative text moves into `case-contract.md`,
 `data-ingestion.md`, `modeling.md`, or `reporting.md`, and this document is
 reduced to the remaining roadmap.
 
@@ -77,6 +77,10 @@ is linked by `instrument_id`.
 
 ### Units and stablecoin quotes
 
+> **Implemented (phase 1)**: see `data-ingestion.md`, "Canonical contracts and
+> explicit local import". Model token scales, register unit documentation, and
+> peg leaves belong to the later `model token` phase.
+
 Add to the controlled sets in `data_contracts.py`:
 
 | Set | Additions |
@@ -120,6 +124,11 @@ close on the model's price session differs from the declared peg by more than
 a fixed relative 0.005.
 
 ### Web and API captures
+
+> **Implemented (phase 1)**: see `data-ingestion.md`, "Captures", and
+> `case-contract.md`, "Capture artifacts". Provider ingest commands and
+> normalization from captures are phase 2 and 3; multi-id `source_evidence`
+> and `capture:` references are in `data-ingestion.md`, "Research registers".
 
 The trial case saved every API response under `analysis/raw/` with a sidecar
 such as:

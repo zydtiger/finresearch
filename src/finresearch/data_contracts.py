@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import json
 import math
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import date
 from typing import Final
+from urllib.parse import parse_qsl, urlsplit
 
 import polars as pl
 
@@ -384,7 +386,9 @@ ASSET_CLASSES: Final = frozenset(
     }
 )
 PRICE_BASES: Final = frozenset({"unadjusted", "split-adjusted", "total-return"})
-UNIT_KINDS: Final = frozenset({"count", "currency", "ratio", "shares", "text", "other"})
+UNIT_KINDS: Final = frozenset(
+    {"count", "currency", "ratio", "shares", "text", "tokens", "other"}
+)
 FACT_CATEGORIES: Final = frozenset(
     {
         "balance-sheet",
@@ -392,7 +396,9 @@ FACT_CATEGORIES: Final = frozenset(
         "entity",
         "income-statement",
         "other",
+        "protocol-metric",
         "share-data",
+        "token-supply",
     }
 )
 FACT_UNITS: Final = frozenset(
@@ -419,10 +425,27 @@ FACT_UNITS: Final = frozenset(
         "KRW/shares",
         "SGD/shares",
         "USD/shares",
+        "AUD/token",
+        "CAD/token",
+        "CHF/token",
+        "CNY/token",
+        "EUR/token",
+        "GBP/token",
+        "HKD/token",
+        "JPY/token",
+        "KRW/token",
+        "SGD/token",
+        "USD/token",
+        "bps",
         "pure",
         "shares",
+        "tokens",
     }
 )
+# Stablecoins are quote assets, never currencies: every ``currency`` column
+# keeps accepting fiat only.
+STABLECOIN_QUOTE_ASSETS: Final = frozenset({"USDC", "USDH", "USDT"})
+QUOTE_ASSETS: Final = CURRENCY_CODES | STABLECOIN_QUOTE_ASSETS
 CORPORATE_ACTION_TYPES: Final = frozenset({"capital-gain", "dividend", "split"})
 FX_RATE_KINDS: Final = frozenset({"close", "spot"})
 PERIOD_TYPES: Final = frozenset({"duration", "instant"})
@@ -523,6 +546,29 @@ def _validate_daily_prices_v2(frame: pl.DataFrame) -> None:
             )
 
 
+def _validate_new_fact_unit(contract: str, row: dict[str, object]) -> None:
+    """Pair the units added for tokens with a fixed unit kind and currency.
+
+    Pre-existing units are deliberately not re-validated so older artifacts
+    stay valid.
+    """
+    unit = row["unit"]
+    if unit == "tokens":
+        expected_kind, expected_currency = "tokens", None
+    elif unit == "bps":
+        expected_kind, expected_currency = "ratio", None
+    elif isinstance(unit, str) and unit.endswith("/token"):
+        expected_kind, expected_currency = "currency", unit.removesuffix("/token")
+    else:
+        return
+    if row["unit_kind"] != expected_kind or row["currency"] != expected_currency:
+        raise _semantic_error(
+            contract,
+            f"unit {unit!r} requires unit_kind {expected_kind!r} and "
+            f"currency {expected_currency!r}",
+        )
+
+
 def _validate_fundamental_facts_v2(frame: pl.DataFrame) -> None:
     contract = "normalized.fundamental-facts.v2"
     _validate_enum(frame, contract, "unit", FACT_UNITS)
@@ -532,6 +578,7 @@ def _validate_fundamental_facts_v2(frame: pl.DataFrame) -> None:
     for row in frame.iter_rows(named=True):
         if row["currency"] is not None and row["currency"] not in CURRENCY_CODES:
             raise _semantic_error(contract, "currency has an unsupported value")
+        _validate_new_fact_unit(contract, row)
         numeric = row["value"]
         if numeric is not None and not math.isfinite(numeric):
             raise _semantic_error(contract, "value must be finite when present")
@@ -1502,7 +1549,127 @@ MODEL_PROJECTION_ASSESSMENT_V1: Final = DatasetContract(
     semantic_validator=_validate_projection_assessment_v1,
 )
 
+CAPTURE_PROVIDERS: Final = frozenset({"coingecko", "defillama", "hyperliquid", "web"})
+CAPTURE_KINDS: Final = frozenset(
+    {"api-response", "document", "tool-summary", "web-page"}
+)
+CAPTURE_RECORDERS: Final = frozenset({"agent", "cli"})
+_SECRET_QUERY_NAME = re.compile(r"key|token|secret", re.IGNORECASE)
+_SHA256_HEX = re.compile(r"[0-9a-f]{64}")
+
+
+def validate_capture_url(url: str) -> None:
+    """Require an absolute https URL that cannot carry credentials."""
+    try:
+        parsed = urlsplit(url)
+        hostname = parsed.hostname
+        has_userinfo = parsed.username is not None or parsed.password is not None
+        names = [name for name, _ in parse_qsl(parsed.query, keep_blank_values=True)]
+    except ValueError as exc:
+        raise DataContractError(f"capture url is invalid: {exc}") from exc
+    if parsed.scheme != "https" or not hostname:
+        raise DataContractError("capture url must be an absolute https URL")
+    if has_userinfo or "@" in parsed.netloc:
+        raise DataContractError("capture url must not contain credentials")
+    secret_names = sorted(
+        {name for name in names if _SECRET_QUERY_NAME.search(name) is not None}
+    )
+    if secret_names:
+        raise DataContractError(
+            "capture url must not carry secrets; query parameters "
+            f"{secret_names!r} contain key, token, or secret"
+        )
+
+
+def _sorted_json(value: object) -> object:
+    if isinstance(value, dict):
+        return {key: _sorted_json(value[key]) for key in sorted(value)}
+    if isinstance(value, list):
+        return [_sorted_json(item) for item in value]
+    return value
+
+
+def canonical_request_body(text: str) -> str:
+    """Return compact JSON with sorted keys, except a leading ``type`` key."""
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise DataContractError(f"request body must be JSON: {exc}") from exc
+    ordered = _sorted_json(parsed)
+    if isinstance(ordered, dict) and "type" in ordered:
+        ordered = {"type": ordered["type"], **ordered}
+    return json.dumps(
+        ordered, ensure_ascii=True, separators=(",", ":"), allow_nan=False
+    )
+
+
+def _validate_capture_v1(frame: pl.DataFrame) -> None:
+    contract = "raw.capture.v1"
+    _validate_enum(frame, contract, "provider", CAPTURE_PROVIDERS)
+    _validate_enum(frame, contract, "capture_kind", CAPTURE_KINDS)
+    _validate_enum(frame, contract, "recorded_by", CAPTURE_RECORDERS)
+    _validate_enum(frame, contract, "request_method", frozenset({"GET", "POST"}))
+    for row in frame.iter_rows(named=True):
+        try:
+            validate_capture_url(row["url"])
+            body = row["request_body"]
+            if row["request_method"] == "GET" and body is not None:
+                raise DataContractError("GET captures must not have a request_body")
+            if row["request_method"] == "POST":
+                if body is None:
+                    raise DataContractError("POST captures require a request_body")
+                if canonical_request_body(body) != body:
+                    raise DataContractError("request_body must be canonical JSON")
+        except DataContractError as exc:
+            raise _semantic_error(contract, str(exc)) from exc
+        status = row["http_status"]
+        if row["capture_kind"] == "api-response" and status is None:
+            raise _semantic_error(contract, "api-response requires http_status")
+        if status is not None and not 200 <= status <= 299:
+            raise _semantic_error(contract, "http_status must be 2xx")
+        if (
+            "/" not in row["media_type"]
+            or row["media_type"] != row["media_type"].strip()
+        ):
+            raise _semantic_error(contract, "media_type must be a media type")
+        if _SHA256_HEX.fullmatch(row["content_sha256"]) is None:
+            raise _semantic_error(contract, "content_sha256 must be lowercase hex")
+        if row["content_bytes"] < 0:
+            raise _semantic_error(contract, "content_bytes must not be negative")
+
+
+RAW_CAPTURE_V1_FIELDS: Final[dict[str, pl.DataType | type[pl.DataType]]] = {
+    "schema_version": pl.UInt16,
+    "capture_id": pl.String,
+    "body_artifact_id": pl.String,
+    "provider": pl.String,
+    "capture_kind": pl.String,
+    "recorded_by": pl.String,
+    "request_method": pl.String,
+    "url": pl.String,
+    "request_body": pl.String,
+    "http_status": pl.Int16,
+    "media_type": pl.String,
+    "content_sha256": pl.String,
+    "content_bytes": pl.Int64,
+    "retrieved_at": pl.Datetime("us", "UTC"),
+}
+
+RAW_CAPTURE_V1: Final = DatasetContract(
+    name="raw.capture",
+    version=1,
+    schema=pl.Schema(RAW_CAPTURE_V1_FIELDS),
+    non_nullable=tuple(
+        name
+        for name in RAW_CAPTURE_V1_FIELDS
+        if name not in {"request_body", "http_status"}
+    ),
+    unique_key=("capture_id",),
+    semantic_validator=_validate_capture_v1,
+)
+
 CONTRACTS: Final = {
+    RAW_CAPTURE_V1.identifier: RAW_CAPTURE_V1,
     RAW_YFINANCE_DAILY_PRICES_V1.identifier: RAW_YFINANCE_DAILY_PRICES_V1,
     RAW_SEC_SUBMISSIONS_V1.identifier: RAW_SEC_SUBMISSIONS_V1,
     RAW_SEC_COMPANYFACTS_V1.identifier: RAW_SEC_COMPANYFACTS_V1,

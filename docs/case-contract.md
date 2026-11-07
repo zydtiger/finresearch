@@ -159,6 +159,17 @@ identity, content, and declaration returns its existing receipt. Reusing that
 identity with different bytes or metadata is an integrity error; no file or
 manifest entry is overwritten.
 
+## Capture artifacts
+
+Web and API captures live below the raw role at
+`data/raw/captures/<provider>/<capture-key>/<retrieved-at>.<ext>` as a
+non-Parquet `raw.capture-body` artifact (the exact bytes; its `sha256` is the
+content hash) with a one-row `raw.capture.v1` metadata artifact as its child.
+Both are v2 artifacts registered by `data register-capture` or a provider
+ingest command; see [`data-ingestion.md`](data-ingestion.md#captures). Normalized
+tables cite the metadata artifact as `capture_artifact_id`, and
+`evidence.csv` `source_ref` may cite it as `capture:<capture_id>`.
+
 ## Command behavior
 
 ```text
