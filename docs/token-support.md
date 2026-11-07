@@ -414,6 +414,7 @@ One row per provider value of one metric for one period.
 | `instrument_id` | `String` | yes | Value-receiving token when declared |
 | `provider_protocol_id` | `String` | no | e.g. DefiLlama slug `hyperliquid` |
 | `sub_protocol` | `String` | yes | Child or market, e.g. `Hyperliquid Perps`, or perp market `HYPE`; NULL for the provider aggregate |
+| `chain` | `String` | yes | Chain level of a chain-nested breakdown; NULL for aggregate rows and providers without chains |
 | `metric` | `String` | no | Controlled, below |
 | `period_type` | `String` | no | `duration` or `instant` |
 | `period_start` | `Date` | yes | UTC date; required for `duration` |
@@ -438,7 +439,7 @@ Controlled `metric` and allowed units:
 | `open_interest` | fiat (notional) | instant |
 | `funding_rate_1h` | `bps` | instant |
 
-Unique key: `(provider, provider_protocol_id, sub_protocol, metric,
+Unique key: `(provider, provider_protocol_id, sub_protocol, chain, metric,
 period_start, period_end, observed_at, source_artifact_id)`.
 
 Semantic rules: volume, fees, and open interest are nonnegative; revenue

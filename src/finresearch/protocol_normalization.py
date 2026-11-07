@@ -314,13 +314,18 @@ def _parse_defillama(capture: LoadedCapture, payload: object) -> Parsed:
     instant = metric == "open_interest"
 
     def row(
-        sub_protocol: str | None, point_time: object, value: float, label: str
+        chain: str | None,
+        sub_protocol: str | None,
+        point_time: object,
+        value: float,
+        label: str,
     ) -> dict[str, object]:
         observed_at = _bucket(point_time, f"{label}[0]")
         return {
             "provider": "defillama",
             "provider_protocol_id": slug,
             "sub_protocol": sub_protocol,
+            "chain": chain,
             "metric": metric,
             "period_type": "instant" if instant else "duration",
             "period_start": None if instant else observed_at.date(),
@@ -342,7 +347,7 @@ def _parse_defillama(capture: LoadedCapture, payload: object) -> Parsed:
             raise IngestionError(f"{label} must be [timestamp, value]")
         value = json_number(point[1], f"{label}[1]")
         if value is not None:
-            rows.append(row(None, point[0], value, label))
+            rows.append(row(None, None, point[0], value, label))
     breakdown = document.get("totalDataChartBreakdown") or []
     if not isinstance(breakdown, list):
         raise IngestionError("totalDataChartBreakdown must be an array")
@@ -352,12 +357,21 @@ def _parse_defillama(capture: LoadedCapture, payload: object) -> Parsed:
             isinstance(point, list) and len(point) == 2 and isinstance(point[1], dict)
         ):
             raise IngestionError(f"{label} must be [timestamp, {{child: value}}]")
-        for child, raw_value in sorted(point[1].items()):
+        for key, raw_value in sorted(point[1].items()):
             if isinstance(raw_value, dict):
-                raise IngestionError(f"{label}.{child} has an unsupported nested value")
-            value = json_number(raw_value, f"{label}.{child}")
+                # chain -> sub-protocol -> value; chains are never summed.
+                for child, inner in sorted(raw_value.items()):
+                    if isinstance(inner, dict):
+                        raise IngestionError(
+                            f"{label}.{key}.{child} has an unsupported nested value"
+                        )
+                    value = json_number(inner, f"{label}.{key}.{child}")
+                    if value is not None:
+                        rows.append(row(str(key), str(child), point[0], value, label))
+                continue
+            value = json_number(raw_value, f"{label}.{key}")
             if value is not None:
-                rows.append(row(str(child), point[0], value, label))
+                rows.append(row(None, str(key), point[0], value, label))
     return rows, [definition]
 
 
@@ -404,6 +418,7 @@ def _parse_hyperliquid_asset_ctxs(capture: LoadedCapture, payload: object) -> Pa
                     "provider": "hyperliquid",
                     "provider_protocol_id": "hyperliquid",
                     "sub_protocol": name,
+                    "chain": None,
                     "metric": metric,
                     "period_type": "instant" if instant else "duration",
                     "period_start": None if instant else window_start,

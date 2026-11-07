@@ -28,30 +28,42 @@
     [
       1793750400,
       {
-        "Hyperliquid Perps": 1800000.0,
-        "Hyperliquid Spot Orderbook": 400000.0
+        "Hyperliquid L1": {
+          "Hyperliquid Perps": 1800000.0,
+          "Hyperliquid Spot Orderbook": 400000.0
+        }
       }
     ],
     [
       1793836800,
       {
-        "Hyperliquid Perps": 1700000.0,
-        "Hyperliquid Spot Orderbook": 400000.0
+        "Hyperliquid L1": {
+          "Hyperliquid Perps": 1700000.0,
+          "Hyperliquid Spot Orderbook": 400000.0
+        }
       }
     ],
     [
       1793923200,
       {
-        "Hyperliquid Perps": 1900000.0,
-        "Hyperliquid Spot Orderbook": 400000.0
+        "Hyperliquid L1": {
+          "Hyperliquid Perps": 1900000.0,
+          "Hyperliquid Spot Orderbook": 400000.0
+        }
       }
     ],
     [
       1794009600,
       {
-        "Hyperliquid Perps": 900000.0,
-        "Hyperliquid Spot Orderbook": 200000.0
+        "Hyperliquid L1": {
+          "Hyperliquid Perps": 900000.0,
+          "Hyperliquid Spot Orderbook": 200000.0
+        }
       }
     ]
+  ],
+  "childProtocols": [
+    "Hyperliquid Perps",
+    "Hyperliquid Spot Orderbook"
   ]
 }

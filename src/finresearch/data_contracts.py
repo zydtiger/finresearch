@@ -2025,6 +2025,7 @@ NORMALIZED_PROTOCOL_METRICS_V1_FIELDS: Final[
     "instrument_id": pl.String,
     "provider_protocol_id": pl.String,
     "sub_protocol": pl.String,
+    "chain": pl.String,
     "metric": pl.String,
     "period_type": pl.String,
     "period_start": pl.Date,
@@ -2043,6 +2044,7 @@ _PROTOCOL_METRICS_UNIQUE_KEY: Final = (
     "provider",
     "provider_protocol_id",
     "sub_protocol",
+    "chain",
     "metric",
     "period_start",
     "period_end",
@@ -2060,6 +2062,7 @@ NORMALIZED_PROTOCOL_METRICS_V1: Final = DatasetContract(
         not in {
             "instrument_id",
             "sub_protocol",
+            "chain",
             "period_start",
             "currency",
             "capture_artifact_id",

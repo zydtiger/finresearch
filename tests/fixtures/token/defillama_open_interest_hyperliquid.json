@@ -18,5 +18,40 @@
       1794009600,
       1700000000.0
     ]
+  ],
+  "methodology": null,
+  "totalDataChartBreakdown": [
+    [
+      1793750400,
+      {
+        "Hyperliquid L1": {
+          "Hyperliquid Perps": 1500000000.0
+        }
+      }
+    ],
+    [
+      1793836800,
+      {
+        "Hyperliquid L1": {
+          "Hyperliquid Perps": 1600000000.0
+        }
+      }
+    ],
+    [
+      1793923200,
+      {
+        "Hyperliquid L1": {
+          "Hyperliquid Perps": 1550000000.0
+        }
+      }
+    ],
+    [
+      1794009600,
+      {
+        "Hyperliquid L1": {
+          "Hyperliquid Perps": 1700000000.0
+        }
+      }
+    ]
   ]
 }
