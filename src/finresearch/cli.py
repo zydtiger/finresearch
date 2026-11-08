@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
@@ -56,7 +58,7 @@ from finresearch.normalization import (
 from finresearch.protocol_normalization import normalize_protocol_metrics
 from finresearch.providers import ProviderError
 from finresearch.registers import REGISTER_FILES, inspect_registers
-from finresearch.reporting import generate_report
+from finresearch.reporting import ReportReceipt, generate_report
 from finresearch.token_model import run_token
 from finresearch.token_normalization import normalize_token_supply
 from finresearch.token_reconciliation import reconcile_token_supply
@@ -232,6 +234,13 @@ MaxPriceAgeClassOption = Annotated[
         help="Per asset-class maximum price age as CLASS=N, e.g. crypto=0; repeatable.",
     ),
 ]
+JsonOption = Annotated[
+    bool,
+    typer.Option(
+        "--json",
+        help="Print one JSON object per command instead of human-readable text.",
+    ),
+]
 VerifyHashesOption = Annotated[
     bool,
     typer.Option(
@@ -251,12 +260,18 @@ class State:
     workspace: Path
 
 
+_json_output = False
+
+
 @app.callback()
 def configure(
     ctx: typer.Context,
     workspace: WorkspaceOption,
+    json_output: JsonOption = False,
 ) -> None:
     """Require the explicit workspace shared by research commands."""
+    global _json_output
+    _json_output = json_output
     ctx.obj = State(workspace=workspace)
 
 
@@ -280,47 +295,69 @@ def initialize_case_command(
         case_dir = initialize_case(workspace, case_id, title)
     except (CaseContractError, OSError) as exc:
         fail(str(exc))
-    typer.echo(f"created case: {case_id}")
-    typer.echo(f"manifest: {case_dir / 'manifest.toml'}")
+
+    def human() -> None:
+        typer.echo(f"created case: {case_id}")
+        typer.echo(f"manifest: {case_dir / 'manifest.toml'}")
+
+    emit({"case_id": case_id, "manifest": str(case_dir / "manifest.toml")}, human)
 
 
 @case_app.command("status")
 def show_case_status(ctx: typer.Context, case_id: CaseIdArgument) -> None:
     """Show manifest, directory, and artifact state for a case."""
     status = get_case_status(ctx, case_id)
-    typer.echo(f"case: {status.case_id}")
-    typer.echo(f"workspace: {state_from_context(ctx).workspace}")
-    typer.echo(f"manifest: {'valid' if status.manifest_status else 'invalid'}")
-    typer.echo(f"status: {status.manifest_status or 'unknown'}")
-    typer.echo(
-        "directories: "
-        f"{status.required_directories_present}/"
-        f"{status.required_directories_total} required"
+    workspace = state_from_context(ctx).workspace
+
+    def human() -> None:
+        typer.echo(f"case: {status.case_id}")
+        typer.echo(f"workspace: {workspace}")
+        typer.echo(f"manifest: {'valid' if status.manifest_status else 'invalid'}")
+        typer.echo(f"status: {status.manifest_status or 'unknown'}")
+        typer.echo(
+            "directories: "
+            f"{status.required_directories_present}/"
+            f"{status.required_directories_total} required"
+        )
+        typer.echo(
+            "artifacts: "
+            f"{status.artifacts_declared} declared, "
+            f"{status.artifacts_present} present, "
+            f"{status.artifacts_missing} missing"
+        )
+        unused = status.unused_raw_snapshots
+        typer.echo(f"unused raw snapshots: {len(unused)}")
+        for artifact_id in unused:
+            typer.echo(f"  {artifact_id}")
+        typer.echo(f"valid: {'yes' if status.valid else 'no'}")
+
+    emit_validation(
+        {
+            "case_id": status.case_id,
+            "workspace": str(workspace),
+            "manifest_valid": bool(status.manifest_status),
+            "status": status.manifest_status or "unknown",
+            "directories_present": status.required_directories_present,
+            "directories_total": status.required_directories_total,
+            "artifacts_declared": status.artifacts_declared,
+            "artifacts_present": status.artifacts_present,
+            "artifacts_missing": status.artifacts_missing,
+            "unused_raw_snapshots": list(status.unused_raw_snapshots),
+        },
+        status.issues,
+        human,
     )
-    typer.echo(
-        "artifacts: "
-        f"{status.artifacts_declared} declared, "
-        f"{status.artifacts_present} present, "
-        f"{status.artifacts_missing} missing"
-    )
-    unused = status.unused_raw_snapshots
-    typer.echo(f"unused raw snapshots: {len(unused)}")
-    for artifact_id in unused:
-        typer.echo(f"  {artifact_id}")
-    typer.echo(f"valid: {'yes' if status.valid else 'no'}")
-    if not status.valid:
-        print_issues(status.issues)
-        raise typer.Exit(1)
 
 
 @case_app.command("validate")
 def validate_case_command(ctx: typer.Context, case_id: CaseIdArgument) -> None:
     """Validate a case against its versioned contract."""
     status = get_case_status(ctx, case_id)
-    if not status.valid:
-        print_issues(status.issues)
-        raise typer.Exit(1)
-    typer.echo(f"valid case: {case_id}")
+    emit_validation(
+        {"case_id": case_id},
+        status.issues,
+        lambda: None if status.issues else typer.echo(f"valid case: {case_id}"),
+    )
 
 
 @case_app.command("migrate")
@@ -330,10 +367,14 @@ def migrate_case_command(ctx: typer.Context, case_id: CaseIdArgument) -> None:
         receipt = migrate_case(state_from_context(ctx).workspace, case_id)
     except (CaseContractError, OSError) as exc:
         fail(str(exc))
-    if receipt.migrated:
-        typer.echo(f"migrated case manifest to v2: {case_id}")
-    else:
-        typer.echo(f"case manifest already at v2: {case_id}")
+    emit(
+        {"case_id": case_id, "migrated": receipt.migrated},
+        lambda: typer.echo(
+            f"migrated case manifest to v2: {case_id}"
+            if receipt.migrated
+            else f"case manifest already at v2: {case_id}"
+        ),
+    )
 
 
 @case_app.command("audit")
@@ -358,12 +399,17 @@ def audit_case_command(
         )
     except (CaseContractError, DataContractError, IngestionError, OSError) as exc:
         fail(str(exc))
-    typer.echo(f"case: {audit.case_id}")
-    typer.echo(f"as_of: {audit.as_of.isoformat()}")
-    typer.echo(f"valid: {'yes' if audit.valid else 'no'}")
-    if not audit.valid:
-        print_issues(audit.issues)
-        raise typer.Exit(1)
+
+    def human() -> None:
+        typer.echo(f"case: {audit.case_id}")
+        typer.echo(f"as_of: {audit.as_of.isoformat()}")
+        typer.echo(f"valid: {'yes' if audit.valid else 'no'}")
+
+    emit_validation(
+        {"case_id": audit.case_id, "as_of": audit.as_of.isoformat()},
+        audit.issues,
+        human,
+    )
 
 
 @data_app.command("ingest-yfinance-prices")
@@ -391,7 +437,7 @@ def ingest_yfinance_prices_command(
         ProviderError,
     ) as exc:
         fail(str(exc))
-    print_ingestion_receipt(receipt)
+    emit_ingestion_receipt(receipt)
 
 
 @data_app.command("ingest-sec-submissions")
@@ -417,7 +463,7 @@ def ingest_sec_submissions_command(
         ProviderError,
     ) as exc:
         fail(str(exc))
-    print_ingestion_receipt(receipt)
+    emit_ingestion_receipt(receipt)
 
 
 @data_app.command("ingest-sec-companyfacts")
@@ -443,7 +489,7 @@ def ingest_sec_companyfacts_command(
         ProviderError,
     ) as exc:
         fail(str(exc))
-    print_ingestion_receipt(receipt)
+    emit_ingestion_receipt(receipt)
 
 
 @data_app.command("import-csv")
@@ -467,7 +513,7 @@ def import_csv_command(
         )
     except (CaseContractError, DataContractError, IngestionError, OSError) as exc:
         fail(str(exc))
-    print_local_import_receipt(receipt)
+    emit_local_import_receipt(receipt)
 
 
 @data_app.command("import-parquet")
@@ -491,7 +537,7 @@ def import_parquet_command(
         )
     except (CaseContractError, DataContractError, IngestionError, OSError) as exc:
         fail(str(exc))
-    print_local_import_receipt(receipt)
+    emit_local_import_receipt(receipt)
 
 
 @data_app.command("register-capture")
@@ -555,7 +601,7 @@ def register_capture_command(
         )
     except (CaseContractError, DataContractError, IngestionError, OSError) as exc:
         fail(str(exc))
-    print_capture_receipt(receipt)
+    emit_capture_receipt(receipt)
 
 
 VsCurrencyOption = Annotated[
@@ -588,7 +634,7 @@ def ingest_coingecko_token_command(
         ProviderError,
     ) as exc:
         fail(str(exc))
-    print_capture_receipt(receipt)
+    emit_capture_receipt(receipt)
 
 
 @data_app.command("ingest-coingecko-markets")
@@ -616,7 +662,7 @@ def ingest_coingecko_markets_command(
         ProviderError,
     ) as exc:
         fail(str(exc))
-    print_capture_receipt(receipt)
+    emit_capture_receipt(receipt)
 
 
 @data_app.command("ingest-hyperliquid-info")
@@ -660,8 +706,7 @@ def ingest_hyperliquid_info_command(
         ProviderError,
     ) as exc:
         fail(str(exc))
-    for receipt in receipts:
-        print_capture_receipt(receipt)
+    emit_capture_receipts(receipts)
 
 
 @data_app.command("ingest-defillama")
@@ -681,13 +726,15 @@ def ingest_defillama_command(
     ],
 ) -> None:
     """Capture DefiLlama per-protocol summaries (keyless endpoints)."""
+    json_output = json_mode()
+    captured: list[CaptureReceipt] = []
     try:
         ingest_defillama(
             state_from_context(ctx).workspace,
             case_id,
             slug,
             tuple(dataset),
-            report=print_capture_receipt,
+            report=captured.append if json_output else print_capture_receipt,
         )
     except (
         CaseContractError,
@@ -697,6 +744,8 @@ def ingest_defillama_command(
         ProviderError,
     ) as exc:
         fail(str(exc))
+    if json_output:
+        emit_capture_receipts(captured)
 
 
 @data_app.command("normalize-protocol-metrics")
@@ -726,10 +775,20 @@ def normalize_protocol_metrics_command(
         )
     except (CaseContractError, DataContractError, IngestionError, OSError) as exc:
         fail(str(exc))
-    typer.echo("normalized provider-metric-definitions:")
-    print_ingestion_receipt(receipt.definitions)
-    typer.echo("normalized protocol-metrics:")
-    print_ingestion_receipt(receipt.metrics)
+
+    def human() -> None:
+        typer.echo("normalized provider-metric-definitions:")
+        print_ingestion_receipt(receipt.definitions)
+        typer.echo("normalized protocol-metrics:")
+        print_ingestion_receipt(receipt.metrics)
+
+    emit(
+        {
+            "definitions": ingestion_fields(receipt.definitions),
+            "metrics": ingestion_fields(receipt.metrics),
+        },
+        human,
+    )
 
 
 @data_app.command("normalize-token-supply")
@@ -762,13 +821,26 @@ def normalize_token_supply_command(
         )
     except (CaseContractError, DataContractError, IngestionError, OSError) as exc:
         fail(str(exc))
-    typer.echo("normalized token-supply:")
-    print_ingestion_receipt(receipt.supply)
-    if receipt.market is not None:
-        typer.echo("normalized token-market:")
-        print_ingestion_receipt(receipt.market)
-    if receipt.skipped_assets:
-        typer.echo(f"skipped unmapped assets: {', '.join(receipt.skipped_assets)}")
+
+    def human() -> None:
+        typer.echo("normalized token-supply:")
+        print_ingestion_receipt(receipt.supply)
+        if receipt.market is not None:
+            typer.echo("normalized token-market:")
+            print_ingestion_receipt(receipt.market)
+        if receipt.skipped_assets:
+            typer.echo(f"skipped unmapped assets: {', '.join(receipt.skipped_assets)}")
+
+    emit(
+        {
+            "supply": ingestion_fields(receipt.supply),
+            "market": None
+            if receipt.market is None
+            else ingestion_fields(receipt.market),
+            "skipped_assets": list(receipt.skipped_assets),
+        },
+        human,
+    )
 
 
 @data_app.command("reconcile-token-supply")
@@ -795,8 +867,7 @@ def reconcile_token_supply_command(
         )
     except (CaseContractError, DataContractError, IngestionError, OSError) as exc:
         fail(str(exc))
-    typer.echo("reconciled token-supply:")
-    print_ingestion_receipt(receipt)
+    emit_ingestion_receipt(receipt, "reconciled token-supply:")
 
 
 @data_app.command("validate")
@@ -811,11 +882,12 @@ def validate_data_command(
         issues = validate_artifact(workspace, case_id, artifact_id)
     except (CaseContractError, DataValidationError, OSError) as exc:
         fail(str(exc))
-    if issues:
-        print_issues(issues)
-        raise typer.Exit(1)
     target = artifact_id or f"all declared artifacts of {case_id}"
-    typer.echo(f"valid: {target}")
+    emit_validation(
+        {"case_id": case_id, "target": target},
+        issues,
+        lambda: None if issues else typer.echo(f"valid: {target}"),
+    )
 
 
 @data_app.command("inspect")
@@ -831,7 +903,7 @@ def inspect_data_command(
         inspection = inspect_artifact(workspace, case_id, artifact_id, limit)
     except (CaseContractError, DataValidationError, OSError) as exc:
         fail(str(exc))
-    print_artifact_inspection(inspection)
+    emit(inspection_fields(inspection), lambda: print_artifact_inspection(inspection))
 
 
 @data_app.command("normalize-daily-prices")
@@ -865,15 +937,26 @@ def normalize_daily_prices_command(
         OSError,
     ) as exc:
         fail(str(exc))
-    typer.echo("normalized instrument-master:")
-    print_ingestion_receipt(receipt.instrument_master)
-    typer.echo("normalized daily-prices:")
-    print_ingestion_receipt(receipt.daily_prices)
-    typer.echo("normalized corporate-actions:")
-    print_ingestion_receipt(receipt.corporate_actions)
+
+    def human() -> None:
+        typer.echo("normalized instrument-master:")
+        print_ingestion_receipt(receipt.instrument_master)
+        typer.echo("normalized daily-prices:")
+        print_ingestion_receipt(receipt.daily_prices)
+        typer.echo("normalized corporate-actions:")
+        print_ingestion_receipt(receipt.corporate_actions)
+        if receipt.price_gaps is not None:
+            typer.echo("normalized price-gaps:")
+            print_ingestion_receipt(receipt.price_gaps)
+
+    payload: dict[str, object] = {
+        "instrument_master": ingestion_fields(receipt.instrument_master),
+        "daily_prices": ingestion_fields(receipt.daily_prices),
+        "corporate_actions": ingestion_fields(receipt.corporate_actions),
+    }
     if receipt.price_gaps is not None:
-        typer.echo("normalized price-gaps:")
-        print_ingestion_receipt(receipt.price_gaps)
+        payload["price_gaps"] = ingestion_fields(receipt.price_gaps)
+    emit(payload, human)
 
 
 @data_app.command("normalize-fx-rates")
@@ -902,10 +985,20 @@ def normalize_fx_rates_command(
         OSError,
     ) as exc:
         fail(str(exc))
-    typer.echo("normalized fx-rates:")
-    print_ingestion_receipt(receipt.fx_rates)
-    typer.echo("normalized price-gaps:")
-    print_ingestion_receipt(receipt.price_gaps)
+
+    def human() -> None:
+        typer.echo("normalized fx-rates:")
+        print_ingestion_receipt(receipt.fx_rates)
+        typer.echo("normalized price-gaps:")
+        print_ingestion_receipt(receipt.price_gaps)
+
+    emit(
+        {
+            "fx_rates": ingestion_fields(receipt.fx_rates),
+            "price_gaps": ingestion_fields(receipt.price_gaps),
+        },
+        human,
+    )
 
 
 @data_app.command("normalize-fundamental-facts")
@@ -930,8 +1023,7 @@ def normalize_fundamental_facts_command(
         OSError,
     ) as exc:
         fail(str(exc))
-    typer.echo("normalized fundamental-facts:")
-    print_ingestion_receipt(receipt)
+    emit_ingestion_receipt(receipt, "normalized fundamental-facts:")
 
 
 @data_app.command("reconcile-instrument-master")
@@ -956,8 +1048,7 @@ def reconcile_instrument_master_command(
         OSError,
     ) as exc:
         fail(str(exc))
-    typer.echo("reconciled instrument-master:")
-    print_ingestion_receipt(receipt)
+    emit_ingestion_receipt(receipt, "reconciled instrument-master:")
 
 
 @model_app.command("dcf")
@@ -985,7 +1076,7 @@ def model_dcf_command(
         OSError,
     ) as exc:
         fail(str(exc))
-    print_model_run(receipt)
+    emit_model_run(receipt)
 
 
 @model_app.command("token")
@@ -1016,7 +1107,7 @@ def model_token_command(
         OSError,
     ) as exc:
         fail(str(exc))
-    print_model_run(receipt)
+    emit_model_run(receipt)
 
 
 @model_app.command("comps")
@@ -1046,7 +1137,7 @@ def model_comps_command(
         OSError,
     ) as exc:
         fail(str(exc))
-    print_model_run(receipt)
+    emit_model_run(receipt)
 
 
 @model_app.command("projection-assess")
@@ -1070,7 +1161,7 @@ def model_projection_assess_command(
         OSError,
     ) as exc:
         fail(str(exc))
-    print_model_run(receipt)
+    emit_model_run(receipt)
 
 
 @report_app.command("markdown")
@@ -1097,18 +1188,32 @@ def show_registers_status(ctx: typer.Context, case_id: CaseIdArgument) -> None:
         status = inspect_registers(workspace, case_id)
     except (CaseContractError, OSError) as exc:
         fail(str(exc))
-    typer.echo(f"case: {status.case_id}")
-    typer.echo(
-        f"registers: {status.registers_present}/{status.registers_total} present"
+
+    def human() -> None:
+        typer.echo(f"case: {status.case_id}")
+        typer.echo(
+            f"registers: {status.registers_present}/{status.registers_total} present"
+        )
+        for filename in REGISTER_FILES:
+            count = status.row_counts.get(filename, 0)
+            if count:
+                typer.echo(f"{filename}: {count} rows")
+        typer.echo(f"valid: {'yes' if status.valid else 'no'}")
+
+    emit_validation(
+        {
+            "case_id": status.case_id,
+            "registers_present": status.registers_present,
+            "registers_total": status.registers_total,
+            "row_counts": {
+                name: status.row_counts[name]
+                for name in REGISTER_FILES
+                if status.row_counts.get(name, 0)
+            },
+        },
+        status.issues,
+        human,
     )
-    for filename in REGISTER_FILES:
-        count = status.row_counts.get(filename, 0)
-        if count:
-            typer.echo(f"{filename}: {count} rows")
-    typer.echo(f"valid: {'yes' if status.valid else 'no'}")
-    if not status.valid:
-        print_issues(status.issues)
-        raise typer.Exit(1)
 
 
 def get_case_status(ctx: typer.Context, case_id: str) -> CaseStatus:
@@ -1152,6 +1257,160 @@ def print_local_import_receipt(receipt: LocalImportReceipt) -> None:
     typer.echo(f"path: {receipt.normalized.path}")
     typer.echo(f"rows: {receipt.normalized.row_count}")
     typer.echo(f"sha256: {receipt.normalized.sha256}")
+
+
+def ingestion_fields(receipt: IngestionReceipt) -> dict[str, object]:
+    """Return the JSON form of the fields print_ingestion_receipt shows."""
+    return {
+        "artifact_id": receipt.artifact_id,
+        "path": str(receipt.path),
+        "row_count": receipt.row_count,
+        "sha256": receipt.sha256,
+    }
+
+
+def capture_fields(receipt: CaptureReceipt) -> dict[str, object]:
+    """Return the JSON form of the fields print_capture_receipt shows."""
+    return {
+        "capture_id": receipt.capture_id,
+        "body_artifact_id": receipt.body_artifact_id,
+        "path": str(receipt.body_path),
+        "sha256": receipt.content_sha256,
+    }
+
+
+def inspection_fields(inspection: ArtifactInspection) -> dict[str, object]:
+    """Return the JSON form of the facts print_artifact_inspection shows."""
+    return {
+        "artifact_id": inspection.artifact_id,
+        "contract": inspection.contract_identifier,
+        "path": inspection.path,
+        "size": inspection.size,
+        "sha256": inspection.sha256,
+        "row_count": inspection.row_count,
+        "provider": inspection.provider,
+        "provider_symbol": inspection.provider_symbol,
+        "cik": inspection.cik,
+        "source_url": inspection.source_url,
+        "columns": [
+            {"name": column.name, "dtype": column.dtype}
+            for column in inspection.columns
+        ],
+        "date_ranges": [
+            {"name": item.name, "minimum": item.minimum, "maximum": item.maximum}
+            for item in inspection.date_ranges
+        ],
+        "nulls": {null.name: null.count for null in inspection.nulls},
+        "duplicate_key_rows": inspection.duplicate_key_rows,
+        "preview": None
+        if inspection.preview_json is None
+        else json.loads(inspection.preview_json),
+    }
+
+
+def json_mode() -> bool:
+    """Return whether the running command was invoked with the root --json flag."""
+    return _json_output
+
+
+def emit(payload: dict[str, object], human: Callable[[], object]) -> None:
+    """Print one JSON object with --json, otherwise run the human printer."""
+    if json_mode():
+        typer.echo(json.dumps({"ok": True, **payload}))
+    else:
+        human()
+
+
+def emit_validation(
+    payload: dict[str, object],
+    issues: tuple[ValidationIssue, ...],
+    human: Callable[[], object],
+) -> None:
+    """Emit a validation result; issues also go to stderr and exit nonzero."""
+    if json_mode():
+        typer.echo(
+            json.dumps(
+                {
+                    **payload,
+                    "ok": not issues,
+                    "issues": [
+                        {"code": issue.code, "message": issue.message}
+                        for issue in issues
+                    ],
+                }
+            )
+        )
+    else:
+        human()
+    if issues:
+        print_issues(issues)
+        raise typer.Exit(1)
+
+
+def emit_ingestion_receipt(
+    receipt: IngestionReceipt, heading: str | None = None
+) -> None:
+    """Emit one ingestion receipt, optionally under a human-only heading."""
+
+    def human() -> None:
+        if heading is not None:
+            typer.echo(heading)
+        print_ingestion_receipt(receipt)
+
+    emit(ingestion_fields(receipt), human)
+
+
+def emit_capture_receipt(receipt: CaptureReceipt) -> None:
+    """Emit one registered capture receipt."""
+    emit(capture_fields(receipt), lambda: print_capture_receipt(receipt))
+
+
+def emit_capture_receipts(receipts: Sequence[CaptureReceipt]) -> None:
+    """Emit several capture receipts as one JSON object."""
+
+    def human() -> None:
+        for receipt in receipts:
+            print_capture_receipt(receipt)
+
+    emit({"captures": [capture_fields(receipt) for receipt in receipts]}, human)
+
+
+def emit_local_import_receipt(receipt: LocalImportReceipt) -> None:
+    """Emit the raw and normalized outputs of one local import."""
+    emit(
+        {
+            "raw": {
+                "artifact_id": receipt.raw.artifact_id,
+                "path": str(receipt.raw.path),
+                "sha256": receipt.raw.sha256,
+            },
+            "normalized": {
+                "artifact_id": receipt.normalized.artifact_id,
+                "path": str(receipt.normalized.path),
+                "row_count": receipt.normalized.row_count,
+                "sha256": receipt.normalized.sha256,
+            },
+        },
+        lambda: print_local_import_receipt(receipt),
+    )
+
+
+def emit_report_receipt(receipt: ReportReceipt) -> None:
+    """Emit one rendered report receipt."""
+
+    def human() -> None:
+        typer.echo(f"artifact: {receipt.artifact_id}")
+        typer.echo(f"path: {receipt.path}")
+        typer.echo(f"sha256: {receipt.sha256}")
+
+    emit(
+        {
+            "artifact_id": receipt.artifact_id,
+            "path": str(receipt.path),
+            "sha256": receipt.sha256,
+        },
+        human,
+    )
 
 
 def parse_class_limits(values: list[str] | None) -> dict[str, int]:
@@ -1210,15 +1469,25 @@ def parse_dcf_sensitivity(
     return waccs, growths
 
 
-def print_model_run(run: object) -> None:
-    """Print only stable run/artifact identifiers for all model commands."""
+def emit_model_run(run: object) -> None:
+    """Emit only stable run/artifact identifiers for all model commands."""
     from finresearch.modeling import ModelRun
 
     if not isinstance(run, ModelRun):
         raise RuntimeError("unexpected model receipt")
-    typer.echo(f"run_id: {run.run_id}")
-    for receipt in run.receipts:
-        typer.echo(f"artifact: {receipt.artifact_id}")
+
+    def human() -> None:
+        typer.echo(f"run_id: {run.run_id}")
+        for receipt in run.receipts:
+            typer.echo(f"artifact: {receipt.artifact_id}")
+
+    emit(
+        {
+            "run_id": run.run_id,
+            "artifacts": [receipt.artifact_id for receipt in run.receipts],
+        },
+        human,
+    )
 
 
 def _render_report_command(
@@ -1241,9 +1510,7 @@ def _render_report_command(
         OSError,
     ) as exc:
         fail(str(exc))
-    typer.echo(f"artifact: {receipt.artifact_id}")
-    typer.echo(f"path: {receipt.path}")
-    typer.echo(f"sha256: {receipt.sha256}")
+    emit_report_receipt(receipt)
 
 
 def print_artifact_inspection(inspection: ArtifactInspection) -> None:
@@ -1286,6 +1553,8 @@ def print_artifact_inspection(inspection: ArtifactInspection) -> None:
 
 def fail(message: str) -> NoReturn:
     """Exit a command with a concise contract error."""
+    if json_mode():
+        typer.echo(json.dumps({"ok": False, "error": message}))
     typer.echo(f"error: {message}", err=True)
     raise typer.Exit(1)
 
