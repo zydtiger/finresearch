@@ -199,6 +199,39 @@ def test_non_distinct_scenario_values_are_rejected(register_case: Path) -> None:
     assert any(issue.code == "scenario_not_distinct" for issue in status.issues)
 
 
+def _scenario_rows(*rows: tuple[str, str, str]) -> list[dict[str, str]]:
+    return [
+        {
+            "scenario": scenario,
+            "parameter": parameter,
+            "value": value,
+            "unit": "pct",
+            "rationale": "r",
+        }
+        for scenario, parameter, value in rows
+    ]
+
+
+def test_all_row_fixes_a_parameter_across_scenarios(register_case: Path) -> None:
+    case_dir = register_case / "cases" / "aapl"
+    rows = VALID_REGISTERS["scenarios.csv"] + _scenario_rows(("all", "tax", "0.21"))
+    write_registers(case_dir, {"scenarios.csv": rows})
+
+    assert inspect_registers(register_case, "aapl").valid
+
+
+def test_all_row_cannot_mix_with_scenario_rows(register_case: Path) -> None:
+    case_dir = register_case / "cases" / "aapl"
+    rows = VALID_REGISTERS["scenarios.csv"] + _scenario_rows(
+        ("all", "tax", "0.21"), ("bear", "tax", "0.25")
+    )
+    write_registers(case_dir, {"scenarios.csv": rows})
+
+    status = inspect_registers(register_case, "aapl")
+
+    assert [i.code for i in status.issues] == ["scenario_fixed_conflict"]
+
+
 def test_dangling_evidence_reference_is_rejected(register_case: Path) -> None:
     case_dir = register_case / "cases" / "aapl"
     rows = [dict(row) for row in VALID_REGISTERS["assumptions.csv"]]

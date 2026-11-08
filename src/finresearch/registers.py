@@ -34,6 +34,7 @@ REGISTER_FILES: Final = (
 )
 
 SCENARIOS: Final = ("bear", "base", "bull")
+FIXED_SCENARIO: Final = "all"
 SOURCE_TYPES: Final = ("filing", "estimate", "external", "assumption")
 IMPACTS: Final = ("positive", "negative", "neutral")
 IMPORTANCES: Final = ("high", "medium", "low")
@@ -75,7 +76,7 @@ REGISTER_SPECS: Final = {
     "scenarios.csv": RegisterSpec(
         name="scenarios",
         columns={
-            "scenario": ("enum", SCENARIOS),
+            "scenario": ("enum", (*SCENARIOS, FIXED_SCENARIO)),
             "parameter": "text",
             "value": "text",
             "unit": "text",
@@ -479,13 +480,23 @@ def _validate_scenario_completeness(registers_dir: Path) -> list[ValidationIssue
         value = row.get("value", "")
         if not scenario or not parameter:
             continue
-        if scenario not in SCENARIOS:
+        if scenario not in (*SCENARIOS, FIXED_SCENARIO):
             continue
         if scenario in parameters.setdefault(parameter, {}):
             continue
         parameters[parameter][scenario] = value
     issues: list[ValidationIssue] = []
     for parameter, values in sorted(parameters.items()):
+        if FIXED_SCENARIO in values:
+            if len(values) > 1:
+                issues.append(
+                    ValidationIssue(
+                        "scenario_fixed_conflict",
+                        f"scenarios.csv parameter {parameter!r} has an "
+                        f"{FIXED_SCENARIO!r} row and per-scenario rows",
+                    )
+                )
+            continue
         missing = [s for s in SCENARIOS if s not in values]
         if missing:
             issues.append(
