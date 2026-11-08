@@ -19,7 +19,7 @@ from finresearch.cases import (
     initialize_case,
     read_manifest,
 )
-from finresearch.data_contracts import RAW_YFINANCE_DAILY_PRICES_V1
+from finresearch.data_contracts import RAW_YFINANCE_DAILY_PRICES_V2
 from finresearch.ingestion import (
     IngestionError,
     ingest_sec_companyfacts,
@@ -48,10 +48,11 @@ def valid_price_frame(
     return pl.DataFrame(
         [
             {
-                "schema_version": 1,
+                "schema_version": 2,
                 "provider": "yfinance",
                 "provider_symbol": symbol,
                 "currency": "USD",
+                "quote_type": "EQUITY",
                 "retrieved_at": retrieved_at,
                 "requested_start": start,
                 "requested_end": end,
@@ -70,7 +71,7 @@ def valid_price_frame(
                 "capital_gains": None,
             }
         ],
-        schema=RAW_YFINANCE_DAILY_PRICES_V1.schema,
+        schema=RAW_YFINANCE_DAILY_PRICES_V2.schema,
     )
 
 
@@ -220,11 +221,12 @@ def test_ingestion_writes_parquet_and_registers_provenance(tmp_path: Path) -> No
     stored = pl.read_parquet(receipt.path)
     assert stored.height == 1
     assert stored.get_column("provider_symbol").to_list() == ["AAPL"]
+    assert stored.get_column("quote_type").to_list() == ["EQUITY"]
 
     artifact = read_manifest(case_dir).artifacts[0]
     assert artifact.artifact_id == receipt.artifact_id
     assert artifact.kind == "raw.yfinance.daily-prices"
-    assert artifact.schema_version == 1
+    assert artifact.schema_version == 2
     assert artifact.path == receipt.path.relative_to(case_dir).as_posix()
     assert artifact.source is None
     assert artifact.input_artifact_ids == ()
@@ -317,7 +319,7 @@ def test_publish_snapshot_rejects_legacy_source_for_v2_without_changes(
             manifest=manifest,
             path_role="raw",
             frame=frame,
-            contract=RAW_YFINANCE_DAILY_PRICES_V1,
+            contract=RAW_YFINANCE_DAILY_PRICES_V2,
             path_parts=("test",),
             entity_key="aapl",
             identity="source-rejected",

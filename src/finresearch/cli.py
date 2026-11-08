@@ -839,6 +839,14 @@ def normalize_daily_prices_command(
     case_id: CaseIdArgument,
     symbol: SymbolArgument,
     raw_artifact_id: RawArtifactOption = None,
+    null_bars: Annotated[
+        str,
+        typer.Option(
+            "--null-bars",
+            help="fail (default) on bars with NULL OHLC, or drop them and "
+            "publish normalized.price-gaps.",
+        ),
+    ] = "fail",
 ) -> None:
     """Derive instrument-master and daily-prices artifacts from one raw snapshot."""
     try:
@@ -847,6 +855,7 @@ def normalize_daily_prices_command(
             case_id,
             symbol,
             raw_artifact_id=raw_artifact_id,
+            null_bars=null_bars,
         )
     except (
         CaseContractError,
@@ -861,6 +870,9 @@ def normalize_daily_prices_command(
     print_ingestion_receipt(receipt.daily_prices)
     typer.echo("normalized corporate-actions:")
     print_ingestion_receipt(receipt.corporate_actions)
+    if receipt.price_gaps is not None:
+        typer.echo("normalized price-gaps:")
+        print_ingestion_receipt(receipt.price_gaps)
 
 
 @data_app.command("normalize-fundamental-facts")

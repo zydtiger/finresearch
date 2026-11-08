@@ -20,12 +20,15 @@ from finresearch.cli import app
 from finresearch.data_contracts import (
     NORMALIZED_DAILY_PRICES_V2,
     NORMALIZED_INSTRUMENT_MASTER_V2,
+    NORMALIZED_PRICE_GAPS_V1,
     RAW_YFINANCE_DAILY_PRICES_V1,
+    RAW_YFINANCE_DAILY_PRICES_V2,
 )
 from finresearch.ingestion import (
     ArtifactIntegrityError,
     IngestionError,
     ingest_yfinance_daily_prices,
+    persist_snapshot,
     publish_snapshot,
 )
 from finresearch.normalization import (
@@ -53,8 +56,10 @@ def price_frame(
     duplicate_session: bool = False,
     null_close: bool = False,
     currency: str = "USD",
+    quote_type: str | None = None,
+    null_ohlc: dict[int, tuple[str, ...]] | None = None,
 ) -> pl.DataFrame:
-    """Build a raw-contract frame with the requested shape."""
+    """Build a raw frame; ``quote_type=None`` builds a v1 snapshot."""
     sessions: list[dict[str, object]] = []
     for index in range(rows):
         session_date = date(2026, 1, 2 + index)
@@ -75,6 +80,7 @@ def price_frame(
                 "high": 102.0,
                 "low": 99.0,
                 "close": None if null_close else 101.0,
+                **{name: None for name in (null_ohlc or {}).get(index, ())},
                 "adj_close": 100.5,
                 "volume": 1_000,
                 "dividends": 0.0,
@@ -89,7 +95,12 @@ def price_frame(
                 "timestamp": datetime(2026, 1, 2, 5, 30, tzinfo=UTC),
             }
         )
-    return pl.DataFrame(sessions, schema=RAW_YFINANCE_DAILY_PRICES_V1.schema)
+    if quote_type is None:
+        return pl.DataFrame(sessions, schema=RAW_YFINANCE_DAILY_PRICES_V1.schema)
+    v2_sessions = [
+        {**row, "schema_version": 2, "quote_type": quote_type} for row in sessions
+    ]
+    return pl.DataFrame(v2_sessions, schema=RAW_YFINANCE_DAILY_PRICES_V2.schema)
 
 
 class FakePriceProvider:
@@ -117,26 +128,43 @@ def build_raw_case(
     null_close: bool = False,
     snapshots: int = 1,
     currency: str = "USD",
+    quote_type: str | None = None,
+    null_ohlc: dict[int, tuple[str, ...]] | None = None,
 ) -> Path:
-    """Ingest one or more raw snapshots through the real ingestion path."""
-    initialize_case(tmp_path, "aapl")
+    """Register raw snapshots: v2 through ingestion, v1 (no quote_type) directly."""
+    case_dir = initialize_case(tmp_path, "aapl")
     for index in range(snapshots):
+        frame = price_frame(
+            symbol=symbol,
+            rows=rows,
+            duplicate_session=duplicate_session,
+            null_close=null_close,
+            currency=currency,
+            quote_type=quote_type,
+            null_ohlc=null_ohlc,
+        )
+        retrieved_at = RETRIEVED_AT.replace(minute=index)
+        if quote_type is None:
+            persist_snapshot(
+                case_dir=case_dir,
+                manifest=read_manifest(case_dir),
+                path_role="raw",
+                frame=frame.with_columns(pl.lit(retrieved_at).alias("retrieved_at")),
+                contract=RAW_YFINANCE_DAILY_PRICES_V1,
+                provider="yfinance",
+                path_parts=("yfinance", "daily-prices", symbol.lower()),
+                entity_key=symbol.lower(),
+                retrieved_at=retrieved_at,
+            )
+            continue
         ingest_yfinance_daily_prices(
             tmp_path,
             "aapl",
             symbol,
             date(2026, 1, 1),
             date(2026, 1, 8),
-            provider=FakePriceProvider(
-                price_frame(
-                    symbol=symbol,
-                    rows=rows,
-                    duplicate_session=duplicate_session,
-                    null_close=null_close,
-                    currency=currency,
-                )
-            ),
-            retrieved_at=RETRIEVED_AT.replace(minute=index),
+            provider=FakePriceProvider(frame),
+            retrieved_at=retrieved_at,
         )
     return tmp_path
 
@@ -649,3 +677,188 @@ def test_normalize_cli_failure_exits_nonzero(tmp_path: Path) -> None:
 
     assert result.exit_code == 1
     assert "no raw yfinance daily-prices snapshot" in result.output
+
+
+def master_rows(workspace: Path) -> list[dict[str, Any]]:
+    manifest = read_manifest(workspace / "cases" / "aapl")
+    artifact = next(
+        a for a in manifest.artifacts if a.kind == "normalized.instrument-master"
+    )
+    return pl.read_parquet(workspace / "cases" / "aapl" / artifact.path).to_dicts()
+
+
+@pytest.mark.parametrize(
+    ("quote_type", "asset_class"),
+    [
+        ("CRYPTOCURRENCY", "crypto"),
+        ("EQUITY", "equity"),
+        ("ETF", "etf"),
+        ("CURRENCY", "fx"),
+        ("INDEX", "index"),
+        ("MUTUALFUND", "unknown"),
+    ],
+)
+def test_v2_raw_quote_type_sets_provider_asset_class(
+    tmp_path: Path, quote_type: str, asset_class: str
+) -> None:
+    workspace = build_raw_case(tmp_path, quote_type=quote_type)
+    normalize_daily_prices(workspace, "aapl", SYMBOL, normalized_at=NORMALIZED_AT)
+
+    manifest = read_manifest(workspace / "cases" / "aapl")
+    master = next(
+        a for a in manifest.artifacts if a.kind == "normalized.instrument-master"
+    )
+    assert master.schema_version == 3
+    (row,) = master_rows(workspace)
+    assert row["asset_class"] == asset_class
+    assert row["asset_class_source"] == "provider"
+    assert row["provider_ids"] is None
+
+
+def test_v1_raw_still_normalizes_to_unknown_v2_master(tmp_path: Path) -> None:
+    workspace = build_raw_case(tmp_path)
+    normalize_daily_prices(workspace, "aapl", SYMBOL, normalized_at=NORMALIZED_AT)
+
+    manifest = read_manifest(workspace / "cases" / "aapl")
+    master = next(
+        a for a in manifest.artifacts if a.kind == "normalized.instrument-master"
+    )
+    assert master.schema_version == 2
+    assert master_rows(workspace)[0]["asset_class"] == "unknown"
+
+
+def test_audit_ages_crypto_in_complete_bars_from_provider_class_alone(
+    tmp_path: Path,
+) -> None:
+    def audit(*extra: str) -> Result:
+        return invoke(
+            workspace, "case", "audit", "aapl", "--as-of", "2026-01-03",
+            "--max-price-age-days", "5", *extra,
+        )  # fmt: skip
+
+    audit_time = datetime(2026, 1, 3, tzinfo=UTC)
+    workspace = build_raw_case(tmp_path, quote_type="CRYPTOCURRENCY")
+    normalize_daily_prices(workspace, "aapl", SYMBOL, normalized_at=audit_time)
+
+    # The 2026-01-02 bar is the latest complete bar on 2026-01-03: age 0.
+    assert audit("--max-price-age", "crypto=0").exit_code == 0
+
+    equity = tmp_path / "equity"
+    workspace = build_raw_case(equity, quote_type="EQUITY")
+    normalize_daily_prices(workspace, "aapl", SYMBOL, normalized_at=audit_time)
+    stale = audit("--max-price-age", "equity=0")
+    assert stale.exit_code == 1 and "[price_stale]" in stale.output
+
+
+def test_null_bars_drop_publishes_gaps_and_keeps_bars(tmp_path: Path) -> None:
+    workspace = build_raw_case(
+        tmp_path,
+        rows=3,
+        null_ohlc={1: ("open", "high", "low", "close"), 2: ("close", "high")},
+    )
+    receipt = normalize_daily_prices(
+        workspace, "aapl", SYMBOL, normalized_at=NORMALIZED_AT, null_bars="drop"
+    )
+
+    assert receipt.price_gaps is not None
+    gaps = pl.read_parquet(receipt.price_gaps.path)
+    NORMALIZED_PRICE_GAPS_V1.validate(gaps)
+    assert gaps.select("session_date", "null_fields", "reason").rows() == [
+        (date(2026, 1, 3), "close,high,low,open", "null_ohlc"),
+        (date(2026, 1, 4), "close,high", "null_ohlc"),
+    ]
+    assert set(gaps["instrument_id"]) == {INSTRUMENT_ID}
+    assert set(gaps["source_artifact_id"]) == {
+        read_manifest(workspace / "cases" / "aapl").artifacts[0].artifact_id
+    }
+    prices = pl.read_parquet(receipt.daily_prices.path)
+    assert prices["session_date"].to_list() == [date(2026, 1, 2)]
+    assert invoke(workspace, "data", "validate", "aapl").exit_code == 0
+
+
+def test_null_bars_drop_without_gaps_publishes_empty_artifact(
+    tmp_path: Path,
+) -> None:
+    workspace = build_raw_case(tmp_path, rows=2)
+    receipt = normalize_daily_prices(
+        workspace, "aapl", SYMBOL, normalized_at=NORMALIZED_AT, null_bars="drop"
+    )
+    assert receipt.price_gaps is not None
+    assert pl.read_parquet(receipt.price_gaps.path).is_empty()
+    assert pl.read_parquet(receipt.daily_prices.path).height == 2
+
+
+def test_null_bars_fail_is_default_and_publishes_no_gaps(tmp_path: Path) -> None:
+    workspace = build_raw_case(tmp_path, rows=2, null_ohlc={0: ("open",)})
+    with pytest.raises(IngestionError, match="cannot be normalized"):
+        normalize_daily_prices(workspace, "aapl", SYMBOL, normalized_at=NORMALIZED_AT)
+    with pytest.raises(IngestionError, match="null_bars must be"):
+        normalize_daily_prices(
+            workspace, "aapl", SYMBOL, normalized_at=NORMALIZED_AT, null_bars="skip"
+        )
+
+
+def test_null_bars_drop_still_fails_inconsistent_ohlc(tmp_path: Path) -> None:
+    workspace = build_raw_case(tmp_path, rows=2, null_ohlc={0: ("close",)})
+    path = next(
+        workspace.joinpath("cases", "aapl").rglob("daily-prices/aapl/*.parquet")
+    )
+    frame = pl.read_parquet(path).with_columns(
+        pl.when(pl.col("session_date") == date(2026, 1, 3))
+        .then(pl.lit(150.0))
+        .otherwise(pl.col("low"))
+        .alias("low")
+    )
+    frame.write_parquet(path)
+    manifest = read_manifest(workspace / "cases" / "aapl")
+    write_manifest(
+        workspace / "cases" / "aapl",
+        manifest.__class__(
+            **{
+                **manifest.__dict__,
+                "artifacts": tuple(
+                    a.__class__(
+                        **{
+                            **a.__dict__,
+                            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                        }
+                    )
+                    for a in manifest.artifacts
+                ),
+            }
+        ),
+    )
+    with pytest.raises(IngestionError, match="low must not exceed"):
+        normalize_daily_prices(
+            workspace, "aapl", SYMBOL, normalized_at=NORMALIZED_AT, null_bars="drop"
+        )
+
+
+def test_null_bars_drop_has_distinct_prices_identity(tmp_path: Path) -> None:
+    workspace = build_raw_case(tmp_path)
+    failed = normalize_daily_prices(
+        workspace, "aapl", SYMBOL, normalized_at=NORMALIZED_AT
+    )
+    dropped = normalize_daily_prices(
+        workspace, "aapl", SYMBOL, normalized_at=NORMALIZED_AT, null_bars="drop"
+    )
+    assert dropped.daily_prices.artifact_id != failed.daily_prices.artifact_id
+    assert dropped.instrument_master.artifact_id == failed.instrument_master.artifact_id
+
+
+def test_normalize_cli_null_bars_option(tmp_path: Path) -> None:
+    workspace = build_raw_case(tmp_path, null_ohlc={0: ("open",)})
+    failed = invoke(workspace, "data", "normalize-daily-prices", "aapl", SYMBOL)
+    assert failed.exit_code == 1
+    dropped = invoke(
+        workspace, "data", "normalize-daily-prices", "aapl", SYMBOL,
+        "--null-bars", "drop",
+    )  # fmt: skip
+    assert dropped.exit_code == 1  # every bar dropped leaves no price rows
+    workspace = build_raw_case(tmp_path / "ok", rows=2, null_ohlc={0: ("open",)})
+    dropped = invoke(
+        workspace, "data", "normalize-daily-prices", "aapl", SYMBOL,
+        "--null-bars", "drop",
+    )  # fmt: skip
+    assert dropped.exit_code == 0, dropped.output
+    assert "normalized price-gaps:" in dropped.output

@@ -9,7 +9,7 @@ from pathlib import Path
 
 import polars as pl
 
-from finresearch.data_contracts import RAW_YFINANCE_DAILY_PRICES_V1
+from finresearch.data_contracts import RAW_YFINANCE_DAILY_PRICES_V2
 from finresearch.ingestion import IngestionError, ingest_yfinance_daily_prices
 
 
@@ -37,10 +37,11 @@ class CoordinatedPriceProvider:
         return pl.DataFrame(
             [
                 {
-                    "schema_version": 1,
+                    "schema_version": 2,
                     "provider": "yfinance",
                     "provider_symbol": symbol,
                     "currency": "USD",
+                    "quote_type": "EQUITY",
                     "retrieved_at": retrieved_at,
                     "requested_start": start,
                     "requested_end": end,
@@ -59,7 +60,7 @@ class CoordinatedPriceProvider:
                     "capital_gains": None,
                 }
             ],
-            schema=RAW_YFINANCE_DAILY_PRICES_V1.schema,
+            schema=RAW_YFINANCE_DAILY_PRICES_V2.schema,
         )
 
 

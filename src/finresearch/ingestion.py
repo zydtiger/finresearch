@@ -31,7 +31,7 @@ from finresearch.cases import (
 from finresearch.data_contracts import (
     RAW_SEC_COMPANYFACTS_V1,
     RAW_SEC_SUBMISSIONS_V1,
-    RAW_YFINANCE_DAILY_PRICES_V1,
+    RAW_YFINANCE_DAILY_PRICES_V2,
     DatasetContract,
 )
 
@@ -132,7 +132,7 @@ def ingest_yfinance_daily_prices(
         end,
         retrieval_time,
     )
-    RAW_YFINANCE_DAILY_PRICES_V1.validate(frame)
+    RAW_YFINANCE_DAILY_PRICES_V2.validate(frame)
     _validate_snapshot_metadata(
         frame,
         symbol=normalized_symbol,
@@ -145,7 +145,7 @@ def ingest_yfinance_daily_prices(
         case_dir=case_dir,
         manifest=manifest,
         frame=frame,
-        contract=RAW_YFINANCE_DAILY_PRICES_V1,
+        contract=RAW_YFINANCE_DAILY_PRICES_V2,
         provider="yfinance",
         path_parts=("yfinance", "daily-prices", symbol_key(normalized_symbol)),
         entity_key=symbol_key(normalized_symbol),
@@ -847,7 +847,7 @@ def _validate_snapshot_metadata(
     retrieved_at: datetime,
 ) -> None:
     expected = {
-        "schema_version": RAW_YFINANCE_DAILY_PRICES_V1.version,
+        "schema_version": RAW_YFINANCE_DAILY_PRICES_V2.version,
         "provider": "yfinance",
         "provider_symbol": symbol,
         "retrieved_at": retrieved_at,
@@ -860,6 +860,11 @@ def _validate_snapshot_metadata(
     if len(currency_values) != 1 or not isinstance(currency_values[0], str):
         raise IngestionError(
             f"provider snapshot has inconsistent currency: {currency_values!r}"
+        )
+    quote_type_values = frame.get_column("quote_type").unique().to_list()
+    if len(quote_type_values) != 1 or not isinstance(quote_type_values[0], str):
+        raise IngestionError(
+            f"provider snapshot has inconsistent quote_type: {quote_type_values!r}"
         )
 
 

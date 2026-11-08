@@ -29,8 +29,11 @@ from finresearch.data_contracts import (
     NORMALIZED_FUNDAMENTAL_FACTS_V2,
     NORMALIZED_INSTRUMENT_MASTER_V2,
     NORMALIZED_INSTRUMENT_MASTER_V3,
+    NORMALIZED_PRICE_GAPS_V1,
+    PRICE_GAP_FIELDS,
     RAW_SEC_COMPANYFACTS_V1,
     RAW_YFINANCE_DAILY_PRICES_V1,
+    RAW_YFINANCE_DAILY_PRICES_V2,
     DataContractError,
     DatasetContract,
 )
@@ -45,6 +48,19 @@ from finresearch.ingestion import (
 # carries it from the raw snapshot.
 DAILY_PRICES_KIND: Final = "raw.yfinance.daily-prices"
 PRICE_BASIS: Final = "unadjusted"
+_RAW_PRICE_CONTRACTS: Final = {
+    RAW_YFINANCE_DAILY_PRICES_V1.version: RAW_YFINANCE_DAILY_PRICES_V1,
+    RAW_YFINANCE_DAILY_PRICES_V2.version: RAW_YFINANCE_DAILY_PRICES_V2,
+}
+NULL_BAR_POLICIES: Final = ("fail", "drop")
+# yfinance quoteType values; anything else normalizes to ``unknown``.
+_QUOTE_TYPE_ASSET_CLASSES: Final = {
+    "CRYPTOCURRENCY": "crypto",
+    "EQUITY": "equity",
+    "ETF": "etf",
+    "CURRENCY": "fx",
+    "INDEX": "index",
+}
 COMPANYFACTS_KIND: Final = "raw.sec.companyfacts"
 # value types that carry a numeric JSON scalar in value_text
 _NUMERIC_VALUE_TYPES: Final = ("integer", "number")
@@ -69,6 +85,7 @@ class NormalizationReceipt:
     instrument_master: IngestionReceipt
     daily_prices: IngestionReceipt
     corporate_actions: IngestionReceipt
+    price_gaps: IngestionReceipt | None = None
 
 
 def normalize_daily_prices(
@@ -78,8 +95,17 @@ def normalize_daily_prices(
     *,
     raw_artifact_id: str | None = None,
     normalized_at: datetime | None = None,
+    null_bars: str = "fail",
 ) -> NormalizationReceipt:
-    """Derive instrument-master and daily-prices artifacts from one raw snapshot."""
+    """Derive instrument-master and daily-prices artifacts from one raw snapshot.
+
+    ``null_bars="drop"`` removes bars with a NULL open, high, low, or close and
+    publishes them in a companion ``normalized.price-gaps.v1`` artifact.
+    """
+    if null_bars not in NULL_BAR_POLICIES:
+        raise IngestionError(
+            f"null_bars must be one of: {', '.join(NULL_BAR_POLICIES)}"
+        )
     requested_symbol = symbol.strip()
     if not requested_symbol:
         raise IngestionError("symbol must not be empty")
@@ -87,7 +113,13 @@ def normalize_daily_prices(
     case_dir, manifest, normalized_root = _case_normalized_context(workspace, case_id)
     raw_artifact = _select_raw_artifact(manifest, requested_symbol, raw_artifact_id)
     raw_frame = _read_raw_snapshot(case_dir, raw_artifact)
-    RAW_YFINANCE_DAILY_PRICES_V1.validate(raw_frame)
+    raw_contract = _RAW_PRICE_CONTRACTS.get(raw_artifact.schema_version)
+    if raw_contract is None:
+        raise IngestionError(
+            f"raw snapshot {raw_artifact.artifact_id} has unsupported "
+            f"schema_version {raw_artifact.schema_version}"
+        )
+    raw_contract.validate(raw_frame)
     provider_symbol = _validate_raw_price_snapshot(
         raw_frame,
         requested_symbol,
@@ -98,6 +130,17 @@ def normalize_daily_prices(
     instrument_id = f"yfinance.{symbol_key(provider_symbol)}"
     currency = _require_constant(raw_frame, "currency", raw_artifact.artifact_id)
 
+    asset_class = None
+    if raw_contract is RAW_YFINANCE_DAILY_PRICES_V2:
+        quote_type = _require_constant(
+            raw_frame, "quote_type", raw_artifact.artifact_id
+        )
+        asset_class = _QUOTE_TYPE_ASSET_CLASSES.get(quote_type, "unknown")
+    master_contract = (
+        NORMALIZED_INSTRUMENT_MASTER_V2
+        if asset_class is None
+        else NORMALIZED_INSTRUMENT_MASTER_V3
+    )
     master_frame = _instrument_master_frame(
         raw_frame,
         instrument_id=instrument_id,
@@ -105,9 +148,19 @@ def normalize_daily_prices(
         currency=currency,
         source_artifact_id=raw_artifact.artifact_id,
         normalized_at=timestamp,
+        asset_class=asset_class,
     )
+    price_source = raw_frame
+    gaps_frame: pl.DataFrame | None = None
+    if null_bars == "drop":
+        price_source, gaps_frame = split_null_bars(
+            raw_frame,
+            PRICE_GAP_FIELDS,
+            instrument_id=instrument_id,
+            source_artifact_id=raw_artifact.artifact_id,
+        )
     prices_frame = _daily_prices_frame(
-        raw_frame,
+        price_source,
         instrument_id=instrument_id,
         provider_symbol=provider_symbol,
         currency=currency,
@@ -122,13 +175,15 @@ def normalize_daily_prices(
         source_artifact_id=raw_artifact.artifact_id,
         normalized_at=timestamp,
     )
-    master_frame = NORMALIZED_INSTRUMENT_MASTER_V2.canonical_sort(master_frame)
+    master_frame = master_contract.canonical_sort(master_frame)
     prices_frame = NORMALIZED_DAILY_PRICES_V2.canonical_sort(prices_frame)
     actions_frame = NORMALIZED_CORPORATE_ACTIONS_V1.canonical_sort(actions_frame)
     try:
-        NORMALIZED_INSTRUMENT_MASTER_V2.validate(master_frame)
+        master_contract.validate(master_frame)
         NORMALIZED_DAILY_PRICES_V2.validate(prices_frame)
         NORMALIZED_CORPORATE_ACTIONS_V1.validate(actions_frame)
+        if gaps_frame is not None:
+            NORMALIZED_PRICE_GAPS_V1.validate(gaps_frame)
     except DataContractError as exc:
         raise IngestionError(
             f"raw snapshot {raw_artifact.artifact_id} cannot be normalized: {exc}"
@@ -141,12 +196,15 @@ def normalize_daily_prices(
         manifest=manifest,
         path_role="normalized",
         frame=master_frame,
-        contract=NORMALIZED_INSTRUMENT_MASTER_V2,
+        contract=master_contract,
         path_parts=("normalized.instrument-master", instrument_id),
         entity_key=instrument_id,
         raw_artifact=raw_artifact,
         normalized_at=timestamp,
     )
+    # The policy is a producer parameter of the artifacts it shapes; the default
+    # keeps the pre-policy identity so existing outputs are unchanged.
+    policy = {"null_bars": "drop"} if null_bars == "drop" else {}
     prices_receipt = _publish_normalized_snapshot(
         case_dir=case_dir,
         manifest=manifest,
@@ -157,6 +215,7 @@ def normalize_daily_prices(
         entity_key=instrument_id,
         raw_artifact=raw_artifact,
         normalized_at=timestamp,
+        policy=policy,
     )
     actions_receipt = _publish_normalized_snapshot(
         case_dir=case_dir,
@@ -169,10 +228,25 @@ def normalize_daily_prices(
         raw_artifact=raw_artifact,
         normalized_at=timestamp,
     )
+    gaps_receipt = None
+    if gaps_frame is not None:
+        gaps_receipt = _publish_normalized_snapshot(
+            case_dir=case_dir,
+            manifest=manifest,
+            path_role="normalized",
+            frame=gaps_frame,
+            contract=NORMALIZED_PRICE_GAPS_V1,
+            path_parts=("normalized.price-gaps", instrument_id),
+            entity_key=instrument_id,
+            raw_artifact=raw_artifact,
+            normalized_at=timestamp,
+            policy=policy,
+        )
     return NormalizationReceipt(
         instrument_master=master_receipt,
         daily_prices=prices_receipt,
         corporate_actions=actions_receipt,
+        price_gaps=gaps_receipt,
     )
 
 
@@ -368,6 +442,39 @@ def reconcile_instrument_master(
     )
 
 
+def split_null_bars(
+    frame: pl.DataFrame,
+    fields: tuple[str, ...],
+    *,
+    instrument_id: str,
+    source_artifact_id: str,
+) -> tuple[pl.DataFrame, pl.DataFrame]:
+    """Split rows with a NULL in any of ``fields`` from ``frame``.
+
+    Returns the remaining rows and the ``normalized.price-gaps.v1`` rows for the
+    removed sessions. Shared by every normalization that drops provider bars.
+    """
+    if not set(fields) <= set(PRICE_GAP_FIELDS):
+        raise IngestionError(f"unsupported price-gap fields: {fields!r}")
+    has_null = pl.any_horizontal(pl.col(name).is_null() for name in fields)
+    null_fields = pl.concat_str(
+        [pl.when(pl.col(name).is_null()).then(pl.lit(name)) for name in sorted(fields)],
+        separator=",",
+        ignore_nulls=True,
+    )
+    gaps = frame.filter(has_null).select(
+        pl.lit(NORMALIZED_PRICE_GAPS_V1.version, dtype=pl.UInt16).alias(
+            "schema_version"
+        ),
+        pl.lit(instrument_id).alias("instrument_id"),
+        "session_date",
+        pl.lit("null_ohlc").alias("reason"),
+        null_fields.alias("null_fields"),
+        pl.lit(source_artifact_id).alias("source_artifact_id"),
+    )
+    return frame.filter(~has_null), NORMALIZED_PRICE_GAPS_V1.canonical_sort(gaps)
+
+
 def _publish_normalized_snapshot(
     *,
     case_dir: Path,
@@ -379,10 +486,12 @@ def _publish_normalized_snapshot(
     entity_key: str,
     raw_artifact: Artifact,
     normalized_at: datetime,
+    policy: dict[str, str] | None = None,
 ) -> IngestionReceipt:
     """Publish one normalized snapshot under a source-derived identity."""
     parameters_sha256 = canonical_parameters_sha256(
         {
+            **(policy or {}),
             "contract": contract.name,
             "contract_version": contract.version,
             "input_artifact_ids": [raw_artifact.artifact_id],
@@ -642,30 +751,41 @@ def _instrument_master_frame(
     currency: str | None,
     source_artifact_id: str,
     normalized_at: datetime,
+    asset_class: str | None = None,
 ) -> pl.DataFrame:
-    return pl.DataFrame(
-        [
-            {
-                "schema_version": NORMALIZED_INSTRUMENT_MASTER_V2.version,
-                "provider": "yfinance",
-                "instrument_id": instrument_id,
-                "entity_id": None,
-                "provider_symbol": provider_symbol,
-                "primary_symbol": None,
-                "name": None,
-                "asset_class": "unknown",
-                "instrument_type": None,
-                "venue_mic": None,
-                "country_code": None,
-                "trading_currency": currency,
-                "valid_from": None,
-                "valid_to": None,
-                "observed_at": normalized_at,
-                "source_artifact_id": source_artifact_id,
-            }
-        ],
-        schema=NORMALIZED_INSTRUMENT_MASTER_V2.schema,
+    """Build the one-row master; a provider asset class selects contract v3."""
+    contract = (
+        NORMALIZED_INSTRUMENT_MASTER_V2
+        if asset_class is None
+        else NORMALIZED_INSTRUMENT_MASTER_V3
     )
+    row: dict[str, object] = {
+        "schema_version": contract.version,
+        "provider": "yfinance",
+        "instrument_id": instrument_id,
+        "entity_id": None,
+        "provider_symbol": provider_symbol,
+        "primary_symbol": None,
+        "name": None,
+        "asset_class": asset_class or "unknown",
+        "instrument_type": None,
+        "venue_mic": None,
+        "country_code": None,
+        "trading_currency": currency,
+        "valid_from": None,
+        "valid_to": None,
+        "observed_at": normalized_at,
+        "source_artifact_id": source_artifact_id,
+    }
+    if asset_class is not None:
+        row.update(
+            chain=None,
+            contract_address=None,
+            token_standard=None,
+            provider_ids=None,
+            asset_class_source="provider",
+        )
+    return pl.DataFrame([row], schema=contract.schema)
 
 
 def _daily_prices_frame(
