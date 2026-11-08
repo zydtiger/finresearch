@@ -821,7 +821,8 @@ def _quote_rate(config: TokenConfig, quote_asset: str) -> float:
 
 def _holders_revenue_window(
     config: TokenConfig, metrics: pl.DataFrame, peer: Peer
-) -> float:
+) -> float | None:
+    """Return the peer's window total, or None when any window day is missing."""
     multiples = config.multiples
     days = _WINDOWS[multiples.window]
     rows = metrics.filter(
@@ -845,9 +846,7 @@ def _holders_revenue_window(
     for offset in range(days):
         day = multiples.metric_window_end - timedelta(days=offset)
         if day not in values or day in incomplete:
-            raise CaseContractError(
-                f"peer {peer.entity_id} has no complete {multiples.metric} for {day}"
-            )
+            return None
         if len(values[day]) != 1:
             raise CaseContractError(
                 f"peer {peer.entity_id} has conflicting {multiples.metric} for {day}"
@@ -928,7 +927,18 @@ def _peer_rows(
                     f"peer {peer.instrument_id} has conflicting latest {metric}"
                 )
             numerator = next(iter(values))
-            if revenue <= 0:
+            if revenue is None:
+                rows.append(
+                    row(
+                        peer.instrument_id,
+                        peer.entity_id,
+                        basis,
+                        numerator,
+                        None,
+                        "incomplete_metric_window",
+                    )
+                )
+            elif revenue <= 0:
                 rows.append(
                     row(
                         peer.instrument_id,

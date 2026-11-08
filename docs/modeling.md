@@ -168,8 +168,10 @@ and `chain` NULL), complete daily `metric` rows over the 30 (annualized by
 365/30) or 365 UTC days ending `metric_window_end`, in the model currency.
 Each declared peer needs a market observation on `market_observed_on`
 (latest wins; conflicting latest values fail); a missing `market_cap` or `fdv`
-or a nonpositive HR is an explicit exclusion on that basis, as is a peer in
-`exclude`. Each basis needs at least one included peer. Statistics use the same
+(`missing_market_observation`), a window with any missing or incomplete day
+(`incomplete_metric_window`), or a nonpositive HR
+(`nonpositive_holders_revenue`) is an explicit exclusion on that basis, as is a
+peer in `exclude`. Conflicting values for one day still fail. Each basis needs at least one included peer. Statistics use the same
 linear interpolation as comps. A market value quoted in a stablecoin needs the
 matching peg leaf; there is no FX conversion between fiat currencies.
 
