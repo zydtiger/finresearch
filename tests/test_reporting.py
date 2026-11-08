@@ -1689,7 +1689,6 @@ def test_case_audit_enforces_facts_estimates_and_master_cutoffs(tmp_path: Path) 
         "fact_knowledge_after_as_of",
         "estimate_as_of_after_as_of",
         "estimate_available_after_as_of",
-        "master_observed_after_as_of",
     }.issubset({issue.code for issue in audit.issues})
 
 

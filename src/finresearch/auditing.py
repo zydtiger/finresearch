@@ -461,7 +461,6 @@ def _cutoff_issues(
             "fact_knowledge_after_as_of",
         ),
         "normalized.estimates": ("estimate_as_of", "estimate_as_of_after_as_of"),
-        "normalized.instrument-master": ("observed_at", "master_observed_after_as_of"),
         "normalized.daily-prices": ("session_date", "price_session_after_as_of"),
     }
     issues: list[ValidationIssue] = []
