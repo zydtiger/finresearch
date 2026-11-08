@@ -22,11 +22,13 @@ from finresearch.cases import (
     resolve_relative_path,
 )
 from finresearch.data_contracts import (
+    CURRENCY_CODES,
     DERIVED_INSTRUMENT_MASTER_CURRENT_V1,
     DERIVED_INSTRUMENT_MASTER_CURRENT_V2,
     NORMALIZED_CORPORATE_ACTIONS_V1,
     NORMALIZED_DAILY_PRICES_V2,
     NORMALIZED_FUNDAMENTAL_FACTS_V2,
+    NORMALIZED_FX_RATES_V1,
     NORMALIZED_INSTRUMENT_MASTER_V2,
     NORMALIZED_INSTRUMENT_MASTER_V3,
     NORMALIZED_PRICE_GAPS_V1,
@@ -248,6 +250,108 @@ def normalize_daily_prices(
         corporate_actions=actions_receipt,
         price_gaps=gaps_receipt,
     )
+
+
+@dataclass(frozen=True)
+class FxNormalizationReceipt:
+    """Persisted fx-rates and companion price-gaps artifacts."""
+
+    fx_rates: IngestionReceipt
+    price_gaps: IngestionReceipt
+
+
+def normalize_fx_rates(
+    workspace: Path,
+    case_id: str,
+    symbol: str,
+    *,
+    base: str,
+    quote: str,
+    raw_artifact_id: str | None = None,
+    normalized_at: datetime | None = None,
+) -> FxNormalizationReceipt:
+    """Derive ``normalized.fx-rates.v1`` close rates from one raw FX snapshot.
+
+    Only ``close`` is published (``rate_kind = "close"``). Rows with a NULL
+    close are dropped and recorded in ``normalized.price-gaps.v1``, which is
+    always published, possibly empty. OHLC ordering is not checked.
+    """
+    requested_symbol = symbol.strip()
+    base = base.strip().upper()
+    quote = quote.strip().upper()
+    for label, code in (("base", base), ("quote", quote)):
+        if code not in CURRENCY_CODES:
+            raise IngestionError(f"{label} must be a controlled ISO currency code")
+    if requested_symbol.upper() != f"{base}{quote}=X":
+        raise IngestionError(f"symbol must be {base}{quote}=X for {base}/{quote}")
+
+    case_dir, manifest, _ = _case_normalized_context(workspace, case_id)
+    raw_artifact = _select_raw_artifact(manifest, requested_symbol, raw_artifact_id)
+    raw_frame = _read_raw_snapshot(case_dir, raw_artifact)
+    raw_contract = _RAW_PRICE_CONTRACTS.get(raw_artifact.schema_version)
+    if raw_contract is None:
+        raise IngestionError(
+            f"raw snapshot {raw_artifact.artifact_id} has unsupported "
+            f"schema_version {raw_artifact.schema_version}"
+        )
+    raw_contract.validate(raw_frame)
+    provider_symbol = _validate_raw_price_snapshot(
+        raw_frame, requested_symbol, raw_artifact
+    )
+    timestamp = _normalization_time(normalized_at, raw_artifact, raw_frame)
+    instrument_id = f"yfinance.{symbol_key(provider_symbol)}"
+    kept, gaps_frame = split_null_bars(
+        raw_frame,
+        ("close",),
+        instrument_id=instrument_id,
+        source_artifact_id=raw_artifact.artifact_id,
+    )
+    rates_frame = kept.select(
+        pl.lit(NORMALIZED_FX_RATES_V1.version, dtype=pl.UInt16).alias("schema_version"),
+        pl.lit("yfinance").alias("provider"),
+        pl.lit(base).alias("base_currency"),
+        pl.lit(quote).alias("quote_currency"),
+        pl.col("session_date").alias("rate_date"),
+        "timestamp",
+        pl.col("close").alias("rate"),
+        pl.lit("close").alias("rate_kind"),
+        pl.lit(raw_artifact.artifact_id).alias("source_artifact_id"),
+        pl.lit(timestamp).alias("normalized_at"),
+    )
+    rates_frame = NORMALIZED_FX_RATES_V1.canonical_sort(rates_frame)
+    try:
+        NORMALIZED_FX_RATES_V1.validate(rates_frame)
+        NORMALIZED_PRICE_GAPS_V1.validate(gaps_frame)
+    except DataContractError as exc:
+        raise IngestionError(
+            f"raw snapshot {raw_artifact.artifact_id} cannot be normalized: {exc}"
+        ) from exc
+    policy = {"null_bars": "drop"}
+    rates_receipt = _publish_normalized_snapshot(
+        case_dir=case_dir,
+        manifest=manifest,
+        path_role="normalized",
+        frame=rates_frame,
+        contract=NORMALIZED_FX_RATES_V1,
+        path_parts=("normalized.fx-rates", f"{base}{quote}".lower()),
+        entity_key=f"{base}{quote}".lower(),
+        raw_artifact=raw_artifact,
+        normalized_at=timestamp,
+        policy=policy,
+    )
+    gaps_receipt = _publish_normalized_snapshot(
+        case_dir=case_dir,
+        manifest=manifest,
+        path_role="normalized",
+        frame=gaps_frame,
+        contract=NORMALIZED_PRICE_GAPS_V1,
+        path_parts=("normalized.price-gaps", instrument_id),
+        entity_key=instrument_id,
+        raw_artifact=raw_artifact,
+        normalized_at=timestamp,
+        policy=policy,
+    )
+    return FxNormalizationReceipt(fx_rates=rates_receipt, price_gaps=gaps_receipt)
 
 
 def normalize_fundamental_facts(
