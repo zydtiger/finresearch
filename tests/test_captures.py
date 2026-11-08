@@ -152,6 +152,8 @@ def test_capture_url_and_body_rules() -> None:
     )
     with pytest.raises(DataContractError, match="secret"):
         validate_capture_url("https://x.example/?Api-Secret=1")
+    with pytest.raises(DataContractError, match="secret"):
+        validate_capture_url("https://x.example/page#access_token=abc")
     assert (
         canonical_request_body('{"b":1,"type":"t","a":2}') == '{"type":"t","a":2,"b":1}'
     )

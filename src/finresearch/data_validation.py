@@ -343,6 +343,7 @@ def _protocol_definition_issues(
 ) -> list[ValidationIssue]:
     """Require every cited provider definition in a declared definitions table."""
     declared: set[str] = set()
+    issues: list[ValidationIssue] = []
     for candidate in manifest.artifacts:
         if candidate.kind != "normalized.provider-metric-definitions":
             continue
@@ -353,12 +354,18 @@ def _protocol_definition_issues(
                 )
             )
             declared.update(definitions.get_column("provider_definition_id").to_list())
-        except Exception:
-            continue
+        except (OSError, pl.exceptions.PolarsError, CaseContractError) as exc:
+            issues.append(
+                ValidationIssue(
+                    "protocol_metric_definitions_unreadable",
+                    f"definitions artifact {candidate.artifact_id} is unreadable "
+                    f"or lacks provider_definition_id: {exc}",
+                )
+            )
     missing = sorted(
         set(frame.get_column("provider_definition_id").to_list()) - declared
     )
-    return [
+    return issues + [
         ValidationIssue(
             "protocol_metric_definition_missing",
             f"artifact {artifact.artifact_id} cites provider_definition_id "
