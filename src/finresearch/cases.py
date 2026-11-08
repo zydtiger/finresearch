@@ -103,6 +103,7 @@ class CaseStatus:
     artifacts_present: int
     artifacts_missing: int
     issues: tuple[ValidationIssue, ...]
+    unused_raw_snapshots: tuple[str, ...] = ()
 
     @property
     def valid(self) -> bool:
@@ -927,6 +928,14 @@ def inspect_case(workspace: Path, case_id: str) -> CaseStatus:
             )
 
     declared = len(manifest.artifacts)
+    consumed = {i for a in manifest.artifacts for i in a.input_artifact_ids}
+    unused = tuple(
+        a.artifact_id
+        for a in manifest.artifacts
+        if a.kind.startswith("raw.")
+        and not a.kind.startswith("raw.capture")
+        and a.artifact_id not in consumed
+    )
     return CaseStatus(
         case_id=case_id,
         case_dir=case_dir,
@@ -937,6 +946,7 @@ def inspect_case(workspace: Path, case_id: str) -> CaseStatus:
         artifacts_present=artifacts_present,
         artifacts_missing=declared - artifacts_present,
         issues=tuple(issues),
+        unused_raw_snapshots=unused,
     )
 
 

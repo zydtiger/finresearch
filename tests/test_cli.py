@@ -251,3 +251,26 @@ def test_sec_schema_failure_is_printed_as_concise_cli_error(
         result.output.strip()
         == "error: SEC data does not satisfy raw.sec.companyfacts.v1"
     )
+
+
+def test_case_status_reports_unused_raw_snapshots_without_failing(
+    tmp_path: Path,
+) -> None:
+    from token_support import import_prices, new_case
+
+    from finresearch.cases import read_manifest
+
+    case_dir = new_case(tmp_path)
+    import_prices(tmp_path, tmp_path, [("2026-11-06", 78.0)])
+    used = invoke(tmp_path, "case", "status", "hype")
+    assert used.exit_code == 0
+    assert "unused raw snapshots: 0" in used.output
+
+    manifest = read_manifest(case_dir)
+    raw_ids = [a.artifact_id for a in manifest.artifacts if a.kind == "raw.import"]
+    kept = tuple(a for a in manifest.artifacts if a.kind == "raw.import")
+    write_manifest(case_dir, CaseManifest(**{**vars(manifest), "artifacts": kept}))
+    unused = invoke(tmp_path, "case", "status", "hype")
+    assert unused.exit_code == 0
+    assert "unused raw snapshots: 1" in unused.output
+    assert raw_ids[0] in unused.output
