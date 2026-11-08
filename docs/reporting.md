@@ -156,6 +156,15 @@ The audit then applies deterministic point-in-time checks:
   (`protocol_metric_after_as_of`);
 - a capture's `content_sha256` must equal its body artifact checksum
   (`capture_metadata_mismatch`); and
+- a `normalized.token-unlocks.v1` schedule cannot schedule more than the
+  latest reconciliation's selected `max` minus `circulating`
+  (`token_unlocks_exceed_supply`) and must cite declared captures
+  (`token_unlocks_capture_missing`);
+- a token run's declared peg leaf `<FIAT>/<STABLECOIN>` must stay within a
+  relative 0.005 (50 bps) of that stablecoin's close on the run's price
+  session whenever the case holds a `daily-prices.v2` series with provider
+  symbol `<STABLECOIN>-<FIAT>` and currency `<FIAT>`
+  (`stablecoin_peg_deviation`); and
 - evidence `source_ref` tokens `capture:<id>` must name a declared
   `raw.capture.v1` (`register_capture_reference_invalid`) retrieved on or before
   the evidence `observed_at` (`register_capture_after_observed`).

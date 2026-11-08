@@ -78,8 +78,10 @@ is linked by `instrument_id`.
 ### Units and stablecoin quotes
 
 > **Implemented (phase 1)**: see `data-ingestion.md`, "Canonical contracts and
-> explicit local import". Model token scales, register unit documentation, and
-> peg leaves belong to the later `model token` phase.
+> explicit local import". Model token scales and peg leaves are
+> implemented with `model token` (`modeling.md`), and the audit code
+> `stablecoin_peg_deviation` (`reporting.md`) is implemented as described
+> below.
 
 Add to the controlled sets in `data_contracts.py`:
 
@@ -121,7 +123,9 @@ Peg units are `<FIAT>/<STABLECOIN>` for the stablecoins in `QUOTE_ASSETS`
 and are accepted only on peg leaves. When the case holds a normalized price
 series for that stablecoin, audit reports `stablecoin_peg_deviation` if its
 close on the model's price session differs from the declared peg by more than
-a fixed relative 0.005.
+a fixed relative 0.005 (50 bps). The series is a `daily-prices.v2` bar with
+provider symbol `<STABLECOIN>-<FIAT>` (for example `USDT-USD`) and currency
+`<FIAT>`, matching the peg unit `<FIAT>/<STABLECOIN>`.
 
 ### Web and API captures
 
@@ -622,8 +626,10 @@ ignoring the issue.
 > **Implemented (phase 4)**: see `modeling.md`, "Token model", and
 > `reporting.md`. Differences from this proposal are listed there:
 > `[price] master_artifact_id`, per-basis peer exclusions for a missing
-> market observation, `[pegs]` as a named table, and `unlocks_artifact_id`
-> deferred with `token-unlocks.v1`.
+> market observation, and `[pegs]` as a named table. `[supply]
+> unlocks_artifact_id` and `schedule_id` (phase 6) and the per-scenario
+> `fully_diluted.applies_to` scope are implemented as described below and in
+> `modeling.md`.
 
 ```text
 finresearch --workspace PATH model token CASE_ID \
@@ -700,7 +706,10 @@ observation present in the reconciliation artifact, not only the selected
 row:
 `[scenario.bear] fully_diluted = { metric = "total", provider = "hyperliquid", source_id = "a-bear-gross-supply" }`.
 That is how the trial's bear case divides by Hyperliquid's gross 998.8M while
-base and bull use the selected CoinGecko 951.5M. `unlocks` may instead come from a
+base and bull use the selected CoinGecko 951.5M. The override applies to both
+valuation methods unless `applies_to` narrows it to a non-empty, sorted list
+drawn from `"dcf"` and `"multiple"`, so a bear case can use a larger supply
+for the DCF only. `unlocks` may instead come from a
 `token-unlocks.v1` artifact once that contract exists:
 `[supply] unlocks_artifact_id = "...", schedule_id = "tokenomist-2026-11-07"`;
 the CLI then sums scheduled events per projection period, and inline
@@ -795,6 +804,12 @@ basis and 13.63 on the circulating basis, and the reverse figure
 ## Should-have
 
 ### `token-unlocks.v1` import
+
+> **Implemented (phase 6)**: see `data-ingestion.md`,
+> "normalized.token-unlocks.v1", and `modeling.md`, "Token model". An
+> `emission` event with an end date is prorated like a `linear` one and
+> without an end date counts as a cliff; the model rejects a schedule with an
+> event observed after `as_of`.
 
 Unlock schedules have no free authoritative API, and the trial's sources
 conflicted (Tokenomist 9.92M nominal per month; announced claims 0.14M to
