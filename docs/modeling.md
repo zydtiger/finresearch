@@ -165,7 +165,8 @@ finresearch --workspace PATH model token CASE_ID \
   [--sensitivity RATES;GROWTHS]
 ```
 
-`token-inputs.toml` is strict `version = 1` TOML. Top-level keys:
+`token-inputs.toml` is strict TOML with `version = 1` or `version = 2`;
+version 2 adds three optional keys described below. Top-level keys:
 `as_of`, `instrument_id`, `currency`, `value_unit` (a currency amount scale such
 as `USDm`), `token_unit` (`tokens`, `tokens_k`, `tokens_m`, `tokens_b`),
 `discount_convention` (`year_end` or `mid_year`), `held_buyback_treatment`
@@ -205,6 +206,34 @@ per-period amount, and the artifact is a parent of the inputs table and covered
 by run authentication. The per-period amounts are recorded as `unlocks:DATE`
 input rows with `source_artifact_id`.
 
+Version 2 accepts three optional keys, each rejected in a version 1 file. With
+all three at their defaults a version 2 file produces the same numbers as the
+equivalent version 1 file; the run id still differs because it covers the TOML
+bytes.
+
+| Key | Values (default first) | Effect |
+| --- | --- | --- |
+| `[supply] emissions_source` | `reserve`, `mint` | `reserve`: forecast `emissions` draw from the fully diluted stock, so they only move tokens from the reserve into circulation. `mint`: forecast `emissions` are new tokens and also grow fully diluted supply |
+| `dcf_dilution` (top level) | `none`, `issuance` | `issuance`: each basis's DCF value counts only the share attributable to today's tokens (below) |
+| `[multiples] subject_revenue` | `scenario`, `trailing` | `trailing`: the multiple applies to the subject's own trailing revenue over the peers' window instead of the scenario's year-1 `holders_revenue`; requires `subject_entity_id`, which is accepted only with `trailing` |
+
+Scheduled unlocks, including `emission`-kind schedule events, always draw from
+the reserve; only forecast `emissions` leaves follow `emissions_source`. An
+uncapped or inflationary token (fully diluted equal to circulating, positive
+issuance) fails under `reserve` with "circulating exceeds fully diluted
+supply"; model it with `emissions_source = "mint"` and no `fully_diluted`
+override. A `fully_diluted` override must cite a real provider observation in
+the reconciliation, never an analyst projection imported as one.
+
+With `subject_revenue = "trailing"` the subject's entity must have rows for
+the multiples `metric` in one of `metric_artifact_ids`; its window is computed
+exactly like a peer's (same `window`, `metric_window_end`, and aggregate-row
+rules), and a missing entity, an incomplete window, or nonpositive revenue
+fails the run. The revenue is recorded as a `subject_revenue` input row
+(`value_unit`, `period_end = metric_window_end`, `source_artifact_id` = the
+first declared metric artifact holding the subject's rows) in every scenario,
+so only the peer statistic differs between scenarios.
+
 Calculation, per scenario and period `t` (actual/365 from `as_of`, with the
 DCF's `mid_year` adjustment):
 
@@ -216,11 +245,33 @@ retired_tokens_t = cf_t * (buyback_retire + burn) / price_0
 circulating_t    = circulating_{t-1} + unlocks_t * unlock_realization_t
                    + emissions_t - retired_t
 fully_diluted_t  = fully_diluted_{t-1} - retired_t
+                   + [mint] emissions_t
 aggregate_value  = sum(cf_t * DF_t) + TV * DF_T,  TV = cf_T (1+g) / (r-g)
 per_token        = aggregate_value / opening supply  (circulating or fully diluted)
 implied_cf_scale = price_0 * fully_diluted_0 / aggregate_value
 multiple_value_b = multiple_b(statistic) * holders_revenue_1   # pre-capture
+                   [trailing] multiple_b(statistic) * subject trailing revenue
 ```
+
+With `dcf_dilution = "issuance"` each basis `b` scales its DCF terms by the
+share of supply that today's tokens still hold:
+
+```text
+factor_b_t       = S0_b / (S0_b + issued_b through t)
+  circulating:     S0 = circulating_0,   issued = realized unlocks + emissions
+  fully diluted:   S0 = DCF fully_diluted_0, issued = minted emissions
+                   (0 under emissions_source = "reserve")
+aggregate_value_b = sum(cf_t * DF_t * factor_b_t) + TV * DF_T * factor_b_T
+per_token_b      = aggregate_value_b / S0_b
+```
+
+Retirements (burns and buybacks) do not enter the factor: their value is
+already counted as tokenholder cash flow, so shrinking the share count as
+well would count it twice. The terminal value assumes no dilution after the
+last period, so set `terminal_growth` net of ongoing issuance. `terminal_share`,
+`implied_cf_scale`, and the sensitivity grid's `per_token_value_fd` use the
+diluted aggregate of their basis; the `pv_sum` check still verifies the
+undiluted sum.
 
 Value and token scales convert so that `USDm / tokens_m` reads as
 `USD/token`. The denominator is opening supply; the supply path is reported
@@ -249,7 +300,8 @@ when there is no new supply. Inputs have the referenced artifacts as ordered
 parents (price, reconciliation, market, metric, anchor, master); supply path,
 cash flows, and peer multiples descend from inputs, results from those three,
 and sensitivity and reconciliation from results. Reconciliation checks: supply
-roll-forward (both bases), PV sum plus terminal PV equals aggregate value,
+roll-forward (both bases; the fully diluted roll-forward adds minted
+emissions), PV sum plus terminal PV equals the undiluted aggregate value,
 `per_token_value * denominator` equals aggregate value for every method and
 basis, peer statistics reproduce from included peers, and `implied_cf_scale *
 aggregate_value` equals `price_0 * fully_diluted_0`; a failed check prevents

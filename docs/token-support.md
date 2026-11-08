@@ -281,7 +281,9 @@ supply_metric, provider, observed_at, holder_address)`.
 Semantic rules:
 
 - `observed_at <= retrieved_at`; `observed_at_basis = "retrieval"` requires
-  equality.
+  equality. A `token-supply.v1` import takes `retrieved_at` from
+  `--retrieved-at`, so its `retrieval` rows must carry `observed_at` equal to
+  that value: import one file per retrieval time.
 - Within one provider observation, `circulating <= total <= max` where the
   metrics are present; violations fail normalization with the three values.
 - `holder_address` is set only for `non_circulating`, `staked`, `locked`, and
@@ -495,6 +497,11 @@ failure stops the command and keeps captures already completed, each of which
 is independently valid. Provider errors are printed verbatim, for example the
 trial's HTTP 400 `Fees for aster not found...`.
 
+`SLUG` may also be a DefiLlama chain slug such as `ethereum`, `solana`, `bsc`,
+`tron`, or `avalanche`; the same summary endpoints return the chain's fees and
+revenue. For a chain, `revenue` and `holders-revenue` may be the identical
+series.
+
 ```text
 finresearch --workspace PATH data normalize-protocol-metrics CASE_ID \
   --capture-artifact-id ID [--capture-artifact-id ID ...] \
@@ -630,6 +637,12 @@ ignoring the issue.
 > unlocks_artifact_id` and `schedule_id` (phase 6) and the per-scenario
 > `fully_diluted.applies_to` scope are implemented as described below and in
 > `modeling.md`.
+>
+> **Implemented (token-inputs version 2)**: `[supply] emissions_source`
+> (`reserve` or `mint`), top-level `dcf_dilution` (`none` or `issuance`), and
+> `[multiples] subject_revenue` (`scenario` or `trailing`, with
+> `subject_entity_id`), described in "Token-inputs version 2" below and in
+> `modeling.md`. Version 1 inputs are unchanged.
 
 ```text
 finresearch --workspace PATH model token CASE_ID \
@@ -745,7 +758,50 @@ from the aggregate (`sub_protocol IS NULL`) rows.
 
 The denominator is opening supply; the supply path is reported separately as
 dilution and absorption. This matches the trial memo and keeps the two effects
-visible instead of folding issuance into value.
+visible instead of folding issuance into value. Version 2 inputs can fold
+issuance in with `dcf_dilution = "issuance"`, below.
+
+#### Token-inputs version 2
+
+An ETH trial exposed three defects in version 1: forecast `emissions` came
+out of the fully diluted stock, so an uncapped token (fully diluted equal to
+circulating) failed with "circulating exceeds fully diluted supply"; the DCF
+divided by opening supply, so issuance dilution never reached the value; and
+the multiple applied a peer statistic to the scenario's forward revenue, so
+scenario optimism compounded and forward revenue was compared with peers'
+trailing revenue. `version = 2` adds three optional keys, each rejected in a
+version 1 file; at their defaults the numbers equal version 1.
+
+- `[supply] emissions_source = "reserve" | "mint"`. Under `reserve` (default)
+  forecast `emissions` draw from the fully diluted stock. Under `mint` they
+  also grow it: `fully_diluted_t = fully_diluted_{t-1} + emissions_t -
+  retired_t`, and the fully diluted roll-forward check adds minted
+  emissions. Scheduled unlocks, including `emission`-kind schedule events,
+  draw from the reserve in both modes. The `circulating <= fully diluted`
+  check stays. For an uncapped token use `mint` and no `fully_diluted`
+  override; an override must cite a real provider observation, never a
+  projection imported as one.
+- `dcf_dilution = "none" | "issuance"`. Under `issuance` each basis scales
+  period `t`'s PV by `S0 / (S0 + issued through t)` and the terminal PV by the
+  last period's factor. Circulating: `S0 = circulating_0`, issued = realized
+  unlocks + emissions. Fully diluted: `S0` = the DCF `fully_diluted_0`,
+  issued = minted emissions (0 under `reserve`). Burns and buybacks stay out
+  of the factor because their value is already tokenholder cash flow.
+  `denominator_tokens` stays `S0`; `terminal_share`, `implied_cf_scale`, and
+  the sensitivity grid use the diluted aggregate of their basis, and `pv_sum`
+  still checks the undiluted sum. The terminal value assumes no dilution
+  after the last period, so `terminal_growth` should be net of ongoing
+  issuance.
+- `[multiples] subject_revenue = "scenario" | "trailing"` and
+  `subject_entity_id` (required exactly when `trailing`). `trailing` applies
+  the statistic to the subject's own revenue over the peers' window, metric,
+  and `metric_window_end`, read from the multiples metric artifacts with the
+  peer window rules; a missing entity, incomplete window, or nonpositive
+  revenue fails the run. The value is recorded as a `subject_revenue` input
+  row with `source_artifact_id`, so audit reconstruction covers it.
+
+No output contract changes: the new values flow through the existing tables,
+run identity (TOML bytes), and audit reconstruction.
 
 #### Validation
 

@@ -228,6 +228,13 @@ uv run finresearch --workspace /path/to/research-artifacts \
   --scenario all [--sensitivity "0.2,0.25;0.02,0.03"]
 ```
 
+`token-inputs.toml` `version = 2` adds `[supply] emissions_source = "mint"`
+for uncapped or inflationary tokens (forecast emissions grow fully diluted
+supply instead of drawing from it), `dcf_dilution = "issuance"` (DCF value per
+today's token after issuance), and `[multiples] subject_revenue = "trailing"`
+with `subject_entity_id` (apply peer multiples to the subject's own trailing
+revenue). `data ingest-defillama` also accepts chain slugs such as `ethereum`.
+
 See [the modeling contract](docs/modeling.md) for strict source-provenance,
 input, and projection-gate requirements.
 

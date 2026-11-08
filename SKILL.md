@@ -100,7 +100,10 @@ financial values, peers, evidence, assumptions, or source IDs.
   `--instrument-map PROVIDER_ASSET_ID=INSTRUMENT_ID` per asset; the instrument
   id is always yours, never inferred. Put supplies read from web pages in a
   `token-supply.v1` CSV (`data import-csv --schema token-supply.v1`) citing
-  the registered capture in `capture_artifact_id`. Reconcile providers with
+  the registered capture in `capture_artifact_id`; a row with
+  `observed_at_basis = retrieval` must have `observed_at` equal to
+  `--retrieved-at`, so import one file per retrieval time. Reconcile
+  providers with
   `data reconcile-token-supply --policy analysis/token-supply-policy.toml`
   (tolerances per metric, `provider_priority`, and a `[resolution.<metric>]`
   with an evidence or assumption `source_id` that records which definition you
@@ -121,7 +124,9 @@ financial values, peers, evidence, assumptions, or source IDs.
   complete UTC daily bars, so at cutoff D the usable bar is D-1 and a bar dated
   D is `price_bar_incomplete`. Equity-only cases audit as before.
 - Protocol metrics: `data ingest-defillama SLUG --dataset ...` (repeatable;
-  per-protocol keyless summaries) and
+  per-protocol keyless summaries; `SLUG` may be a chain slug such as
+  `ethereum`, `solana`, `bsc`, `tron`, or `avalanche`, for which `revenue` and
+  `holders-revenue` may be the identical series) and
   `data ingest-hyperliquid-info --request meta-and-asset-ctxs` capture the
   provider responses; `data normalize-protocol-metrics --capture-artifact-id ID
   ... --entity-id ID [--instrument-id ID]` writes
@@ -296,7 +301,23 @@ the policy and TOML cite before running `reconcile-token-supply` and
 leaf; audit reports `stablecoin_peg_deviation` when a case price series
 `<COIN>-<FIAT>` closed more than 50 bps from the declared peg. Bases that are
 equal across scenarios belong in the TOML; a `scenarios.csv` parameter equal
-across scenarios is one `scenario=all` row. Report and audit work as for DCF;
+across scenarios is one `scenario=all` row.
+
+`version = 2` token inputs add three optional keys (rejected in version 1;
+defaults reproduce version 1). Forecast `emissions` draw from the fully
+diluted stock under `[supply] emissions_source = "reserve"` (default); under
+`"mint"` they also grow fully diluted supply. Scheduled unlocks, including
+`emission` events, always draw from the reserve. For an uncapped or
+inflationary token (fully diluted equal to circulating) use `"mint"` with no
+`fully_diluted` override; an override must cite a real provider observation,
+never your projection imported as one. `dcf_dilution = "issuance"` scales each
+basis's PVs by `S0 / (S0 + cumulative issuance)` (circulating: realized
+unlocks plus emissions; fully diluted: minted emissions); burns and buybacks
+are not in the factor, and terminal value assumes no further dilution, so set
+`terminal_growth` net of ongoing issuance. `[multiples] subject_revenue =
+"trailing"` with `subject_entity_id` applies the peer statistic to the
+subject's own trailing revenue over the peers' window instead of the
+scenario's year-1 revenue. Report and audit work as for DCF;
 token audit codes are
 prefixed `token_run_`.
 
