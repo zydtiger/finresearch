@@ -271,7 +271,7 @@ def configure(
 ) -> None:
     """Require the explicit workspace shared by research commands."""
     global _json_output
-    _json_output = json_output
+    _json_output = json_output  # reset on every invocation
     ctx.obj = State(workspace=workspace)
 
 
