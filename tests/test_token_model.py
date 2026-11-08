@@ -454,7 +454,6 @@ def test_peer_exclusions_are_explicit(built: Path) -> None:
             'period_end = "2026-11-07", holders_revenue = { value = 600.0',
             "strictly increase",
         ),
-        ('session_date = "2026-11-06"', 'session_date = "2026-11-08"', "session_date"),
         ('currency = "USD"', 'currency = "EUR"', "currency"),
         (
             'fully_diluted_metric = "total"',

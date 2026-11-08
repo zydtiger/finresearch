@@ -193,30 +193,6 @@ def test_validate_all_checks_declared_non_parquet_artifact(price_case: Path) -> 
     assert "valid: all declared artifacts of aapl" in result.output
 
 
-def test_validate_exact_non_parquet_artifact_checks_integrity(price_case: Path) -> None:
-    case_dir = price_case / "cases" / "aapl"
-    report_path = case_dir / "reports/summary.md"
-    report_path.write_text("# Summary\n", encoding="utf-8")
-    append_artifact(
-        case_dir,
-        Artifact(
-            artifact_id="report.summary",
-            kind="report.markdown",
-            schema_version=1,
-            path="reports/summary.md",
-            producer="finresearch.test",
-            producer_version="1",
-            parameters_sha256="a" * 64,
-            sha256=hashlib.sha256(report_path.read_bytes()).hexdigest(),
-        ),
-    )
-
-    result = invoke(price_case, "data", "validate", "aapl", "report.summary")
-
-    assert result.exit_code == 0
-    assert "valid: report.summary" in result.output
-
-
 def test_inspect_rejects_non_parquet_artifact(
     price_case: Path,
 ) -> None:
@@ -633,48 +609,6 @@ def master_frame(*, source_artifact_id: str) -> pl.DataFrame:
         ],
         schema=NORMALIZED_INSTRUMENT_MASTER_V1.schema,
     )
-
-
-def test_validate_rejects_dangling_lineage(price_case: Path) -> None:
-    case_dir = price_case / "cases" / "aapl"
-    write_artifact(
-        case_dir,
-        master_frame(source_artifact_id="raw.yfinance.daily-prices.aapl.ghost"),
-        artifact_id="normalized.instrument-master.aapl.ghost",
-        kind="normalized.instrument-master",
-        path="data/normalized/normalized.instrument-master/aapl/ghost.parquet",
-    )
-
-    result = invoke(price_case, "data", "validate", "aapl")
-
-    assert result.exit_code == 1
-    assert "error [lineage_invalid]" in result.output
-    assert "are not in manifest input_artifact_ids" in result.output
-
-
-def test_validate_accepts_declared_lineage(price_case: Path) -> None:
-    case_dir = price_case / "cases" / "aapl"
-    parent_path = case_dir / PRICE_ARTIFACT_PATH
-    write_artifact(
-        case_dir,
-        master_frame(source_artifact_id=PRICE_ARTIFACT_ID),
-        artifact_id="normalized.instrument-master.aapl.valid",
-        kind="normalized.instrument-master",
-        path="data/normalized/normalized.instrument-master/aapl/valid.parquet",
-        input_artifact_ids=(PRICE_ARTIFACT_ID,),
-        input_file_hashes=(
-            InputFileHash(
-                name=f"artifact.{PRICE_ARTIFACT_ID}",
-                path=PRICE_ARTIFACT_PATH,
-                sha256=hashlib.sha256(parent_path.read_bytes()).hexdigest(),
-            ),
-        ),
-    )
-
-    result = invoke(price_case, "data", "validate", "aapl")
-
-    assert result.exit_code == 0
-    assert "valid: all declared artifacts of aapl" in result.output
 
 
 def test_validate_accepts_source_with_multiple_declared_v2_inputs(

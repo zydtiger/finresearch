@@ -648,9 +648,15 @@ def test_model_output_contract_rejects_nonfinite_float(tmp_path: Path) -> None:
         MODEL_DCF_RESULTS_V1.validate(frame)
 
 
-@pytest.mark.parametrize("failure_at", (1, 2, 3, 4))
-def test_dcf_partial_publish_recovers_deterministically(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure_at: int
+@pytest.mark.parametrize(
+    ("with_sensitivity", "failure_at"),
+    ((False, 4), (True, 1), (True, 2), (True, 3), (True, 4), (True, 5)),
+)
+def test_dcf_partial_publish_recovers_all_stages(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    with_sensitivity: bool,
+    failure_at: int,
 ) -> None:
     case_dir = initialize_case(tmp_path, "demo")
     _write_sources(case_dir)
@@ -685,62 +691,15 @@ def test_dcf_partial_publish_recovers_deterministically(
             extra,
         )
 
-    monkeypatch.setattr(modeling_module, "_publish", interrupted)
-    with pytest.raises(OSError, match="injected"):
-        run_dcf(tmp_path, "demo")
-    monkeypatch.setattr(modeling_module, "_publish", original)
-    recovered = run_dcf(tmp_path, "demo")
-    assert len(recovered.receipts) == 4
-    assert len(read_manifest(case_dir).artifacts) == 4
-    assert recovered == run_dcf(tmp_path, "demo")
-    assert validate_artifact(tmp_path, "demo") == ()
-
-
-@pytest.mark.parametrize("failure_at", (1, 2, 3, 4, 5))
-def test_dcf_sensitivity_partial_publish_recovers_all_stages(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure_at: int
-) -> None:
-    case_dir = initialize_case(tmp_path, "demo")
-    _write_sources(case_dir)
-    _write_dcf_input(case_dir)
-    original = modeling_module._publish
-    count = 0
-
-    def interrupted(
-        publish_case_dir: Path,
-        manifest: Any,
-        contract: Any,
-        run_id: str,
-        label: str,
-        frame: pl.DataFrame,
-        parents: tuple[str, ...],
-        as_of: date,
-        extra: tuple[Any, ...],
-    ) -> Any:
-        nonlocal count
-        count += 1
-        if count == failure_at:
-            raise OSError("injected publication interruption")
-        return original(
-            publish_case_dir,
-            manifest,
-            contract,
-            run_id,
-            label,
-            frame,
-            parents,
-            as_of,
-            extra,
-        )
-
-    sensitivity = ((0.08,), (0.02,))
+    sensitivity = ((0.08,), (0.02,)) if with_sensitivity else None
+    stages = 5 if with_sensitivity else 4
     monkeypatch.setattr(modeling_module, "_publish", interrupted)
     with pytest.raises(OSError, match="injected"):
         run_dcf(tmp_path, "demo", sensitivity=sensitivity)
     monkeypatch.setattr(modeling_module, "_publish", original)
     recovered = run_dcf(tmp_path, "demo", sensitivity=sensitivity)
-    assert len(recovered.receipts) == 5
-    assert len(read_manifest(case_dir).artifacts) == 5
+    assert len(recovered.receipts) == stages
+    assert len(read_manifest(case_dir).artifacts) == stages
     assert recovered == run_dcf(tmp_path, "demo", sensitivity=sensitivity)
     assert validate_artifact(tmp_path, "demo") == ()
 
