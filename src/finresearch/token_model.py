@@ -382,8 +382,13 @@ def load_token_input(
             exclude=tuple(exclusions),
         ),
     )
-    if config.session_date > as_of:
-        raise CaseContractError("price.session_date must not be after as_of")
+    # Price class resolution is not available while loading the input, so every
+    # price must be a complete bar: a session on the cutoff would pass here but
+    # fail audit as an incomplete crypto bar.
+    if config.session_date >= as_of:
+        raise CaseContractError(
+            "price.session_date must be before as_of (a complete daily bar)"
+        )
     if (
         not config.multiples.market_artifact_ids
         or not config.multiples.metric_artifact_ids
@@ -760,7 +765,15 @@ def _discounted(
         years = (period.period_end - config.as_of).days / 365.0
         if config.discount_convention == "mid_year":
             years = max(0.0, years - 0.5)
-        factor = (1 + rate) ** years
+        try:
+            factor = (1 + rate) ** years
+        except OverflowError:
+            factor = math.inf
+        if not math.isfinite(factor) or factor <= 0:
+            raise CaseContractError(
+                f"scenario {scenario.name} discount factor must be finite "
+                f"for rate {rate} over {years} years"
+            )
         paths.append(
             _Path(
                 period,
@@ -818,6 +831,7 @@ def _holders_revenue_window(
         & pl.col("chain").is_null()
         & (pl.col("period_type") == "duration")
         & (pl.col("unit") == config.currency)
+        & (pl.col("observed_at").dt.date() <= config.as_of)
     )
     values: dict[date, set[float]] = {}
     incomplete: set[date] = set()
@@ -880,6 +894,7 @@ def _peer_rows(
         observed = data.market.filter(
             (pl.col("instrument_id") == peer.instrument_id)
             & (pl.col("observed_at").dt.date() == multiples.market_observed_on)
+            & (pl.col("observed_at").dt.date() <= config.as_of)
         )
         if observed.is_empty():
             raise CaseContractError(

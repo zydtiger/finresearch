@@ -588,3 +588,61 @@ def test_audit_reports_token_source_after_cutoff(built: Path) -> None:
     )  # fmt: skip
     assert early.exit_code == 1
     assert "[token_run_after_as_of]" in early.output
+
+
+def test_price_session_must_precede_as_of(built: Path) -> None:
+    write_inputs(
+        built,
+        token_toml(
+            built, **{'session_date = "2026-11-06"': 'session_date = "2026-11-07"'}
+        ),
+    )
+    with pytest.raises(CaseContractError, match="before as_of"):
+        run_token(built, CASE)
+
+
+def test_overflowing_discount_factor_is_rejected(built: Path) -> None:
+    text = token_toml(built, **{"value = 0.3,": "value = 1e200,"})
+    write_inputs(built, text)
+    with pytest.raises(CaseContractError, match="finite"):
+        run_token(built, CASE)
+
+
+def test_metric_rows_observed_after_as_of_are_ignored(built: Path) -> None:
+    from datetime import UTC, datetime
+
+    from finresearch.token_model import (
+        Peer,
+        _holders_revenue_window,
+        load_token_input,
+    )
+
+    config, _, _ = load_token_input(
+        built / "cases" / CASE, "analysis/token-inputs.toml"
+    )
+    days = [date(2026, 11, 6) - timedelta(days=i) for i in range(30)]
+
+    def frame(observed: datetime) -> pl.DataFrame:
+        return pl.DataFrame(
+            {
+                "entity_id": ["p"] * 30,
+                "metric": ["holders_revenue"] * 30,
+                "sub_protocol": [None] * 30,
+                "chain": [None] * 30,
+                "period_type": ["duration"] * 30,
+                "unit": ["USD"] * 30,
+                "period_start": days,
+                "period_end": days,
+                "value": [1.0] * 30,
+                "is_complete": [True] * 30,
+                "observed_at": [observed] * 30,
+            },
+            schema_overrides={"observed_at": pl.Datetime("us", "UTC")},
+        )
+
+    peer = Peer("x", "p")
+    assert _holders_revenue_window(
+        config, frame(datetime(2026, 11, 7, tzinfo=UTC)), peer
+    ) == pytest.approx(365.0)
+    with pytest.raises(CaseContractError, match="no complete"):
+        _holders_revenue_window(config, frame(datetime(2026, 11, 8, tzinfo=UTC)), peer)

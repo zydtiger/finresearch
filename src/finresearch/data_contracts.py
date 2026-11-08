@@ -1566,7 +1566,11 @@ def validate_capture_url(url: str) -> None:
         parsed = urlsplit(url)
         hostname = parsed.hostname
         has_userinfo = parsed.username is not None or parsed.password is not None
-        names = [name for name, _ in parse_qsl(parsed.query, keep_blank_values=True)]
+        names = [
+            name
+            for part in (parsed.query, parsed.fragment)
+            for name, _ in parse_qsl(part, keep_blank_values=True)
+        ]
     except ValueError as exc:
         raise DataContractError(f"capture url is invalid: {exc}") from exc
     if parsed.scheme != "https" or not hostname:
