@@ -695,7 +695,7 @@ Five versioned register contracts are validated and summarized:
 | --- | --- | --- |
 | `evidence.csv` | one claim per row | unique `id`; `source_type` is `filing`/`estimate`/`external`/`assumption`; `observed_at` date |
 | `assumptions.csv` | one analyst assumption per row | unique `id`; optional `source_evidence` is one evidence id or a `;`-separated list of existing ids (no spaces, no duplicates, ascending order); a missing id is named in the error |
-| `scenarios.csv` | one scenario parameter value per row | `scenario` is `bear`/`base`/`bull`; every parameter must define all three with pairwise-distinct values |
+| `scenarios.csv` | one scenario parameter value per row | `scenario` is `bear`/`base`/`bull`/`all`; a parameter has either one `all` row (fixed across scenarios) or all three bear/base/bull rows with pairwise-distinct values, never both (`scenario_fixed_conflict`) |
 | `catalysts.csv` | one event per row | unique `id`; `impact` is `positive`/`negative`/`neutral`; optional `expected_date` |
 | `open_questions.csv` | one open item per row | unique `id`; `importance` `high`/`medium`/`low`; `status` `open`/`answered` |
 

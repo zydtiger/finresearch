@@ -230,7 +230,8 @@ declared, and `register_capture_after_observed` when the capture's
 
 The trial case's `scenario_not_distinct` failure for `token_denominator` is
 addressed by the model input instead: bases that are equal across scenarios
-belong in `token-inputs.toml`, not in `scenarios.csv`.
+belong in `token-inputs.toml`. A parameter that is intentionally equal across
+scenarios in `scenarios.csv` is declared with one `scenario=all` row.
 
 ## Must-have
 
