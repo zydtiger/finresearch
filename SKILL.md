@@ -57,6 +57,15 @@ financial values, peers, evidence, assumptions, or source IDs.
   `data normalize-fundamental-facts` only after the corresponding raw snapshot
   exists. When several eligible raw artifacts exist, select a specific
   `--raw-artifact-id` from CLI output or inspection; never guess one.
+- yfinance ingests write `raw.yfinance.daily-prices.v2`, which captures
+  `quote_type`; normalization maps it to the master `asset_class`
+  (`CRYPTOCURRENCY` to `crypto`, `EQUITY` to `equity`, `ETF` to `etf`,
+  `CURRENCY` to `fx`, `INDEX` to `index`, else `unknown`) with
+  `asset_class_source = "provider"`. `data normalize-daily-prices` fails on a
+  bar with a NULL open, high, low, or close; pass `--null-bars drop` only when
+  dropping is acceptable. It removes those bars and publishes
+  `normalized.price-gaps.v1` listing each dropped session; inconsistent OHLC
+  still fails.
 - Register every web page, document, tool summary, or API response you fetched
   yourself with `data register-capture` (record the fetch time and the sha256
   at retrieval; pass them as `--retrieved-at` and `--expect-sha256`) before

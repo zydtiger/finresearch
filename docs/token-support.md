@@ -839,8 +839,8 @@ and `token_unlocks_capture_missing` for an unresolved `capture:` reference.
 
 ### `normalized.instrument-master.v3`
 
-> **Implemented (phase 5 subset)**: contract, import, and reconciliation (see
-> `data-ingestion.md`). The yfinance raw v2 `quote_type` remains proposed.
+> **Implemented (phase 5)**: contract, import, reconciliation, and the
+> yfinance raw v2 `quote_type` mapping (see `data-ingestion.md`).
 
 v2 fields plus:
 
@@ -869,6 +869,9 @@ write master rows; the token master is an import because its ids are case
 declarations.
 
 ### Null provider bars in `normalize-daily-prices`
+
+> **Implemented (phase 5)**: see `data-ingestion.md`, "Null provider bars and
+> normalized.price-gaps.v1". The FX use of price gaps remains proposed.
 
 ```text
 finresearch --workspace PATH data normalize-daily-prices CASE_ID SYMBOL \

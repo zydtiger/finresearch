@@ -119,7 +119,8 @@ file hashes, and producer metadata:
 ```bash
 uv run finresearch \
   --workspace /path/to/research-artifacts \
-  data normalize-daily-prices aapl-2026-08-11 AAPL [--raw-artifact-id ID]
+  data normalize-daily-prices aapl-2026-08-11 AAPL [--raw-artifact-id ID] \
+  [--null-bars fail|drop]
 ```
 
 Parse one raw SEC companyfacts snapshot into structured fundamental facts:
