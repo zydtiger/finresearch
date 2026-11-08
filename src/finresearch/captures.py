@@ -122,6 +122,38 @@ def timestamp_key(value: datetime) -> str:
     return value.astimezone(UTC).strftime("%Y%m%dT%H%M%S%fZ").lower()
 
 
+PROVIDER_HOSTS: Final[dict[str, frozenset[str]]] = {
+    "coingecko": frozenset({"api.coingecko.com"}),
+    "defillama": frozenset(
+        {"api.llama.fi", "coins.llama.fi", "stablecoins.llama.fi", "yields.llama.fi"}
+    ),
+    "hyperliquid": frozenset({"api.hyperliquid.xyz"}),
+}
+
+
+def validate_capture_provider(provider: str, url: str) -> None:
+    """Reject a provider label that disagrees with the URL host.
+
+    Captures are immutable, so a wrong label would otherwise be permanent and
+    route the body to the wrong parser.
+    """
+    host = (urlsplit(url).hostname or "").lower()
+    owner = next(
+        (name for name, hosts in PROVIDER_HOSTS.items() if host in hosts), None
+    )
+    if provider == "web":
+        if owner is not None:
+            raise IngestionError(
+                f"URL host {host} belongs to provider {owner}; use --provider {owner}"
+            )
+        return
+    if owner != provider:
+        expected = ", ".join(sorted(PROVIDER_HOSTS[provider]))
+        raise IngestionError(
+            f"provider {provider} requires a URL host in: {expected} (got {host})"
+        )
+
+
 def capture_key(method: str, url: str, request_body: str | None) -> str:
     """Return a readable host slug plus a 12-digit request hash."""
     host = (urlsplit(url).hostname or "host").lower()
@@ -155,6 +187,7 @@ def publish_capture(
         raise IngestionError(
             f"provider must be one of: {', '.join(sorted(CAPTURE_PROVIDERS))}"
         )
+    validate_capture_provider(provider, url)
     if kind not in CAPTURE_KINDS:
         raise IngestionError(
             f"capture kind must be one of: {', '.join(sorted(CAPTURE_KINDS))}"

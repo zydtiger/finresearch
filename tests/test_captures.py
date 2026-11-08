@@ -146,6 +146,27 @@ def test_api_response_requires_status_and_post_body_is_canonical(
     assert loaded.request_body == '{"type":"tokenDetails","tokenId":"0xabc"}'
 
 
+def test_register_capture_rejects_provider_host_mismatch(
+    workspace: Path, tmp_path: Path
+) -> None:
+    llama = "https://api.llama.fi/summary/fees/hyperliquid"
+    wrong = register(
+        workspace, tmp_path, **{"--provider": "hyperliquid", "--url": llama}
+    )
+    assert wrong.exit_code != 0
+    assert "requires a URL host in: api.hyperliquid.xyz" in wrong.output
+    web = register(workspace, tmp_path, **{"--provider": "web", "--url": llama})
+    assert web.exit_code != 0
+    assert "use --provider defillama" in web.output
+    assert read_manifest(workspace / "cases" / "hype").artifacts == ()
+    page = register(
+        workspace,
+        tmp_path,
+        **{"--provider": "web", "--kind": "web-page", "--url": "https://x.example/p"},
+    )
+    assert page.exit_code == 0, page.output
+
+
 def test_capture_url_and_body_rules() -> None:
     validate_capture_url(
         "https://api.llama.fi/summary/fees/hyperliquid?dataType=dailyFees"
