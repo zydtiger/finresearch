@@ -84,6 +84,17 @@ time and stores it in the snapshot, so currency is a point-in-time provider
 observation rather than a later inference. A symbol whose currency cannot be
 reported fails ingestion instead of storing an unknown value.
 
+## Raw yfinance daily-prices v2
+
+Contract identifier: `raw.yfinance.daily-prices.v2`
+
+The v1 fields plus a non-null `quote_type` (`String`, e.g. `EQUITY`,
+`CRYPTOCURRENCY`, `ETF`, `CURRENCY`, `INDEX`), placed after `currency`. The
+adapter reads it from yfinance `fast_info` at retrieval time, like currency; a
+symbol whose quote type cannot be reported fails ingestion. `data
+ingest-yfinance-prices` writes v2 snapshots. v1 snapshots stay valid and
+readable, and normalize as before (`asset_class = "unknown"`).
+
 ## Command
 
 ```text
@@ -197,7 +208,7 @@ rewrites raw files or fetches from the network.
 
 ```text
 finresearch --workspace PATH data normalize-daily-prices \
-  CASE_ID SYMBOL [--raw-artifact-id ARTIFACT_ID]
+  CASE_ID SYMBOL [--raw-artifact-id ARTIFACT_ID] [--null-bars fail|drop]
 ```
 
 The v1 form wrote two registered artifacts below `data/normalized/`. In a v2
@@ -242,6 +253,37 @@ pair without adding artifacts. The instrument master registers before the
 price bars; if publication is interrupted between them, a rerun reuses the
 master receipt and completes the pair. Existing v1 cases remain readable with
 their original artifact files.
+
+Normalization reads raw v1 and v2 snapshots. A v2 snapshot writes a
+`normalized.instrument-master.v3` row whose `asset_class` maps the raw
+`quote_type` (`CRYPTOCURRENCY` to `crypto`, `EQUITY` to `equity`, `ETF` to
+`etf`, `CURRENCY` to `fx`, `INDEX` to `index`, anything else to `unknown`) and
+whose `asset_class_source` is `provider`; its token fields and `provider_ids`
+are NULL. A v1 snapshot still writes the unchanged v2 master with
+`asset_class = "unknown"`. `case audit` uses the provider class when no other
+master observation resolves the price's class.
+
+### Null provider bars and normalized.price-gaps.v1
+
+`--null-bars fail` (default) keeps the rule above: a bar with a NULL open,
+high, low, or close fails normalization. `--null-bars drop` removes those bars
+from `normalized.daily-prices.v2` and publishes a companion
+`normalized.price-gaps.v1` artifact, always, even when no bar was dropped
+(`allow_empty`). The policy is a producer parameter of the prices and gaps
+artifacts, so `drop` output has a distinct artifact id from `fail` output;
+`fail` output keeps its existing identity. Bars with present but inconsistent
+OHLC still fail under `drop`. The corporate-actions table is unaffected.
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `schema_version` | `UInt16` | `1` |
+| `instrument_id` | `String` | Instrument |
+| `session_date` | `Date` | Dropped session |
+| `reason` | `String` | `null_ohlc` |
+| `null_fields` | `String` | Sorted comma list of the NULL fields among `open`, `high`, `low`, `close`, e.g. `close,high,low,open` |
+| `source_artifact_id` | `String` | Raw snapshot |
+
+Unique key `(instrument_id, session_date, source_artifact_id)`.
 
 Both legacy normalized tables share the same `DatasetContract` registry, so
 `data validate` and `data inspect` cover them without extra code.
