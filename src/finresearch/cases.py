@@ -166,8 +166,8 @@ def initialize_case(workspace: Path, case_id: str, title: str | None = None) -> 
         raise CaseContractError(f"case already exists: {validated_id}") from exc
 
     try:
-        for role in REQUIRED_PATH_ROLES:
-            (case_dir / DEFAULT_PATHS[role]).mkdir(parents=True)
+        for path in DEFAULT_PATHS.values():
+            (case_dir / path).mkdir(parents=True)
         write_manifest(case_dir, new_manifest(validated_id, case_title))
     except Exception:
         shutil.rmtree(case_dir)

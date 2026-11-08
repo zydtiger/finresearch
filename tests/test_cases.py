@@ -53,7 +53,7 @@ def test_v1_case_remains_valid_without_implicit_migration(tmp_path: Path) -> Non
     assert read_manifest(case_dir).manifest_version == 1
 
 
-def test_initialize_case_creates_only_core_directories(tmp_path: Path) -> None:
+def test_initialize_case_creates_empty_role_directories(tmp_path: Path) -> None:
     case_dir = initialize_case(tmp_path, "aapl-2026-08-11", "Apple valuation")
 
     manifest = read_manifest(case_dir)
@@ -61,8 +61,10 @@ def test_initialize_case_creates_only_core_directories(tmp_path: Path) -> None:
     assert manifest.title == "Apple valuation"
     for role in REQUIRED_PATH_ROLES:
         assert (case_dir / manifest.paths[role]).is_dir()
-    assert not (case_dir / manifest.paths["registers"]).exists()
-    assert not (case_dir / manifest.paths["analysis"]).exists()
+    for role in ("registers", "analysis"):
+        directory = case_dir / manifest.paths[role]
+        assert directory.is_dir()
+        assert not any(directory.iterdir())
 
 
 @pytest.mark.parametrize(

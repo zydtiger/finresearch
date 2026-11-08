@@ -22,17 +22,19 @@ The CLI does not discover, configure, or infer the workspace.
 └── cases/
     └── <case-id>/
         ├── manifest.toml
-        ├── registers/          # optional; created when research registers exist
+        ├── registers/          # created empty; holds research register CSVs
         ├── data/
         │   ├── raw/            # required; immutable source inputs
         │   ├── normalized/     # required; canonical source-faithful data
         │   └── derived/        # required; reproducible calculations
-        ├── analysis/           # optional; user/agent-owned case-specific Python
+        ├── analysis/           # created empty; user/agent-owned case-specific files
         └── reports/            # required; Markdown and HTML deliverables
 ```
 
-`case init` creates the manifest and required directories. It does not create
-register files, analysis scripts, placeholder data, or reports.
+`case init` creates the manifest, the required directories, and empty
+`registers/` and `analysis/` directories. It does not create register files,
+analysis scripts, placeholder data, or reports. Existing cases without those
+two directories remain valid.
 
 ## Case identifiers
 

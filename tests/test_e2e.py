@@ -34,7 +34,7 @@ def _write_csv(path: Path, header: list[str], row: list[str]) -> None:
 
 def _write_audited_registers(case_dir: Path) -> None:
     registers = case_dir / "registers"
-    registers.mkdir()
+    registers.mkdir(exist_ok=True)
     evidence = [
         "id",
         "claim",
@@ -90,7 +90,7 @@ def _write_audited_registers(case_dir: Path) -> None:
 
 def _write_dcf_input(case_dir: Path) -> None:
     analysis = case_dir / "analysis"
-    analysis.mkdir()
+    analysis.mkdir(exist_ok=True)
     (analysis / "dcf-inputs.toml").write_text(
         """version = 1
 as_of = "2026-06-30"
