@@ -206,6 +206,15 @@ uv run finresearch --workspace /path/to/research-artifacts \
   --metrics ev_revenue,ev_ebitda
 ```
 
+Value a token from tokenholder cash flows, a reconciled supply path, and peer
+revenue multiples (inputs in `analysis/token-inputs.toml`):
+
+```bash
+uv run finresearch --workspace /path/to/research-artifacts \
+  model token hype-2026-11-07 --input analysis/token-inputs.toml \
+  --scenario all [--sensitivity "0.2,0.25;0.02,0.03"]
+```
+
 See [the modeling contract](docs/modeling.md) for strict source-provenance,
 input, and projection-gate requirements.
 

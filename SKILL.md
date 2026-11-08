@@ -221,6 +221,28 @@ finresearch --workspace WORKSPACE model comps CASE_ID --input ARTIFACT_ID \
   --as-of YYYY-MM-DD --metrics ev_revenue,ev_ebitda --target COMPANY_ID
 ```
 
+### Token valuation
+
+`model token CASE_ID --input analysis/token-inputs.toml` is the token
+counterpart of `model dcf`: strict TOML, every economic leaf a
+`{ value, unit, source_id }` resolving to a dated evidence or assumption row,
+no values on the command line. Prerequisites, all CLI-owned: a daily-prices.v2
+artifact for the price session (a v3 master row plus `price.master_artifact_id`
+when the price instrument id differs from the token's), a
+`derived.token-supply-reconciliation` with a selected `circulating` row and a
+selected row for `fully_diluted_metric` (an unresolved `conflict` aborts the
+run), token-market artifacts and protocol-metrics artifacts for the peers.
+Your judgments live in the TOML: `fully_diluted_metric` (`total` or `max`),
+per-scenario `fully_diluted` overrides naming a non-conflict observation,
+`held_buyback_treatment` (`exclude` removes held buyback tokens from
+circulating supply; `include` keeps them), the `capture_mix`, unlock
+realization, peers, and exclusions with a `reason_source_id`. Peer multiples
+use only aggregate rows over a complete window ending before
+`market_observed_on`; a stablecoin-quoted market value needs a sourced `[pegs]`
+leaf. Bases that are equal across scenarios belong in the TOML, not in
+`scenarios.csv`. Report and audit work as for DCF; token audit codes are
+prefixed `token_run_`.
+
 ## Report and close the audit loop
 
 Render a report only from a complete registered DCF or comps `run_id`:

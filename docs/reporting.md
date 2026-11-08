@@ -65,6 +65,14 @@ producing command in the caption. It has no external assets. One-dimensional
 or incomplete grids retain the table without a heatmap. Markdown deliberately
 keeps the portable table only.
 
+A token run (`model.token-*`, see [`modeling.md`](modeling.md#token-model))
+reports from the same typed context and adds the supply path, peer multiples,
+cash flow (and sensitivity) tables to both formats. Audit authenticates it by
+full reconstruction from the registered `token-inputs.toml`, registers, and
+every referenced artifact, with issue codes `token_run_identity_invalid`,
+`token_run_after_as_of`, `token_run_source_missing`, and
+`token_run_source_after_as_of`.
+
 Reports are immutable `report.markdown.v1` or `report.html.v1` artifacts under
 the case `reports` role. Their identity is the canonical format, run id,
 ordered model-parent ids and checksums, and report producer version. The report

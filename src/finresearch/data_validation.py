@@ -286,7 +286,12 @@ def _validate_parquet_artifact(
         and not frame.is_empty()
         and "source_artifact_id" in frame.columns
     ):
-        sources = frame.get_column("source_artifact_id").unique().to_list()
+        source_column = frame.get_column("source_artifact_id")
+        if "source_artifact_id" not in contract.non_nullable:
+            # A nullable lineage column (token model inputs) cites an artifact
+            # only on rows resolved from one.
+            source_column = source_column.drop_nulls()
+        sources = source_column.unique().to_list()
         if any(not isinstance(source, str) for source in sources):
             issues.append(
                 ValidationIssue(

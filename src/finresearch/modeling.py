@@ -54,6 +54,7 @@ from finresearch.model import (
 )
 from finresearch.registers import ModelSource, load_model_sources
 
+ModelFamily = Literal["dcf", "comps", "token"]
 MODEL_PRODUCER = "finresearch.model"
 MODEL_PRODUCER_VERSION = "1"
 _SCENARIOS = ("bear", "base", "bull")
@@ -107,7 +108,7 @@ class ModelRun:
 class AuthenticatedModelRun:
     """A model run whose cutoff and identity were reproduced from case bytes."""
 
-    family: Literal["dcf", "comps"]
+    family: ModelFamily
     run_id: str
     as_of: date
     artifacts: tuple[Artifact, ...]
@@ -1027,6 +1028,15 @@ _DCF_RUN_SPECS = (
     _RunArtifactSpec("model.dcf-reconciliation", "reconciliation", 1),
     _RunArtifactSpec("model.dcf-sensitivity", "sensitivity", 1, optional=True),
 )
+_TOKEN_RUN_SPECS = (
+    _RunArtifactSpec("model.token-inputs", "inputs", 1),
+    _RunArtifactSpec("model.token-supply-path", "supply-path", 1),
+    _RunArtifactSpec("model.token-cashflows", "cashflows", 1),
+    _RunArtifactSpec("model.token-peer-multiples", "peer-multiples", 1),
+    _RunArtifactSpec("model.token-results", "results", 1),
+    _RunArtifactSpec("model.token-sensitivity", "sensitivity", 1, optional=True),
+    _RunArtifactSpec("model.token-reconciliation", "reconciliation", 1),
+)
 _COMPS_RUN_SPECS = (
     _RunArtifactSpec("model.comps-inputs", "inputs", 2),
     _RunArtifactSpec("model.comps-results", "results", 1),
@@ -1039,7 +1049,7 @@ def resolve_model_run(
     case_dir: Path,
     manifest: CaseManifest,
     *,
-    family: Literal["dcf", "comps"],
+    family: ModelFamily,
     run_id: str,
     verify_hashes: bool = True,
 ) -> AuthenticatedModelRun:
@@ -1062,6 +1072,17 @@ def resolve_model_run(
         _validate_model_run_graph(artifacts, family)
         if family == "dcf":
             as_of = _authenticate_dcf_run(
+                case_dir,
+                manifest,
+                artifacts,
+                tables,
+                run_id,
+                verify_hashes=verify_hashes,
+            )
+        elif family == "token":
+            from finresearch.token_model import authenticate_token_run
+
+            as_of = authenticate_token_run(
                 case_dir,
                 manifest,
                 artifacts,
@@ -1097,7 +1118,7 @@ def authenticate_model_run(
     case_dir: Path,
     manifest: CaseManifest,
     *,
-    family: Literal["dcf", "comps"],
+    family: ModelFamily,
     run_id: str,
     verify_hashes: bool = True,
 ) -> AuthenticatedModelRun:
@@ -1118,8 +1139,9 @@ def authenticate_case_model_runs(
     verify_hashes: bool = True,
 ) -> tuple[tuple[AuthenticatedModelRun, ...], tuple[ValidationIssue, ...]]:
     """Authenticate every complete discoverable run without raising for one bad run."""
-    candidates: set[tuple[Literal["dcf", "comps"], str]] = set()
-    for family in ("dcf", "comps"):
+    candidates: set[tuple[ModelFamily, str]] = set()
+    families: tuple[ModelFamily, ...] = ("dcf", "comps", "token")
+    for family in families:
         result_spec = next(
             item for item in _run_specs(family) if item.label == "results"
         )
@@ -1158,7 +1180,9 @@ def authenticate_case_model_runs(
         except CaseContractError as exc:
             issues.append(
                 ValidationIssue(
-                    "model_run_identity_invalid",
+                    "token_run_identity_invalid"
+                    if family == "token"
+                    else "model_run_identity_invalid",
                     f"{family} run {run_id}: {exc}",
                 )
             )
@@ -1166,7 +1190,7 @@ def authenticate_case_model_runs(
 
 
 def model_run_is_declared(
-    manifest: CaseManifest, family: Literal["dcf", "comps"], run_id: str
+    manifest: CaseManifest, family: ModelFamily, run_id: str
 ) -> bool:
     """Return whether manifest identity claims the requested run family/id."""
     return any(
@@ -1181,7 +1205,7 @@ def model_run_is_declared(
 def _resolve_model_artifacts(
     case_dir: Path,
     manifest: CaseManifest,
-    family: Literal["dcf", "comps"],
+    family: ModelFamily,
     run_id: str,
     *,
     verify_hashes: bool,
@@ -1239,7 +1263,9 @@ def _resolve_model_artifacts(
     return tuple(selected), tuple(tables)
 
 
-def _run_specs(family: Literal["dcf", "comps"]) -> tuple[_RunArtifactSpec, ...]:
+def _run_specs(family: ModelFamily) -> tuple[_RunArtifactSpec, ...]:
+    if family == "token":
+        return _TOKEN_RUN_SPECS
     return _DCF_RUN_SPECS if family == "dcf" else _COMPS_RUN_SPECS
 
 
@@ -1284,8 +1310,11 @@ def _reject_alternate_model_tables(
 
 
 def _validate_model_run_graph(
-    artifacts: tuple[Artifact, ...], family: Literal["dcf", "comps"]
+    artifacts: tuple[Artifact, ...], family: ModelFamily
 ) -> None:
+    if family == "token":
+        # Exact per-kind parents are enforced by token authentication.
+        return
     by_kind = {artifact.kind: artifact for artifact in artifacts}
     inputs = by_kind[f"model.{family}-inputs"]
     results = by_kind[f"model.{family}-results"]
