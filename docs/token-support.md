@@ -618,6 +618,12 @@ ignoring the issue.
 
 ### `model token`
 
+> **Implemented (phase 4)**: see `modeling.md`, "Token model", and
+> `reporting.md`. Differences from this proposal are listed there:
+> `[price] master_artifact_id`, per-basis peer exclusions for a missing
+> market observation, `[pegs]` as a named table, and `unlocks_artifact_id`
+> deferred with `token-unlocks.v1`.
+
 ```text
 finresearch --workspace PATH model token CASE_ID \
   --input analysis/token-inputs.toml \

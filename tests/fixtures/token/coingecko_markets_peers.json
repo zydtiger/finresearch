@@ -1,0 +1,41 @@
+[
+  {
+    "id": "aster",
+    "symbol": "aster",
+    "name": "Aster",
+    "current_price": 1.2,
+    "market_cap": 600000000,
+    "fully_diluted_valuation": 1200000000,
+    "total_volume": 5000000.0,
+    "circulating_supply": 500000000.0,
+    "total_supply": 1000000000.0,
+    "max_supply": 1000000000.0,
+    "last_updated": "2026-11-07T20:27:10.000Z"
+  },
+  {
+    "id": "dydx-chain",
+    "symbol": "dydx",
+    "name": "dYdX",
+    "current_price": 0.31,
+    "market_cap": 280000000,
+    "fully_diluted_valuation": 1000000000,
+    "total_volume": 9000000.0,
+    "circulating_supply": 903000000.0,
+    "total_supply": 1000000000.0,
+    "max_supply": 1000000000.0,
+    "last_updated": "2026-11-07T20:27:10.000Z"
+  },
+  {
+    "id": "zero-coin",
+    "symbol": "zero",
+    "name": "Zero",
+    "current_price": 0.5,
+    "market_cap": 50000000,
+    "fully_diluted_valuation": null,
+    "total_volume": 1000.0,
+    "circulating_supply": 100000000.0,
+    "total_supply": null,
+    "max_supply": null,
+    "last_updated": "2026-11-07T20:27:10.000Z"
+  }
+]

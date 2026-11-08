@@ -6,7 +6,6 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Literal
 
 import polars as pl
 
@@ -25,6 +24,7 @@ from finresearch.data_contracts import ASSET_CLASSES, provider_id_pairs
 from finresearch.data_validation import validate_artifact
 from finresearch.modeling import (
     AuthenticatedModelRun,
+    ModelFamily,
     authenticate_case_model_runs,
     resolve_model_run,
 )
@@ -110,7 +110,9 @@ def audit_case(
         if model_run.as_of > as_of:
             issues.append(
                 ValidationIssue(
-                    "model_run_after_as_of",
+                    "token_run_after_as_of"
+                    if model_run.family == "token"
+                    else "model_run_after_as_of",
                     f"{model_run.family} run {model_run.run_id} is dated after "
                     f"audit as_of {as_of.isoformat()}",
                 )
@@ -135,7 +137,7 @@ def audit_model_run(
     workspace: Path,
     case_id: str,
     *,
-    family: Literal["dcf", "comps"],
+    family: ModelFamily,
     run_id: str,
     max_price_age_days: int,
     verify_hashes: bool = False,
@@ -539,8 +541,11 @@ def _datetime_cutoff_issues(
 def _model_lookahead_issues(
     case_dir: Path, kind: str, frame: pl.DataFrame, as_of: date
 ) -> list[ValidationIssue]:
-    if kind not in {"model.dcf-inputs", "model.comps-inputs"}:
+    if kind not in {"model.dcf-inputs", "model.comps-inputs", "model.token-inputs"}:
         return []
+    token = kind == "model.token-inputs"
+    missing_code = "token_run_source_missing" if token else "model_source_missing"
+    after_code = "token_run_source_after_as_of" if token else "model_source_after_as_of"
     try:
         sources = load_model_sources(case_dir, as_of=as_of)
     except CaseContractError as exc:
@@ -556,14 +561,14 @@ def _model_lookahead_issues(
             if source is None:
                 issues.append(
                     ValidationIssue(
-                        "model_source_missing",
+                        missing_code,
                         f"model source id is missing: {source_id}",
                     )
                 )
             elif source.effective_date > as_of:
                 issues.append(
                     ValidationIssue(
-                        "model_source_after_as_of",
+                        after_code,
                         f"model source {source_id} is dated after audit as_of "
                         f"{as_of.isoformat()}",
                     )

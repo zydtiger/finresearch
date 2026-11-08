@@ -27,7 +27,7 @@ from finresearch.cases import (
     canonical_parameters_sha256,
     resolve_relative_path,
 )
-from finresearch.modeling import model_run_is_declared, resolve_model_run
+from finresearch.modeling import ModelFamily, model_run_is_declared, resolve_model_run
 
 REPORT_PRODUCER = "finresearch.report"
 REPORT_MARKDOWN_PRODUCER_VERSION = "1"
@@ -51,7 +51,7 @@ class ReportContext:
 
     case_id: str
     run_id: str
-    family: Literal["dcf", "comps"]
+    family: ModelFamily
     as_of: date
     artifacts: tuple[Artifact, ...]
     source_ids: tuple[str, ...]
@@ -59,6 +59,8 @@ class ReportContext:
     results: pl.DataFrame
     summary: pl.DataFrame | None
     sensitivity: pl.DataFrame | None
+    # Additional titled tables rendered after the summary (token runs).
+    extra_tables: tuple[tuple[str, pl.DataFrame], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -96,10 +98,14 @@ def resolve_report_context(
     comps = _context_for_family(
         case_dir, manifest, case_id, run_id, "comps", verify_hashes=verify_hashes
     )
-    found = [context for context in (dcf, comps) if context is not None]
+    token = _context_for_family(
+        case_dir, manifest, case_id, run_id, "token", verify_hashes=verify_hashes
+    )
+    found = [context for context in (dcf, comps, token) if context is not None]
     if len(found) != 1:
         raise CaseContractError(
-            "model run must resolve to exactly one complete DCF or comps artifact set"
+            "model run must resolve to exactly one complete DCF, comps, or token "
+            "artifact set"
         )
     return found[0]
 
@@ -271,7 +277,7 @@ def _context_for_family(
     manifest: CaseManifest,
     case_id: str,
     run_id: str,
-    family: Literal["dcf", "comps"],
+    family: ModelFamily,
     *,
     verify_hashes: bool,
 ) -> ReportContext | None:
@@ -288,9 +294,9 @@ def _context_for_family(
     if reconciliation.filter(pl.col("status") == "failed").height:
         raise CaseContractError(f"run {run_id} has failed reconciliation checks")
     inputs = resolved.table(f"model.{family}-inputs")
-    source_ids = tuple(sorted(set(inputs["source_id"].to_list())))
+    source_ids = tuple(sorted(set(inputs["source_id"].drop_nulls().to_list())))
     source_artifacts = (
-        tuple(sorted(set(inputs["source_artifact_id"].to_list())))
+        tuple(sorted(set(inputs["source_artifact_id"].drop_nulls().to_list())))
         if "source_artifact_id" in inputs.columns
         else ()
     )
@@ -308,6 +314,20 @@ def _context_for_family(
             resolved.table("model.dcf-sensitivity")
             if any(kind == "model.dcf-sensitivity" for kind, _ in resolved.tables)
             else None
+        ),
+        (
+            (
+                ("Supply path", resolved.table("model.token-supply-path")),
+                ("Peer multiples", resolved.table("model.token-peer-multiples")),
+                ("Cash flows", resolved.table("model.token-cashflows")),
+            )
+            + (
+                (("Sensitivity", resolved.table("model.token-sensitivity")),)
+                if any(k == "model.token-sensitivity" for k, _ in resolved.tables)
+                else ()
+            )
+            if family == "token"
+            else ()
         ),
     )
 
@@ -339,6 +359,8 @@ def render_markdown(context: ReportContext) -> bytes:
         lines.extend(["", "## Peer summary", "", *_markdown_table(context.summary)])
     if context.sensitivity is not None:
         lines.extend(["", "## Sensitivity", "", *_markdown_table(context.sensitivity)])
+    for title, table in context.extra_tables:
+        lines.extend(["", f"## {title}", "", *_markdown_table(table)])
     return ("\n".join(lines) + "\n").encode("utf-8")
 
 
@@ -438,6 +460,8 @@ def _render_html_v2(context: ReportContext) -> bytes:
                 _html_table(context.sensitivity),
             ]
         )
+    for title, table in context.extra_tables:
+        sections.extend([f"<h2>{html.escape(title)}</h2>", _html_table(table)])
     sections.append("</body></html>\n")
     return "".join(sections).encode("utf-8")
 

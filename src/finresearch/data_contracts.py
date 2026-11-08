@@ -1064,7 +1064,9 @@ def _validate_dcf_sensitivity_v1(frame: pl.DataFrame) -> None:
             )
 
 
-def _validate_reconciliation_v1(frame: pl.DataFrame) -> None:
+def _validate_reconciliation_v1(
+    frame: pl.DataFrame, extra_units: frozenset[str] = frozenset()
+) -> None:
     _validate_finite_model_values(frame, "model reconciliation")
     for row in frame.iter_rows(named=True):
         if row["status"] not in {"passed", "failed", "excluded"}:
@@ -1073,7 +1075,7 @@ def _validate_reconciliation_v1(frame: pl.DataFrame) -> None:
         controlled_units = {"x"}
         for currency in CURRENCY_CODES:
             controlled_units |= _amount_units(currency) | {f"{currency}/share"}
-        if unit not in controlled_units:
+        if unit not in controlled_units | extra_units:
             raise _semantic_error("model reconciliation", "unit is not controlled")
         tolerance = 1e-9 * max(1.0, abs(row["expected"]))
         if abs(row["difference"] - (row["actual"] - row["expected"])) > tolerance:
@@ -2195,7 +2197,329 @@ DERIVED_INSTRUMENT_MASTER_CURRENT_V2: Final = DatasetContract(
     semantic_validator=_validate_reconciled_instrument_master_v2,
 )
 
+TOKEN_SCALES: Final = ("tokens", "tokens_k", "tokens_m", "tokens_b")
+PEG_UNIT_PATTERN: Final = re.compile(r"([A-Z]{3})/(USDC|USDH|USDT)")
+_TOKEN_RESULT_METHODS: Final = frozenset({"dcf", "multiple"})
+_TOKEN_BASES: Final = frozenset({"circulating", "fully_diluted"})
+
+
+def _token_units() -> frozenset[str]:
+    units: set[str] = set(TOKEN_SCALES) | {"ratio", "multiple", "x"}
+    for currency in CURRENCY_CODES:
+        units |= _amount_units(currency) | {f"{currency}/token"}
+        units |= {f"{currency}/{coin}" for coin in STABLECOIN_QUOTE_ASSETS}
+    return frozenset(units)
+
+
+def _validate_token_inputs_v1(frame: pl.DataFrame) -> None:
+    contract = "model.token-inputs.v1"
+    _validate_finite_model_values(frame, contract)
+    units = _token_units()
+    for row in frame.iter_rows(named=True):
+        if row["scenario"] not in _DCF_SCENARIOS:
+            raise _semantic_error(contract, "scenario is not controlled")
+        if row["unit"] not in units:
+            raise _semantic_error(contract, "unit is not controlled")
+        if (row["source_id"] is None) == (row["source_artifact_id"] is None):
+            raise _semantic_error(
+                contract, "exactly one of source_id and source_artifact_id is required"
+            )
+
+
+def _validate_token_supply_path_v1(frame: pl.DataFrame) -> None:
+    contract = "model.token-supply-path.v1"
+    _validate_finite_model_values(frame, contract)
+    for row in frame.iter_rows(named=True):
+        if row["scenario"] not in _DCF_SCENARIOS:
+            raise _semantic_error(contract, "scenario is not controlled")
+        if row["token_unit"] not in TOKEN_SCALES:
+            raise _semantic_error(contract, "token_unit is not controlled")
+
+
+def _validate_token_cashflows_v1(frame: pl.DataFrame) -> None:
+    contract = "model.token-cashflows.v1"
+    _validate_finite_model_values(frame, contract)
+    for row in frame.iter_rows(named=True):
+        if row["scenario"] not in _DCF_SCENARIOS:
+            raise _semantic_error(contract, "scenario is not controlled")
+        if row["currency"] not in CURRENCY_CODES:
+            raise _semantic_error(contract, "currency is not controlled")
+        if row["unit"] not in _amount_units(row["currency"]):
+            raise _semantic_error(contract, "unit must be a currency amount scale")
+        if row["discount_factor"] <= 0:
+            raise _semantic_error(contract, "discount_factor must be positive")
+
+
+def _validate_token_peer_multiples_v1(frame: pl.DataFrame) -> None:
+    contract = "model.token-peer-multiples.v1"
+    _validate_finite_model_values(frame, contract)
+    for row in frame.iter_rows(named=True):
+        if row["basis"] not in _TOKEN_BASES:
+            raise _semantic_error(contract, "basis is not controlled")
+        if row["currency"] not in CURRENCY_CODES:
+            raise _semantic_error(contract, "currency is not controlled")
+        included = row["status"] == "included"
+        if row["status"] not in {"included", "excluded"}:
+            raise _semantic_error(contract, "status is not controlled")
+        if included != (row["multiple"] is not None) or included == (
+            row["exclusion_reason"] is not None
+        ):
+            raise _semantic_error(
+                contract, "multiple and exclusion_reason must match the status"
+            )
+
+
+def _validate_token_results_v1(frame: pl.DataFrame) -> None:
+    contract = "model.token-results.v1"
+    _validate_finite_model_values(frame, contract)
+    for row in frame.iter_rows(named=True):
+        currency = row["currency"]
+        if row["scenario"] not in _DCF_SCENARIOS:
+            raise _semantic_error(contract, "scenario is not controlled")
+        if (
+            row["method"] not in _TOKEN_RESULT_METHODS
+            or row["basis"] not in _TOKEN_BASES
+        ):
+            raise _semantic_error(contract, "method or basis is not controlled")
+        if currency not in CURRENCY_CODES:
+            raise _semantic_error(contract, "currency is not controlled")
+        if row["value_unit"] not in _amount_units(currency):
+            raise _semantic_error(contract, "value_unit is not controlled")
+        if row["token_unit"] not in TOKEN_SCALES:
+            raise _semantic_error(contract, "token_unit is not controlled")
+        if row["per_token_unit"] != f"{currency}/token":
+            raise _semantic_error(contract, "per_token_unit is incompatible")
+        if row["denominator_tokens"] <= 0 or row["price"] <= 0:
+            raise _semantic_error(
+                contract, "denominator_tokens and price must be positive"
+            )
+        dcf = row["method"] == "dcf"
+        if (row["multiple_applied"] is None) != dcf:
+            raise _semantic_error(
+                contract, "multiple_applied is for multiple rows only"
+            )
+        if (row["terminal_share"] is None) == dcf:
+            raise _semantic_error(contract, "terminal_share is for dcf rows only")
+        if (row["implied_cf_scale"] is not None) != (
+            dcf and row["basis"] == "fully_diluted"
+        ):
+            raise _semantic_error(
+                contract, "implied_cf_scale belongs on dcf fully_diluted rows only"
+            )
+
+
+def _validate_token_sensitivity_v1(frame: pl.DataFrame) -> None:
+    contract = "model.token-sensitivity.v1"
+    _validate_finite_model_values(frame, contract)
+    for row in frame.iter_rows(named=True):
+        if row["scenario"] not in _DCF_SCENARIOS:
+            raise _semantic_error(contract, "scenario is not controlled")
+        if row["per_token_unit"] != f"{row['currency']}/token":
+            raise _semantic_error(contract, "per_token_unit is incompatible")
+        if (
+            row["discount_rate"] <= 0
+            or row["terminal_growth"] <= -1
+            or row["terminal_growth"] >= row["discount_rate"]
+        ):
+            raise _semantic_error(contract, "invalid discount_rate/growth pair")
+
+
+def _validate_token_reconciliation_v1(frame: pl.DataFrame) -> None:
+    _validate_reconciliation_v1(
+        frame,
+        frozenset(TOKEN_SCALES) | {f"{currency}/token" for currency in CURRENCY_CODES},
+    )
+    if any(value not in _DCF_SCENARIOS for value in frame["scenario"].to_list()):
+        raise _semantic_error(
+            "model.token-reconciliation.v1", "scenario is not controlled"
+        )
+
+
+MODEL_TOKEN_INPUTS_V1_FIELDS: Final = {
+    "schema_version": pl.UInt16,
+    "run_id": pl.String,
+    "scenario": pl.String,
+    "field": pl.String,
+    "period_end": pl.Date,
+    "value": pl.Float64,
+    "unit": pl.String,
+    "source_id": pl.String,
+    "source_artifact_id": pl.String,
+}
+MODEL_TOKEN_INPUTS_V1: Final = DatasetContract(
+    name="model.token-inputs",
+    version=1,
+    schema=pl.Schema(MODEL_TOKEN_INPUTS_V1_FIELDS),
+    non_nullable=(
+        "schema_version",
+        "run_id",
+        "scenario",
+        "field",
+        "value",
+        "unit",
+    ),
+    unique_key=("run_id", "scenario", "field", "period_end"),
+    sort_key=("scenario", "field", "period_end"),
+    semantic_validator=_validate_token_inputs_v1,
+)
+
+MODEL_TOKEN_SUPPLY_PATH_V1_FIELDS: Final = {
+    "schema_version": pl.UInt16,
+    "run_id": pl.String,
+    "scenario": pl.String,
+    "period_end": pl.Date,
+    "opening_circulating": pl.Float64,
+    "unlocks_realized": pl.Float64,
+    "emissions": pl.Float64,
+    "buyback_tokens": pl.Float64,
+    "retired_tokens": pl.Float64,
+    "closing_circulating": pl.Float64,
+    "opening_fully_diluted": pl.Float64,
+    "closing_fully_diluted": pl.Float64,
+    "absorption_ratio": pl.Float64,
+    "token_unit": pl.String,
+}
+MODEL_TOKEN_SUPPLY_PATH_V1: Final = DatasetContract(
+    name="model.token-supply-path",
+    version=1,
+    schema=pl.Schema(MODEL_TOKEN_SUPPLY_PATH_V1_FIELDS),
+    non_nullable=tuple(
+        name for name in MODEL_TOKEN_SUPPLY_PATH_V1_FIELDS if name != "absorption_ratio"
+    ),
+    unique_key=("run_id", "scenario", "period_end"),
+    sort_key=("scenario", "period_end"),
+    semantic_validator=_validate_token_supply_path_v1,
+)
+
+MODEL_TOKEN_CASHFLOWS_V1_FIELDS: Final = {
+    "schema_version": pl.UInt16,
+    "run_id": pl.String,
+    "scenario": pl.String,
+    "period_end": pl.Date,
+    "holders_revenue": pl.Float64,
+    "capture_ratio": pl.Float64,
+    "tokenholder_cash_flow": pl.Float64,
+    "buyback_cash": pl.Float64,
+    "burn_cash": pl.Float64,
+    "distribution_cash": pl.Float64,
+    "year_fraction": pl.Float64,
+    "discount_factor": pl.Float64,
+    "present_value": pl.Float64,
+    "currency": pl.String,
+    "unit": pl.String,
+}
+MODEL_TOKEN_CASHFLOWS_V1: Final = DatasetContract(
+    name="model.token-cashflows",
+    version=1,
+    schema=pl.Schema(MODEL_TOKEN_CASHFLOWS_V1_FIELDS),
+    non_nullable=tuple(MODEL_TOKEN_CASHFLOWS_V1_FIELDS),
+    unique_key=("run_id", "scenario", "period_end"),
+    sort_key=("scenario", "period_end"),
+    semantic_validator=_validate_token_cashflows_v1,
+)
+
+MODEL_TOKEN_PEER_MULTIPLES_V1_FIELDS: Final = {
+    "schema_version": pl.UInt16,
+    "run_id": pl.String,
+    "peer_instrument_id": pl.String,
+    "peer_entity_id": pl.String,
+    "basis": pl.String,
+    "numerator": pl.Float64,
+    "denominator": pl.Float64,
+    "multiple": pl.Float64,
+    "status": pl.String,
+    "exclusion_reason": pl.String,
+    "currency": pl.String,
+}
+MODEL_TOKEN_PEER_MULTIPLES_V1: Final = DatasetContract(
+    name="model.token-peer-multiples",
+    version=1,
+    schema=pl.Schema(MODEL_TOKEN_PEER_MULTIPLES_V1_FIELDS),
+    non_nullable=(
+        "schema_version",
+        "run_id",
+        "peer_instrument_id",
+        "basis",
+        "status",
+        "currency",
+    ),
+    unique_key=("run_id", "peer_instrument_id", "basis"),
+    sort_key=("basis", "peer_instrument_id"),
+    semantic_validator=_validate_token_peer_multiples_v1,
+)
+
+MODEL_TOKEN_RESULTS_V1_FIELDS: Final = {
+    "schema_version": pl.UInt16,
+    "run_id": pl.String,
+    "scenario": pl.String,
+    "method": pl.String,
+    "basis": pl.String,
+    "aggregate_value": pl.Float64,
+    "denominator_tokens": pl.Float64,
+    "per_token_value": pl.Float64,
+    "price": pl.Float64,
+    "upside": pl.Float64,
+    "terminal_share": pl.Float64,
+    "multiple_applied": pl.Float64,
+    "implied_cf_scale": pl.Float64,
+    "currency": pl.String,
+    "value_unit": pl.String,
+    "token_unit": pl.String,
+    "per_token_unit": pl.String,
+}
+MODEL_TOKEN_RESULTS_V1: Final = DatasetContract(
+    name="model.token-results",
+    version=1,
+    schema=pl.Schema(MODEL_TOKEN_RESULTS_V1_FIELDS),
+    non_nullable=tuple(
+        name
+        for name in MODEL_TOKEN_RESULTS_V1_FIELDS
+        if name not in {"terminal_share", "multiple_applied", "implied_cf_scale"}
+    ),
+    unique_key=("run_id", "scenario", "method", "basis"),
+    sort_key=("scenario", "method", "basis"),
+    semantic_validator=_validate_token_results_v1,
+)
+
+MODEL_TOKEN_SENSITIVITY_V1_FIELDS: Final = {
+    "schema_version": pl.UInt16,
+    "run_id": pl.String,
+    "scenario": pl.String,
+    "discount_rate": pl.Float64,
+    "terminal_growth": pl.Float64,
+    "per_token_value_fd": pl.Float64,
+    "currency": pl.String,
+    "token_unit": pl.String,
+    "per_token_unit": pl.String,
+}
+MODEL_TOKEN_SENSITIVITY_V1: Final = DatasetContract(
+    name="model.token-sensitivity",
+    version=1,
+    schema=pl.Schema(MODEL_TOKEN_SENSITIVITY_V1_FIELDS),
+    non_nullable=tuple(MODEL_TOKEN_SENSITIVITY_V1_FIELDS),
+    unique_key=("run_id", "scenario", "discount_rate", "terminal_growth"),
+    sort_key=("scenario", "terminal_growth", "discount_rate"),
+    semantic_validator=_validate_token_sensitivity_v1,
+)
+
+MODEL_TOKEN_RECONCILIATION_V1: Final = DatasetContract(
+    name="model.token-reconciliation",
+    version=1,
+    schema=pl.Schema(MODEL_RECONCILIATION_V1_FIELDS),
+    non_nullable=tuple(MODEL_RECONCILIATION_V1_FIELDS),
+    unique_key=("run_id", "scenario", "check"),
+    sort_key=("scenario", "check"),
+    semantic_validator=_validate_token_reconciliation_v1,
+)
+
 CONTRACTS: Final = {
+    MODEL_TOKEN_INPUTS_V1.identifier: MODEL_TOKEN_INPUTS_V1,
+    MODEL_TOKEN_SUPPLY_PATH_V1.identifier: MODEL_TOKEN_SUPPLY_PATH_V1,
+    MODEL_TOKEN_CASHFLOWS_V1.identifier: MODEL_TOKEN_CASHFLOWS_V1,
+    MODEL_TOKEN_PEER_MULTIPLES_V1.identifier: MODEL_TOKEN_PEER_MULTIPLES_V1,
+    MODEL_TOKEN_RESULTS_V1.identifier: MODEL_TOKEN_RESULTS_V1,
+    MODEL_TOKEN_SENSITIVITY_V1.identifier: MODEL_TOKEN_SENSITIVITY_V1,
+    MODEL_TOKEN_RECONCILIATION_V1.identifier: MODEL_TOKEN_RECONCILIATION_V1,
     NORMALIZED_INSTRUMENT_MASTER_V3.identifier: NORMALIZED_INSTRUMENT_MASTER_V3,
     DERIVED_INSTRUMENT_MASTER_CURRENT_V2.identifier: (
         DERIVED_INSTRUMENT_MASTER_CURRENT_V2

@@ -56,6 +56,7 @@ from finresearch.protocol_normalization import normalize_protocol_metrics
 from finresearch.providers import ProviderError
 from finresearch.registers import REGISTER_FILES, inspect_registers
 from finresearch.reporting import generate_report
+from finresearch.token_model import run_token
 from finresearch.token_normalization import normalize_token_supply
 from finresearch.token_reconciliation import reconcile_token_supply
 
@@ -921,6 +922,37 @@ def model_dcf_command(
     """Run the strict case-backed DCF model and register all typed outputs."""
     try:
         receipt = run_dcf(
+            state_from_context(ctx).workspace,
+            case_id,
+            input_path=input_path,
+            scenario=cast_dcf_scenario(scenario),
+            sensitivity=parse_dcf_sensitivity(sensitivity),
+        )
+    except (
+        CaseContractError,
+        DataContractError,
+        IngestionError,
+        ValueError,
+        OSError,
+    ) as exc:
+        fail(str(exc))
+    print_model_run(receipt)
+
+
+@model_app.command("token")
+def model_token_command(
+    ctx: typer.Context,
+    case_id: CaseIdArgument,
+    input_path: Annotated[
+        str,
+        typer.Option("--input", help="Case-relative path to strict token-inputs.toml."),
+    ] = "analysis/token-inputs.toml",
+    scenario: ScenarioOption = "all",
+    sensitivity: SensitivityOption = None,
+) -> None:
+    """Run the strict case-backed token model and register all typed outputs."""
+    try:
+        receipt = run_token(
             state_from_context(ctx).workspace,
             case_id,
             input_path=input_path,
