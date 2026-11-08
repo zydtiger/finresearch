@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import html
 import math
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -32,7 +33,8 @@ from finresearch.modeling import ModelFamily, model_run_is_declared, resolve_mod
 REPORT_PRODUCER = "finresearch.report"
 REPORT_MARKDOWN_PRODUCER_VERSION = "1"
 REPORT_HTML_LEGACY_PRODUCER_VERSION = "1"
-REPORT_HTML_PRODUCER_VERSION = "2"
+REPORT_HTML_V2_PRODUCER_VERSION = "2"
+REPORT_HTML_PRODUCER_VERSION = "3"
 # Kept for callers that historically imported the v1 report producer constant.
 REPORT_PRODUCER_VERSION = REPORT_MARKDOWN_PRODUCER_VERSION
 ReportFormat = Literal["markdown", "html"]
@@ -150,7 +152,7 @@ def build_report_publication(
     )
     kind = f"report.{format}"
     filename = f"{identity}.{_extension(format)}"
-    if format == "html" and producer_version == REPORT_HTML_PRODUCER_VERSION:
+    if format == "html" and producer_version != REPORT_HTML_LEGACY_PRODUCER_VERSION:
         filename = f"v{producer_version}.{filename}"
     path = Path(
         manifest.paths["reports"],
@@ -379,8 +381,8 @@ def render_markdown(context: ReportContext) -> bytes:
 
 
 def render_html(context: ReportContext) -> bytes:
-    """Render the current v2 self-contained semantic HTML report."""
-    return _render_html_v2(context)
+    """Render the current v3 self-contained semantic HTML report."""
+    return _render_html_heatmap_report(context, _value_label)
 
 
 def _render_report_content(
@@ -393,7 +395,9 @@ def _render_report_content(
         return render_markdown(context)
     if producer_version == REPORT_HTML_LEGACY_PRODUCER_VERSION:
         return _render_html_v1(context)
-    return _render_html_v2(context)
+    if producer_version == REPORT_HTML_V2_PRODUCER_VERSION:
+        return _render_html_heatmap_report(context, _value_label_v2)
+    return render_html(context)
 
 
 def _render_html_v1(context: ReportContext) -> bytes:
@@ -433,8 +437,10 @@ def _render_html_v1(context: ReportContext) -> bytes:
     return "".join(sections).encode("utf-8")
 
 
-def _render_html_v2(context: ReportContext) -> bytes:
-    """Render the current HTML contract with deterministic DCF heatmaps."""
+def _render_html_heatmap_report(
+    context: ReportContext, value_label: Callable[[float], str]
+) -> bytes:
+    """Render HTML v2/v3, which differ only in heatmap value formatting."""
     sections = [
         "<!doctype html>",
         '<html lang="en"><head><meta charset="utf-8">',
@@ -470,7 +476,7 @@ def _render_html_v2(context: ReportContext) -> bytes:
         sections.extend(
             [
                 "<h2>Sensitivity</h2>",
-                *_html_sensitivity_heatmaps(context),
+                *_html_sensitivity_heatmaps(context, value_label),
                 _html_table(context.sensitivity),
             ]
         )
@@ -498,6 +504,7 @@ def _report_producer_version(format: ReportFormat, producer_version: str | None)
         version = producer_version or REPORT_HTML_PRODUCER_VERSION
         if version in {
             REPORT_HTML_LEGACY_PRODUCER_VERSION,
+            REPORT_HTML_V2_PRODUCER_VERSION,
             REPORT_HTML_PRODUCER_VERSION,
         }:
             return version
@@ -531,7 +538,9 @@ def _html_table(frame: pl.DataFrame) -> str:
     return "".join(pieces)
 
 
-def _html_sensitivity_heatmaps(context: ReportContext) -> list[str]:
+def _html_sensitivity_heatmaps(
+    context: ReportContext, value_label: Callable[[float], str]
+) -> list[str]:
     """Render one deterministic accessible SVG heatmap per complete DCF grid."""
     if context.family != "dcf" or context.sensitivity is None:
         return []
@@ -581,6 +590,7 @@ def _html_sensitivity_heatmaps(context: ReportContext) -> list[str]:
             artifact.artifact_id,
             index,
             grid,
+            value_label,
         )
         for index, grid in enumerate(grids, start=1)
         if grid is not None
@@ -614,6 +624,7 @@ def _render_sensitivity_heatmap(
     artifact_id: str,
     index: int,
     grid: SensitivityGrid,
+    value_label: Callable[[float], str],
 ) -> str:
     """Render one dependency-free sensitivity SVG from an authenticated grid."""
     scenario, waccs, growths, values, unit = grid
@@ -664,16 +675,16 @@ def _render_sensitivity_heatmap(
                     f'height="{cell_height}" fill="{color}"/>',
                     f'<text x="{x + cell_width // 2}" y="{y + 26}" '
                     f'text-anchor="middle" font-size="12" fill="{text_color}">'
-                    f"{_value_label(value)}</text>",
+                    f"{value_label(value)}</text>",
                 ]
             )
     legend_y = top + cell_height * len(growths) + 30
     pieces.extend(
         [
             f'<text x="{left}" y="{legend_y}" font-size="11">'
-            f"Low: {_value_label(minimum)}</text>",
+            f"Low: {value_label(minimum)}</text>",
             f'<text x="{left + cell_width * len(waccs)}" y="{legend_y}" '
-            f'text-anchor="end" font-size="11">High: {_value_label(maximum)}</text>',
+            f'text-anchor="end" font-size="11">High: {value_label(maximum)}</text>',
             "</svg>",
             "<figcaption>"
             f"{html.escape(scenario_label)} scenario; sensitivity artifact ID: "
@@ -736,8 +747,22 @@ def _number_label(value: float) -> str:
     return format(value, ".12g")
 
 
-def _value_label(value: float) -> str:
+def _value_label_v2(value: float) -> str:
+    """Frozen HTML v2 heatmap formatter, kept so v2 reports still authenticate."""
     return format(value, ".3e") if abs(value) >= 1_000_000 else f"{value:.2f}"
+
+
+def _value_label(value: float) -> str:
+    """Format by magnitude with thousands separators and no scientific notation."""
+    magnitude = abs(value)
+    if magnitude >= 1_000_000:
+        return f"{value:,.0f}"
+    if magnitude >= 1000:
+        return f"{value:,.2f}"
+    if magnitude != 0 and magnitude < 0.01:
+        decimals = 3 - math.floor(math.log10(magnitude))
+        return f"{value:.{decimals}f}"
+    return f"{value:.2f}"
 
 
 def _markdown_text(value: str) -> str:
