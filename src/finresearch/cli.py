@@ -302,6 +302,10 @@ def show_case_status(ctx: typer.Context, case_id: CaseIdArgument) -> None:
         f"{status.artifacts_present} present, "
         f"{status.artifacts_missing} missing"
     )
+    unused = status.unused_raw_snapshots
+    typer.echo(f"unused raw snapshots: {len(unused)}")
+    for artifact_id in unused:
+        typer.echo(f"  {artifact_id}")
     typer.echo(f"valid: {'yes' if status.valid else 'no'}")
     if not status.valid:
         print_issues(status.issues)

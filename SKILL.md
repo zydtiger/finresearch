@@ -67,10 +67,10 @@ financial values, peers, evidence, assumptions, or source IDs.
   (`api.coingecko.com` is `coingecko`, `api.hyperliquid.xyz` is
   `hyperliquid`, `*.llama.fi` is `defillama`, anything else is `web`); the CLI
   rejects a mismatch, and a registered capture cannot be changed or removed.
-- Retrieval time is point-in-time evidence: `case audit` reports any ingest or
-  capture retrieved after its `--as-of` date. Ingest prices and provider data
-  on or before the valuation cutoff's UTC date, or set the cutoff to the
-  retrieval date.
+- Price sessions are the point-in-time evidence: `case audit` checks them by
+  `session_date`, so prices fetched after the cutoff are fine when every
+  session is on or before it. Instrument-master rows observed after the cutoff
+  are not an issue; audit ignores them when resolving asset class.
 - Token supply: `data ingest-coingecko-token`, `ingest-coingecko-markets`, and
   `ingest-hyperliquid-info` write CLI captures from keyless endpoints (no API
   keys; CoinGecko requests are throttled to one per 6 seconds). Normalize with
@@ -134,8 +134,9 @@ open_questions.csv id,question,context,importance,status,answered_at
 
 Enums and reference rules: `source_type` is `filing`/`estimate`/`external`/
 `assumption`; `assumptions.source_evidence` is one existing evidence id or a
-`;`-joined list of them (no spaces or duplicates, ascending order); `scenarios.scenario` is `bear`/`base`/`bull` and every parameter
-must define all three with pairwise-distinct values; `impact` is
+`;`-joined list of them (no spaces or duplicates, ascending order); `scenarios.scenario` is `bear`/`base`/`bull`/`all`; a parameter has
+either one `all` row (fixed across scenarios, e.g. a tax rate) or all three
+bear/base/bull rows with pairwise-distinct values, never both; `impact` is
 `positive`/`negative`/`neutral`; `importance` is `high`/`medium`/`low`;
 `status` is `open`/`answered`.
 
@@ -252,8 +253,8 @@ revenue is nonpositive, is excluded automatically with a recorded reason, and
 the run fails only when no peer remains for a basis. Write every register row
 the policy and TOML cite before running `reconcile-token-supply` and
 `model token`. A stablecoin-quoted market value needs a sourced `[pegs]`
-leaf. Bases that are equal across scenarios belong in the TOML, not in
-`scenarios.csv`. Report and audit work as for DCF; token audit codes are
+leaf. Bases that are equal across scenarios belong in the TOML; a
+`scenarios.csv` parameter equal across scenarios is one `scenario=all` row. Report and audit work as for DCF; token audit codes are
 prefixed `token_run_`.
 
 ## Report and close the audit loop

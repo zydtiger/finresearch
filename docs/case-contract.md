@@ -194,7 +194,12 @@ case validate CASE_ID
   serializing the operation. Migration is idempotent when the case is already
   v2.
 - `status` reports manifest validity, lifecycle status, required directories,
-  and declared/present/missing artifact counts.
+  and declared/present/missing artifact counts. It also prints the count and
+  ids of unused raw snapshots: declared raw provider snapshot artifacts
+  (`raw.*` kinds other than `raw.capture` and `raw.capture-body`) that no
+  artifact lists in `input_artifact_ids`. This is information only (a
+  superseded snapshot is legitimate): it is not an issue and never changes the
+  exit code.
 - `validate` returns success only when the manifest is valid, every required
   directory exists, and every declared artifact exists as a file.
 
