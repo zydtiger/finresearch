@@ -13,6 +13,12 @@ global `--workspace` option precedes the command, including for group help:
 finresearch --workspace WORKSPACE data --help
 ```
 
+Always pass the root `--json` flag (`finresearch --workspace WORKSPACE --json
+...`) and read artifact IDs, capture IDs, run IDs, paths, and checksums from the
+single JSON object on stdout instead of scraping human text. Validations and
+audits report `ok` and an `issues` list of `{code, message}`; on a failure the
+exit code is nonzero and errors print `{"ok": false, "error": "..."}`.
+
 Do not assume a source checkout or substitute `uv run finresearch` unless the
 user is explicitly working inside the finresearch repository.
 

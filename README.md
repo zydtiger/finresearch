@@ -9,6 +9,18 @@ codebase.
 The CLI does not discover or configure an artifact root. Every command that
 uses research state receives the workspace explicitly with `--workspace`.
 
+Pass the root `--json` flag (`finresearch --workspace PATH --json ...`) to get
+exactly one JSON object on stdout per command instead of human text, so scripts
+and agents read artifact, capture, and run ids without scraping. Receipts keep
+the fields the human output shows under snake_case keys (`artifact_id`,
+`capture_id`, `run_id`, `path`, `row_count`, `sha256`); multi-artifact commands
+nest one object per artifact. Validations and audits (`case status`,
+`case validate`, `case audit`, `data validate`, `data registers status`) add
+`"ok"` and an `issues` list of `{code, message}`. Errors still print the
+message on stderr and exit nonzero, and additionally print
+`{"ok": false, "error": "..."}` on stdout. Without `--json` the output is
+unchanged.
+
 ## Setup
 
 Choose the most recent published `vX.Y.Z` tag from

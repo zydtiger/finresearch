@@ -1,3 +1,4 @@
+import json
 from datetime import UTC, date, datetime
 from importlib.metadata import version
 from pathlib import Path
@@ -6,9 +7,17 @@ import pytest
 from typer.testing import CliRunner, Result
 
 import finresearch
-from finresearch.cases import DEFAULT_PATHS, CaseManifest, write_manifest
+from finresearch.auditing import CaseAudit
+from finresearch.captures import CaptureReceipt
+from finresearch.cases import (
+    DEFAULT_PATHS,
+    CaseManifest,
+    ValidationIssue,
+    write_manifest,
+)
 from finresearch.cli import app
 from finresearch.ingestion import IngestionReceipt
+from finresearch.modeling import ModelRun
 from finresearch.providers.sec import SECProviderError
 
 runner = CliRunner()
@@ -21,6 +30,14 @@ def test_package_version_comes_from_installed_metadata() -> None:
 def invoke(workspace: Path, *arguments: str) -> Result:
     """Invoke the CLI with its required explicit workspace."""
     return runner.invoke(app, ["--workspace", str(workspace), *arguments])
+
+
+def invoke_json(workspace: Path, *arguments: str) -> tuple[Result, dict[str, object]]:
+    """Invoke with --json and parse the single JSON object on stdout."""
+    result = runner.invoke(app, ["--workspace", str(workspace), "--json", *arguments])
+    payload = json.loads(result.stdout)
+    assert isinstance(payload, dict)
+    return result, payload
 
 
 def test_case_lifecycle(tmp_path: Path) -> None:
@@ -274,3 +291,184 @@ def test_case_status_reports_unused_raw_snapshots_without_failing(
     assert unused.exit_code == 0
     assert "unused raw snapshots: 1" in unused.output
     assert raw_ids[0] in unused.output
+
+
+def _receipt(tmp_path: Path, name: str) -> IngestionReceipt:
+    return IngestionReceipt(
+        artifact_id=name,
+        path=tmp_path / f"{name}.parquet",
+        row_count=3,
+        sha256="c" * 64,
+        retrieved_at=datetime(2026, 8, 11, tzinfo=UTC),
+    )
+
+
+def test_json_ingestion_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        "finresearch.cli.ingest_yfinance_daily_prices",
+        lambda *args: _receipt(tmp_path, "raw.snap"),
+    )
+
+    result, payload = invoke_json(
+        tmp_path,
+        "data",
+        "ingest-yfinance-prices",
+        "aapl",
+        "AAPL",
+        "--start",
+        "2026-01-02",
+        "--end",
+        "2026-01-03",
+    )
+
+    assert result.exit_code == 0
+    assert payload == {
+        "ok": True,
+        "artifact_id": "raw.snap",
+        "path": str(tmp_path / "raw.snap.parquet"),
+        "row_count": 3,
+        "sha256": "c" * 64,
+    }
+
+
+def test_json_normalize_receipt_nests_each_artifact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from finresearch.normalization import NormalizationReceipt
+
+    monkeypatch.setattr(
+        "finresearch.cli.normalize_daily_prices",
+        lambda *args, **kwargs: NormalizationReceipt(
+            _receipt(tmp_path, "master"),
+            _receipt(tmp_path, "prices"),
+            _receipt(tmp_path, "actions"),
+        ),
+    )
+
+    result, payload = invoke_json(tmp_path, "data", "normalize-daily-prices", "a", "X")
+
+    assert result.exit_code == 0
+    assert payload["ok"] is True
+    daily = payload["daily_prices"]
+    assert isinstance(daily, dict)
+    assert daily["artifact_id"] == "prices"
+
+
+def test_json_capture_receipt(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    capture = tmp_path / "body.json"
+    capture.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(
+        "finresearch.cli.register_capture",
+        lambda *args, **kwargs: CaptureReceipt(
+            capture_id="capture.web.1",
+            body_artifact_id="raw.capture.web.1.body",
+            body_path=tmp_path / "body.json",
+            metadata_path=tmp_path / "meta.json",
+            content_sha256="d" * 64,
+            content_bytes=2,
+            retrieved_at=datetime(2026, 8, 11, tzinfo=UTC),
+        ),
+    )
+
+    result, payload = invoke_json(
+        tmp_path,
+        "data",
+        "register-capture",
+        "aapl",
+        str(capture),
+        "--provider",
+        "web",
+        "--kind",
+        "api-response",
+        "--url",
+        "https://example.com/x",
+        "--retrieved-at",
+        "2026-08-11T00:00:00Z",
+    )
+
+    assert result.exit_code == 0
+    assert payload == {
+        "ok": True,
+        "capture_id": "capture.web.1",
+        "body_artifact_id": "raw.capture.web.1.body",
+        "path": str(tmp_path / "body.json"),
+        "sha256": "d" * 64,
+    }
+
+
+def test_json_model_run_lists_run_and_artifact_ids(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        "finresearch.cli.run_dcf",
+        lambda *args, **kwargs: ModelRun(
+            "run-1", (_receipt(tmp_path, "a"), _receipt(tmp_path, "b"))
+        ),
+    )
+
+    result, payload = invoke_json(tmp_path, "model", "dcf", "aapl")
+
+    assert result.exit_code == 0
+    assert payload == {"ok": True, "run_id": "run-1", "artifacts": ["a", "b"]}
+
+
+def test_json_case_init_and_status(tmp_path: Path) -> None:
+    created, init_payload = invoke_json(tmp_path, "case", "init", "aapl")
+    status, status_payload = invoke_json(tmp_path, "case", "status", "aapl")
+
+    assert created.exit_code == 0
+    assert init_payload["case_id"] == "aapl"
+    assert status.exit_code == 0
+    assert status_payload["ok"] is True
+    assert status_payload["issues"] == []
+    assert status_payload["directories_present"] == 4
+
+
+def test_json_audit_failure_reports_issues_and_exits_nonzero(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        "finresearch.cli.audit_case",
+        lambda *args, **kwargs: CaseAudit(
+            "aapl",
+            date(2026, 8, 11),
+            (ValidationIssue("price_stale", "price is 9 days old"),),
+        ),
+    )
+
+    result, payload = invoke_json(
+        tmp_path,
+        "case",
+        "audit",
+        "aapl",
+        "--as-of",
+        "2026-08-11",
+        "--max-price-age-days",
+        "3",
+    )
+
+    assert result.exit_code == 1
+    assert payload == {
+        "ok": False,
+        "case_id": "aapl",
+        "as_of": "2026-08-11",
+        "issues": [{"code": "price_stale", "message": "price is 9 days old"}],
+    }
+    assert "error [price_stale]: price is 9 days old" in result.stderr
+
+
+def test_json_error_prints_object_and_keeps_stderr(tmp_path: Path) -> None:
+    result, payload = invoke_json(tmp_path, "case", "migrate", "missing")
+
+    assert result.exit_code == 1
+    assert payload["ok"] is False
+    assert isinstance(payload["error"], str)
+    assert result.stderr.strip() == f"error: {payload['error']}"
+
+
+def test_json_flag_absent_keeps_human_output(tmp_path: Path) -> None:
+    result = invoke(tmp_path, "case", "init", "aapl")
+
+    assert result.stdout.startswith("created case: aapl\nmanifest: ")
