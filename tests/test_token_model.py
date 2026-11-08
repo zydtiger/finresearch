@@ -1006,3 +1006,338 @@ def test_audit_reports_stablecoin_peg_deviation(built: Path, tmp_path: Path) -> 
     assert flagged.exit_code == 1
     assert "[stablecoin_peg_deviation]" in flagged.output
     assert "usdt_usd" in flagged.output
+
+
+# Version 1 fixture outputs, captured before token-inputs version 2 existed.
+V1_RUN_ID = "518d0f683d15efaffcd05c4962def4f9fe88db7245a6d4c893976057bf08e68c"
+V1_ARTIFACT_SHA256 = {
+    "model.token-inputs": (
+        "12d1dfa7a00d2c1392c6e90b6173740c75b7bdfa08508f4b17e9f9d992ed97d0"
+    ),
+    "model.token-supply-path": (
+        "2f3d366bcfdea3958a8f0dd46d65a1d6edb20a563027940bc4b35c799f2a0b30"
+    ),
+    "model.token-cashflows": (
+        "76589ad24d33f3d7013ad9d0add08305a1ed13eb68ed1c04e61bec73f3ea05b3"
+    ),
+    "model.token-peer-multiples": (
+        "a7fd51fa5315403497b4265c7637c335107fc4e9b6c52f71b8c58f139f5758fd"
+    ),
+    "model.token-results": (
+        "9e9dbd337382450c7c88436d30c9ad1895eff596afa54f984f00ece6e82dd322"
+    ),
+    "model.token-sensitivity": (
+        "e6bc20f56fde14eb9790dbb754125f3ce2b32231b9000346ed052fcb35bddac7"
+    ),
+    "model.token-reconciliation": (
+        "d496c95fd2cbad4d0292d95a172e57fb33a1e5957c549797467c7df5a2f1f4a5"
+    ),
+}
+TOKEN_KINDS = tuple(V1_ARTIFACT_SHA256)
+SENSITIVITY = ("--sensitivity", "0.2,0.25;0.02,0.03")
+CIRCULATING_M, TOTAL_M = 239.40681437, 951.53827291
+BUYBACK_PRICE_LINE = 'buyback_price_basis = "as_of_price"\n'
+
+
+def v2_toml(
+    workspace: Path, *, top: str = "", supply: str = "", multiples: str = ""
+) -> str:
+    text = token_toml(workspace)
+    assert text.startswith("version = 1\n")
+    return (
+        text.replace("version = 1\n", "version = 2\n", 1)
+        .replace(BUYBACK_PRICE_LINE, BUYBACK_PRICE_LINE + top)
+        .replace(SUPPLY_LINE, SUPPLY_LINE + supply)
+        .replace("[multiples]\n", "[multiples]\n" + multiples)
+    )
+
+
+def run_tables(workspace: Path, run_id: str) -> dict[str, pl.DataFrame]:
+    return {kind: table(workspace, kind, run_id).drop("run_id") for kind in TOKEN_KINDS}
+
+
+def dcf_rows(
+    workspace: Path, run_id: str, scenario: str
+) -> dict[str, dict[str, object]]:
+    frame = results(workspace, run_id).filter(
+        (pl.col("scenario") == scenario) & (pl.col("method") == "dcf")
+    )
+    return {row["basis"]: row for row in frame.iter_rows(named=True)}
+
+
+def test_version_1_artifacts_are_pinned(built: Path) -> None:
+    run_id = run_id_of(ok(built, "model", "token", CASE, *SENSITIVITY))
+    assert run_id == V1_RUN_ID
+    manifest = read_manifest(built / "cases" / CASE)
+    assert {
+        a.kind: a.sha256 for a in manifest.artifacts if a.kind in TOKEN_KINDS
+    } == V1_ARTIFACT_SHA256
+
+
+@pytest.mark.parametrize(
+    ("place", "line", "key"),
+    [
+        ("top", 'dcf_dilution = "none"\n', "dcf_dilution"),
+        ("supply", 'emissions_source = "reserve"\n', "supply.emissions_source"),
+        ("multiples", 'subject_revenue = "scenario"\n', "multiples.subject_revenue"),
+        ("multiples", 'subject_entity_id = "dydx"\n', "multiples.subject_entity_id"),
+    ],
+)
+def test_version_1_rejects_version_2_keys(
+    built: Path, place: str, line: str, key: str
+) -> None:
+    text = v2_toml(built, **{place: line}).replace("version = 2\n", "version = 1\n")
+    write_inputs(built, text)
+    with pytest.raises(CaseContractError, match=rf"\['{key}'\] require version = 2"):
+        run_token(built, CASE)
+
+
+def test_version_2_defaults_match_version_1(built: Path) -> None:
+    v1 = run_id_of(ok(built, "model", "token", CASE, *SENSITIVITY))
+    write_inputs(
+        built,
+        v2_toml(
+            built,
+            top='dcf_dilution = "none"\n',
+            supply='emissions_source = "reserve"\n',
+            multiples='subject_revenue = "scenario"\n',
+        ),
+    )
+    v2 = run_id_of(ok(built, "model", "token", CASE, *SENSITIVITY))
+    assert v2 != v1
+    first, second = run_tables(built, v1), run_tables(built, v2)
+    for kind in TOKEN_KINDS:
+        assert first[kind].equals(second[kind]), kind
+
+
+@pytest.mark.parametrize(
+    ("text", "message"),
+    [
+        ('dcf_dilution = "full"\n', "dcf_dilution must be none or issuance"),
+        ('emissions_source = "burn"\n', "emissions_source must be reserve or mint"),
+        ('subject_revenue = "forward"\n', "subject_revenue must be scenario or"),
+        ('subject_revenue = "trailing"\n', "subject_entity_id is required"),
+        ('subject_entity_id = "dydx"\n', "subject_entity_id is required"),
+    ],
+)
+def test_version_2_key_validation(built: Path, text: str, message: str) -> None:
+    place = (
+        "top"
+        if text.startswith("dcf")
+        else "supply"
+        if text.startswith("emissions")
+        else "multiples"
+    )
+    write_inputs(built, v2_toml(built, **{place: text}))
+    with pytest.raises(CaseContractError, match=message):
+        run_token(built, CASE)
+
+
+def test_mint_emissions_grow_fully_diluted_supply(built: Path) -> None:
+    from dataclasses import replace
+
+    from finresearch.token_model import _discounted, load_token_input
+
+    config, _, _ = load_token_input(
+        built / "cases" / CASE, "analysis/token-inputs.toml"
+    )
+    base = config.scenarios["base"]
+    # An uncapped token: fully diluted equals circulating, emissions positive.
+    with pytest.raises(CaseContractError, match="exceeds fully diluted"):
+        _discounted(config, base, 78.4549, 100.0, 100.0, (0.0,), 0.25, 0.03)
+    minted = _discounted(
+        replace(config, emissions_source="mint"),
+        base,
+        78.4549,
+        100.0,
+        100.0,
+        (0.0,),
+        0.25,
+        0.03,
+    )
+    (path,) = minted.paths
+    assert path.closing_fd == pytest.approx(100.0 + 10.0 - path.retired)
+    assert path.closing_circ == pytest.approx(path.closing_fd)
+
+    # End to end: emissions beyond the reserve fail under reserve, run as mint.
+    big = {"emissions = { value = 10.0": "emissions = { value = 800.0"}
+    write_inputs(
+        built, token_toml(built, **{k.replace(" ", "__"): v for k, v in big.items()})
+    )
+    with pytest.raises(CaseContractError, match="exceeds fully diluted"):
+        run_token(built, CASE)
+    text = v2_toml(built, supply='emissions_source = "mint"\n')
+    write_inputs(built, text.replace(*next(iter(big.items()))))
+    run_id = run_id_of(ok(built, "model", "token", CASE))
+    path_frame = table(built, "model.token-supply-path", run_id).filter(
+        pl.col("scenario") == "base"
+    )
+    row = path_frame.row(0, named=True)
+    assert row["closing_fully_diluted"] == pytest.approx(
+        TOTAL_M + 800.0 - row["retired_tokens"]
+    )
+    checks = table(built, "model.token-reconciliation", run_id)
+    assert checks["passed"].all()
+    assert (
+        checks.filter(pl.col("check") == "supply_roll_forward_fully_diluted").height
+        == 3
+    )
+
+
+def test_issuance_dilution_values_todays_tokens(built: Path) -> None:
+    undiluted = run_id_of(ok(built, "model", "token", CASE))
+    write_inputs(built, v2_toml(built, top='dcf_dilution = "issuance"\n'))
+    run_id = run_id_of(ok(built, "model", "token", CASE, *SENSITIVITY))
+    assert run_id != undiluted
+
+    # Bear: two periods, 23.8M realized unlocks plus 10M emissions each.
+    cash, rate, growth = 450.0, 0.30, 0.02
+    df1, df2 = 1.3, 1.3 ** (731 / 365)
+    terminal_pv = cash * (1 + growth) / (rate - growth) / df2
+    f1 = CIRCULATING_M / (CIRCULATING_M + 33.8)
+    f2 = CIRCULATING_M / (CIRCULATING_M + 67.6)
+    expected = cash / df1 * f1 + cash / df2 * f2 + terminal_pv * f2
+    bear = dcf_rows(built, run_id, "bear")
+    circ = bear["circulating"]
+    assert circ["aggregate_value"] == pytest.approx(expected, rel=1e-12)
+    assert circ["per_token_value"] == pytest.approx(expected / CIRCULATING_M, rel=1e-12)
+    assert circ["denominator_tokens"] == pytest.approx(CIRCULATING_M)
+    assert circ["terminal_share"] == pytest.approx(terminal_pv * f2 / expected)
+    # Under reserve the fully diluted basis issues nothing: undiluted.
+    undiluted_value = cash / df1 + cash / df2 + terminal_pv
+    fd = bear["fully_diluted"]
+    assert fd["aggregate_value"] == pytest.approx(undiluted_value, rel=1e-12)
+    assert dcf_rows(built, undiluted, "bear")["fully_diluted"][
+        "aggregate_value"
+    ] == pytest.approx(undiluted_value, rel=1e-12)
+    assert table(built, "model.token-reconciliation", run_id)["passed"].all()
+
+    # Burning instead of holding buybacks leaves the dilution factor unchanged.
+    burn = v2_toml(built, top='dcf_dilution = "issuance"\n').replace(
+        "buyback_hold = 1.0, burn = 0.0", "buyback_hold = 0.0, burn = 1.0"
+    )
+    write_inputs(built, burn)
+    burned = run_id_of(ok(built, "model", "token", CASE))
+    assert dcf_rows(built, burned, "bear")["circulating"][
+        "aggregate_value"
+    ] == pytest.approx(expected, rel=1e-12)
+
+    # Minted emissions dilute the fully diluted basis; sensitivity follows it.
+    write_inputs(
+        built,
+        v2_toml(
+            built,
+            top='dcf_dilution = "issuance"\n',
+            supply='emissions_source = "mint"\n',
+        ),
+    )
+    minted = run_id_of(ok(built, "model", "token", CASE, *SENSITIVITY))
+    base_cash = 540.0
+    base_value = base_cash / 1.25 + base_cash * 1.03 / 0.22 / 1.25
+    factor = TOTAL_M / (TOTAL_M + 10.0)
+    base_fd = dcf_rows(built, minted, "base")["fully_diluted"]
+    assert base_fd["aggregate_value"] == pytest.approx(base_value * factor, rel=1e-12)
+    assert base_fd["implied_cf_scale"] == pytest.approx(
+        78.4549 * TOTAL_M / (base_value * factor), rel=1e-12
+    )
+    grid = table(built, "model.token-sensitivity", minted).filter(
+        (pl.col("scenario") == "base")
+        & (pl.col("discount_rate") == 0.25)
+        & (pl.col("terminal_growth") == 0.03)
+    )
+    assert grid["per_token_value_fd"][0] == pytest.approx(
+        base_fd["per_token_value"], rel=1e-12
+    )
+
+
+def test_trailing_subject_revenue(built: Path) -> None:
+    write_inputs(
+        built,
+        v2_toml(
+            built,
+            multiples='subject_revenue = "trailing"\nsubject_entity_id = "dydx"\n',
+        ),
+    )
+    run_id = run_id_of(ok(built, "model", "token", CASE))
+    trailing = 100000.0 * 365 / 1e6  # annualized 30-day window, USDm
+    dydx_fdv = 1e9 / (100000.0 * 365)
+    aster_fdv = 1.2e9 / (200000.0 * 365)
+    median_fdv = (dydx_fdv + aster_fdv) / 2
+    frame = results(built, run_id).filter(
+        (pl.col("method") == "multiple") & (pl.col("basis") == "fully_diluted")
+    )
+    for row in frame.iter_rows(named=True):
+        assert row["aggregate_value"] == pytest.approx(median_fdv * trailing)
+        if row["scenario"] != "bear":
+            assert row["per_token_value"] == pytest.approx(
+                median_fdv * trailing / TOTAL_M
+            )
+    inputs = table(built, "model.token-inputs", run_id).filter(
+        pl.col("field") == "subject_revenue"
+    )
+    assert inputs.height == 3
+    row = inputs.row(0, named=True)
+    assert row["value"] == pytest.approx(trailing)
+    assert row["unit"] == "USDm"
+    assert row["period_end"] == date(2026, 11, 6)
+    assert row["source_id"] is None
+    assert row["source_artifact_id"] in artifact_ids(
+        built, "normalized.protocol-metrics"
+    )
+
+
+@pytest.mark.parametrize(
+    ("entity", "message"),
+    [
+        ("nobody", "hold no holders_revenue rows for subject entity nobody"),
+        ("zero", "nonpositive trailing holders_revenue"),
+    ],
+)
+def test_trailing_subject_revenue_failures(
+    built: Path, entity: str, message: str
+) -> None:
+    write_inputs(
+        built,
+        v2_toml(
+            built,
+            multiples=f'subject_revenue = "trailing"\nsubject_entity_id = "{entity}"\n',
+        ),
+    )
+    with pytest.raises(CaseContractError, match=message):
+        run_token(built, CASE)
+
+
+def test_trailing_subject_window_must_be_complete(built: Path) -> None:
+    write_inputs(
+        built,
+        v2_toml(
+            built,
+            multiples='subject_revenue = "trailing"\nsubject_entity_id = "dydx"\n',
+        ).replace('window = "annualized_30d"', 'window = "ttm"'),
+    )
+    with pytest.raises(CaseContractError, match="incomplete holders_revenue window"):
+        run_token(built, CASE)
+
+
+def test_audit_reconstructs_version_2_run(built: Path) -> None:
+    write_inputs(
+        built,
+        v2_toml(
+            built,
+            top='dcf_dilution = "issuance"\n',
+            supply='emissions_source = "mint"\n',
+            multiples='subject_revenue = "trailing"\nsubject_entity_id = "dydx"\n',
+        ),
+    )
+    ok(built, "model", "token", CASE, *SENSITIVITY)
+    result = audit(built, "--verify-hashes")
+    assert result.exit_code == 0, result.output
+    inputs = built / "cases" / CASE / "analysis" / "token-inputs.toml"
+    inputs.write_text(
+        inputs.read_text().replace(
+            'emissions_source = "mint"', 'emissions_source = "reserve"'
+        )
+    )
+    changed = audit(built)
+    assert changed.exit_code == 1
+    assert "[token_run_identity_invalid]" in changed.output
