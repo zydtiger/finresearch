@@ -34,7 +34,9 @@ authenticate the CLI cutoff; report and audit reject a complete v1 comps run
 with an explicit rerun requirement. A DCF run must have
 exactly one each of `model.dcf-inputs`, `model.dcf-cashflows`,
 `model.dcf-results`, and `model.dcf-reconciliation` linked in that order; an
-optional DCF sensitivity table must also be linked to results. A comps run must
+optional DCF sensitivity table must also be linked to results, and an optional
+`model.dcf-translation` table must be linked to results. `model.dcf-results` may
+be schema v1 or v2. A comps run must
 have exactly one each of `model.comps-inputs`, `model.comps-results`,
 `model.comps-summary`, and `model.comps-reconciliation` with their declared
 edges. A failed reconciliation, missing table, mismatched run identity, or

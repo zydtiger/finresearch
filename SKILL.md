@@ -66,6 +66,12 @@ financial values, peers, evidence, assumptions, or source IDs.
   dropping is acceptable. It removes those bars and publishes
   `normalized.price-gaps.v1` listing each dropped session; inconsistent OHLC
   still fails.
+- For an FX pair, run `data normalize-fx-rates CASE_ID EURUSD=X --base EUR
+  --quote USD` on its raw snapshot. It publishes close-only
+  `normalized.fx-rates.v1` (OHLC is ignored; NULL-close rows go to
+  `normalized.price-gaps.v1`, always published). The symbol must be
+  `<BASE><QUOTE>=X`. Convert in the model with `[translation]`, never by
+  rewriting data.
 - Register every web page, document, tool summary, or API response you fetched
   yourself with `data register-capture` (record the fetch time and the sha256
   at retrieval; pass them as `--retrieved-at` and `--expect-sha256`) before
@@ -210,6 +216,18 @@ finresearch --workspace WORKSPACE model projection-assess CASE_ID \
 finresearch --workspace WORKSPACE model dcf CASE_ID \
   --input analysis/dcf-inputs.toml --scenario all
 ```
+
+`dcf-inputs.toml` `version = 2` adds, per scenario, an optional
+`[scenario.NAME.capitalization] diluted_shares` leaf that replaces the global
+share count and `[[scenario.NAME.issuance]]` rows (`period_end` equal to a
+forecast period, `shares`, `proceeds`, each a sourced leaf) for dilutive cases;
+proceeds are discounted and added to equity value, and per-share value divides by
+opening plus issued shares. An optional `[translation]` (`currency`,
+`fx = { artifact_id, base, quote, rate_date }` with base = model currency, quote
+= translation currency, `rate_date` on or before `as_of`) adds
+`model.dcf-translation.v1`. A version 2 run writes `model.dcf-results.v2` with
+`opening_diluted_shares`, `issued_shares`, `ending_diluted_shares`, and
+`issuance_pv`; version 1 inputs are unchanged.
 
 Add `--sensitivity 'WACCS;GROWTHS'` only when the task provides the grid. Do not
 infer sensitivity values. Preserve the returned `run_id` and every typed model

@@ -288,6 +288,26 @@ Unique key `(instrument_id, session_date, source_artifact_id)`.
 Both legacy normalized tables share the same `DatasetContract` registry, so
 `data validate` and `data inspect` cover them without extra code.
 
+### FX rates
+
+```text
+finresearch --workspace PATH data normalize-fx-rates CASE_ID SYMBOL \
+  --base CCC --quote CCC [--raw-artifact-id ID]
+```
+
+Reads one raw yfinance daily snapshot (v1 or v2) and writes the existing
+`normalized.fx-rates.v1` from `close` only, with `rate_kind = "close"`,
+`rate_date = session_date`, and the raw `timestamp`. `SYMBOL` must be
+`<BASE><QUOTE>=X` for the declared controlled ISO codes, which must differ. OHLC
+ordering is not checked because no OHLC field is published, so yfinance FX bars
+with `low` above `open` normalize. A NULL `close` drops the row; every dropped
+session is recorded in `normalized.price-gaps.v1` (`null_fields = close`), which
+is always published, possibly empty. A nonpositive `close`, duplicate session
+dates, or no remaining row fails. Both artifacts carry the `null_bars = drop`
+policy in their identity and descend from the raw snapshot. Pass the printed
+`normalized.fx-rates` artifact id to `[translation]` in `dcf-inputs.toml`
+(see `modeling.md`).
+
 ## Canonical contracts and explicit local import
 
 Current provider normalization writes immutable `normalized.instrument-master.v2`
