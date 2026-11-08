@@ -131,6 +131,29 @@ RAW_YFINANCE_DAILY_PRICES_V1: Final = DatasetContract(
     unique_key=("provider_symbol", "interval", "timestamp"),
 )
 
+RAW_YFINANCE_DAILY_PRICE_V2_FIELDS: Final[
+    dict[str, pl.DataType | type[pl.DataType]]
+] = {
+    "schema_version": pl.UInt16,
+    "provider": pl.String,
+    "provider_symbol": pl.String,
+    "currency": pl.String,
+    "quote_type": pl.String,
+    **{
+        name: dtype
+        for name, dtype in RAW_YFINANCE_DAILY_PRICE_FIELDS.items()
+        if name not in {"schema_version", "provider", "provider_symbol", "currency"}
+    },
+}
+
+RAW_YFINANCE_DAILY_PRICES_V2: Final = DatasetContract(
+    name="raw.yfinance.daily-prices",
+    version=2,
+    schema=pl.Schema(RAW_YFINANCE_DAILY_PRICE_V2_FIELDS),
+    non_nullable=(*RAW_YFINANCE_DAILY_PRICES_V1.non_nullable, "quote_type"),
+    unique_key=RAW_YFINANCE_DAILY_PRICES_V1.unique_key,
+)
+
 RAW_SEC_SUBMISSIONS_FIELDS: Final[dict[str, pl.DataType | type[pl.DataType]]] = {
     "schema_version": pl.UInt16,
     "provider": pl.String,
@@ -869,6 +892,41 @@ NORMALIZED_CORPORATE_ACTIONS_V1: Final = DatasetContract(
     unique_key=("instrument_id", "ex_date", "action_type", "source_artifact_id"),
     sort_key=("instrument_id", "ex_date", "action_type"),
     semantic_validator=_validate_corporate_actions_v1,
+    allow_empty=True,
+)
+
+PRICE_GAP_FIELDS: Final = ("open", "high", "low", "close")
+
+NORMALIZED_PRICE_GAPS_V1_FIELDS: Final[dict[str, pl.DataType | type[pl.DataType]]] = {
+    "schema_version": pl.UInt16,
+    "instrument_id": pl.String,
+    "session_date": pl.Date,
+    "reason": pl.String,
+    "null_fields": pl.String,
+    "source_artifact_id": pl.String,
+}
+
+
+def _validate_price_gaps_v1(frame: pl.DataFrame) -> None:
+    contract = "normalized.price-gaps.v1"
+    _validate_enum(frame, contract, "reason", frozenset({"null_ohlc"}))
+    for fields in frame.get_column("null_fields"):
+        names = fields.split(",")
+        if not set(names) <= set(PRICE_GAP_FIELDS) or names != sorted(set(names)):
+            raise _semantic_error(
+                contract,
+                "null_fields must be a sorted comma list of open, high, low, close",
+            )
+
+
+NORMALIZED_PRICE_GAPS_V1: Final = DatasetContract(
+    name="normalized.price-gaps",
+    version=1,
+    schema=pl.Schema(NORMALIZED_PRICE_GAPS_V1_FIELDS),
+    non_nullable=tuple(NORMALIZED_PRICE_GAPS_V1_FIELDS),
+    unique_key=("instrument_id", "session_date", "source_artifact_id"),
+    sort_key=("instrument_id", "session_date", "source_artifact_id"),
+    semantic_validator=_validate_price_gaps_v1,
     allow_empty=True,
 )
 
@@ -2539,6 +2597,8 @@ CONTRACTS: Final = {
     ),
     RAW_CAPTURE_V1.identifier: RAW_CAPTURE_V1,
     RAW_YFINANCE_DAILY_PRICES_V1.identifier: RAW_YFINANCE_DAILY_PRICES_V1,
+    RAW_YFINANCE_DAILY_PRICES_V2.identifier: RAW_YFINANCE_DAILY_PRICES_V2,
+    NORMALIZED_PRICE_GAPS_V1.identifier: NORMALIZED_PRICE_GAPS_V1,
     RAW_SEC_SUBMISSIONS_V1.identifier: RAW_SEC_SUBMISSIONS_V1,
     RAW_SEC_COMPANYFACTS_V1.identifier: RAW_SEC_COMPANYFACTS_V1,
     NORMALIZED_INSTRUMENT_MASTER_V1.identifier: NORMALIZED_INSTRUMENT_MASTER_V1,

@@ -9,7 +9,7 @@ from datetime import UTC, date, datetime
 import polars as pl
 import yfinance as yf  # type: ignore[import-untyped]
 
-from finresearch.data_contracts import RAW_YFINANCE_DAILY_PRICES_V1
+from finresearch.data_contracts import RAW_YFINANCE_DAILY_PRICES_V2
 from finresearch.providers import ProviderError
 
 
@@ -18,7 +18,7 @@ class YFinanceProviderError(ProviderError):
 
 
 class YFinancePriceProvider:
-    """Fetch daily prices and trading currency from yfinance."""
+    """Fetch daily prices, trading currency, and quote type from yfinance."""
 
     def fetch_daily_prices(
         self,
@@ -27,7 +27,7 @@ class YFinancePriceProvider:
         end: date,
         retrieved_at: datetime,
     ) -> pl.DataFrame:
-        """Fetch an unadjusted daily history with actions and currency."""
+        """Fetch an unadjusted daily history with actions, currency, and type."""
         try:
             ticker = yf.Ticker(symbol)
             history = ticker.history(
@@ -41,9 +41,11 @@ class YFinancePriceProvider:
                 raise_errors=True,
             )
             currency = ticker.fast_info["currency"]
+            quote_type = ticker.fast_info["quote_type"]
         except Exception as exc:
             raise YFinanceProviderError(
-                f"yfinance failed to fetch daily prices or currency for {symbol}: {exc}"
+                f"yfinance failed to fetch daily prices, currency, or quote type "
+                f"for {symbol}: {exc}"
             ) from exc
 
         if history.empty:
@@ -55,6 +57,8 @@ class YFinancePriceProvider:
             raise YFinanceProviderError(
                 f"yfinance reported no trading currency for {symbol}"
             )
+        if not isinstance(quote_type, str) or not quote_type.strip():
+            raise YFinanceProviderError(f"yfinance reported no quote type for {symbol}")
 
         rows = history.reset_index().to_dict(orient="records")
         return yfinance_history_to_frame(
@@ -64,6 +68,7 @@ class YFinancePriceProvider:
             end=end,
             retrieved_at=retrieved_at,
             currency=currency.strip(),
+            quote_type=quote_type.strip(),
         )
 
 
@@ -75,12 +80,15 @@ def yfinance_history_to_frame(
     end: date,
     retrieved_at: datetime,
     currency: str,
+    quote_type: str,
 ) -> pl.DataFrame:
     """Convert yfinance boundary records to the exact raw storage schema."""
     if retrieved_at.tzinfo is None:
         raise YFinanceProviderError("retrieved_at must be timezone-aware")
     if not currency.strip():
         raise YFinanceProviderError("currency must not be empty")
+    if not quote_type.strip():
+        raise YFinanceProviderError("quote_type must not be empty")
     retrieved_utc = retrieved_at.astimezone(UTC)
 
     converted: list[dict[str, object]] = []
@@ -89,10 +97,11 @@ def yfinance_history_to_frame(
         timestamp, provider_timezone = _normalize_timestamp(timestamp_value)
         converted.append(
             {
-                "schema_version": RAW_YFINANCE_DAILY_PRICES_V1.version,
+                "schema_version": RAW_YFINANCE_DAILY_PRICES_V2.version,
                 "provider": "yfinance",
                 "provider_symbol": symbol,
                 "currency": currency.strip(),
+                "quote_type": quote_type.strip(),
                 "retrieved_at": retrieved_utc,
                 "requested_start": start,
                 "requested_end": end,
@@ -112,8 +121,8 @@ def yfinance_history_to_frame(
             }
         )
 
-    frame = pl.DataFrame(converted, schema=RAW_YFINANCE_DAILY_PRICES_V1.schema)
-    RAW_YFINANCE_DAILY_PRICES_V1.validate(frame)
+    frame = pl.DataFrame(converted, schema=RAW_YFINANCE_DAILY_PRICES_V2.schema)
+    RAW_YFINANCE_DAILY_PRICES_V2.validate(frame)
     return frame
 
 

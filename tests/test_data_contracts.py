@@ -134,3 +134,45 @@ def valid_comps_inputs_v1_frame() -> pl.DataFrame:
         ],
         schema=MODEL_COMPS_INPUTS_V1.schema,
     )
+
+
+def test_price_gaps_contract_rules() -> None:
+    from finresearch.data_contracts import NORMALIZED_PRICE_GAPS_V1
+
+    def gaps(**overrides: object) -> pl.DataFrame:
+        row: dict[str, object] = {
+            "schema_version": 1,
+            "instrument_id": "i",
+            "session_date": date(2026, 1, 2),
+            "reason": "null_ohlc",
+            "null_fields": "close,open",
+            "source_artifact_id": "raw",
+        }
+        row.update(overrides)
+        return pl.DataFrame([row], schema=NORMALIZED_PRICE_GAPS_V1.schema)
+
+    assert get_contract("normalized.price-gaps.v1") is NORMALIZED_PRICE_GAPS_V1
+    NORMALIZED_PRICE_GAPS_V1.validate(gaps())
+    NORMALIZED_PRICE_GAPS_V1.validate(gaps().clear())
+    for bad in (
+        {"reason": "other"},
+        {"null_fields": "open,close"},
+        {"null_fields": "close,volume"},
+        {"null_fields": ""},
+    ):
+        with pytest.raises(DataContractError):
+            NORMALIZED_PRICE_GAPS_V1.validate(gaps(**bad))
+    with pytest.raises(DataContractError, match="duplicate"):
+        NORMALIZED_PRICE_GAPS_V1.validate(pl.concat([gaps(), gaps()]))
+
+
+def test_raw_yfinance_v2_requires_quote_type() -> None:
+    from finresearch.data_contracts import RAW_YFINANCE_DAILY_PRICES_V2
+
+    assert get_contract("raw.yfinance.daily-prices.v2") is RAW_YFINANCE_DAILY_PRICES_V2
+    frame = valid_price_frame().with_columns(
+        pl.lit(2, dtype=pl.UInt16).alias("schema_version"),
+        pl.lit(None, dtype=pl.String).alias("quote_type"),
+    )[list(RAW_YFINANCE_DAILY_PRICES_V2.schema)]
+    with pytest.raises(DataContractError, match="quote_type"):
+        RAW_YFINANCE_DAILY_PRICES_V2.validate(frame)
