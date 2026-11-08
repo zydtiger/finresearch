@@ -461,7 +461,7 @@ def test_peer_exclusions_are_explicit(built: Path) -> None:
             "total or max",
         ),
         ('window = "annualized_30d"', 'window = "ttm"', "no valid peer remains"),
-        ("version = 1", "version = 2", "version = 1"),
+        ("version = 1", "version = 3", "version = 1 or version = 2"),
         (
             'holders_revenue = { value = 600.0, unit = "USDm"',
             'holders_revenue = { value = 6000000000.0, unit = "USDm"',
