@@ -141,6 +141,9 @@ class Multiples:
     metric_artifact_ids: tuple[str, ...]
     peers: tuple[Peer, ...]
     exclude: tuple[tuple[str, str], ...]
+    # Version 2: "trailing" applies the statistic to the subject's own window.
+    subject_revenue: str = "scenario"
+    subject_entity_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -163,6 +166,9 @@ class TokenConfig:
     pegs: dict[str, ValueInput]
     scenarios: dict[str, TokenScenario]
     multiples: Multiples
+    # Version 2 options; the defaults reproduce version 1.
+    emissions_source: str = "reserve"
+    dcf_dilution: str = "none"
 
 
 @dataclass(frozen=True)
@@ -185,6 +191,8 @@ class TokenData:
     parents: tuple[str, ...]
     parent_bindings: tuple[tuple[str, str], ...]
     unlock_events: tuple[UnlockEvent, ...] | None = None
+    # First declared metric artifact holding the trailing subject's rows.
+    subject_artifact_id: str | None = None
 
 
 def _token_scale(unit: str) -> float:
@@ -216,7 +224,7 @@ def _keys(
 def load_token_input(
     case_dir: Path, relative_input: str
 ) -> tuple[TokenConfig, bytes, Path]:
-    """Load and strictly validate one case-relative token-inputs.toml v1 file."""
+    """Load and strictly validate one case-relative token-inputs.toml file."""
     if Path(relative_input).is_absolute():
         raise CaseContractError("token input must be a case-relative path")
     path = resolve_relative_path(case_dir, relative_input, "token input")
@@ -227,9 +235,13 @@ def load_token_input(
         data = tomllib.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
         raise CaseContractError("token input must be valid UTF-8 TOML") from exc
-    if data.get("version") != 1 or isinstance(data.get("version"), bool):
-        raise CaseContractError("token input must use version = 1")
-    _keys(data, _TOP_KEYS, "token input", {"anchors", "pegs"})
+    version = data.get("version")
+    if version not in {1, 2} or isinstance(version, bool):
+        raise CaseContractError("token input must use version = 1 or version = 2")
+    _keys(data, _TOP_KEYS, "token input", {"anchors", "pegs", "dcf_dilution"})
+    dcf_dilution = data.get("dcf_dilution", "none")
+    if dcf_dilution not in {"none", "issuance"}:
+        raise CaseContractError("dcf_dilution must be none or issuance")
     as_of = _parse_date(data["as_of"], "as_of")
     instrument_id = _controlled_text(data["instrument_id"], "instrument_id")
     currency = _controlled_text(data["currency"], "currency")
@@ -258,8 +270,11 @@ def load_token_input(
         supply,
         {"reconciliation_artifact_id", "fully_diluted_metric"},
         "supply",
-        {"unlocks_artifact_id", "schedule_id"},
+        {"unlocks_artifact_id", "schedule_id", "emissions_source"},
     )
+    emissions_source = supply.get("emissions_source", "reserve")
+    if emissions_source not in {"reserve", "mint"}:
+        raise CaseContractError("supply.emissions_source must be reserve or mint")
     if supply["fully_diluted_metric"] not in {"total", "max"}:
         raise CaseContractError("supply.fully_diluted_metric must be total or max")
     if ("unlocks_artifact_id" in supply) != ("schedule_id" in supply):
@@ -331,7 +346,35 @@ def load_token_input(
             "peers",
         },
         "multiples",
-        {"exclude"},
+        {"exclude", "subject_revenue", "subject_entity_id"},
+    )
+    if version == 1:
+        v2_keys = [
+            key
+            for key, present in (
+                ("dcf_dilution", "dcf_dilution" in data),
+                ("supply.emissions_source", "emissions_source" in supply),
+                ("multiples.subject_revenue", "subject_revenue" in mult),
+                ("multiples.subject_entity_id", "subject_entity_id" in mult),
+            )
+            if present
+        ]
+        if v2_keys:
+            raise CaseContractError(f"token input keys {v2_keys} require version = 2")
+    subject_revenue = mult.get("subject_revenue", "scenario")
+    if subject_revenue not in {"scenario", "trailing"}:
+        raise CaseContractError(
+            "multiples.subject_revenue must be scenario or trailing"
+        )
+    if (subject_revenue == "trailing") != ("subject_entity_id" in mult):
+        raise CaseContractError(
+            "multiples.subject_entity_id is required exactly when "
+            'subject_revenue = "trailing"'
+        )
+    subject_entity_id = (
+        _controlled_text(mult["subject_entity_id"], "multiples.subject_entity_id")
+        if "subject_entity_id" in mult
+        else None
     )
     if mult["metric"] not in _MULTIPLE_METRICS:
         raise CaseContractError(
@@ -416,7 +459,11 @@ def load_token_input(
             ),
             peers=tuple(peers),
             exclude=tuple(exclusions),
+            subject_revenue=subject_revenue,
+            subject_entity_id=subject_entity_id,
         ),
+        emissions_source=emissions_source,
+        dcf_dilution=dcf_dilution,
     )
     # Price class resolution is not available while loading the input, so every
     # price must be a complete bar: a session on the cutoff would pass here but
@@ -737,12 +784,30 @@ def load_token_data(
             for i in config.multiples.market_artifact_ids
         ]
     )
-    metrics = pl.concat(
-        [
-            frame(i, "normalized.protocol-metrics", 1)
-            for i in config.multiples.metric_artifact_ids
-        ]
-    )
+    metric_frames = [
+        (i, frame(i, "normalized.protocol-metrics", 1))
+        for i in config.multiples.metric_artifact_ids
+    ]
+    metrics = pl.concat([item for _, item in metric_frames])
+    subject_artifact_id = None
+    subject = config.multiples.subject_entity_id
+    if subject is not None:
+        subject_artifact_id = next(
+            (
+                artifact_id
+                for artifact_id, item in metric_frames
+                if item.filter(
+                    (pl.col("entity_id") == subject)
+                    & (pl.col("metric") == config.multiples.metric)
+                ).height
+            ),
+            None,
+        )
+        if subject_artifact_id is None:
+            raise CaseContractError(
+                f"multiples metric artifacts hold no {config.multiples.metric} "
+                f"rows for subject entity {subject}"
+            )
     if config.anchors is not None:
         anchor = frame(config.anchors[0], "normalized.protocol-metrics", 1)
         if config.anchors[1] not in set(anchor["metric"].to_list()):
@@ -755,7 +820,14 @@ def load_token_data(
     parents = token_parent_ids(config)
     bindings = tuple((parent, by_id[parent].sha256 or "") for parent in parents)
     return TokenData(
-        price, reconciliation, market, metrics, parents, bindings, unlock_events
+        price,
+        reconciliation,
+        market,
+        metrics,
+        parents,
+        bindings,
+        unlock_events,
+        subject_artifact_id,
     )
 
 
@@ -881,6 +953,8 @@ class _Dcf:
     paths: tuple[_Path, ...]
     terminal_pv: float
     aggregate: float
+    # (aggregate, terminal PV) per basis after dcf_dilution; undiluted for none.
+    by_basis: dict[str, tuple[float, float]]
 
 
 def _discounted(
@@ -910,7 +984,10 @@ def _discounted(
         )
         unlocks = period_unlocks * period.unlock_realization.value
         closing_circ = circ + unlocks + period.emissions.value - retired
-        closing_fd = fd - retired
+        if config.emissions_source == "mint":
+            closing_fd = fd + period.emissions.value - retired
+        else:
+            closing_fd = fd - retired
         if retired > circ * (1 + 1e-12) or closing_circ < -1e-9 * max(1.0, circ0):
             raise CaseContractError(
                 f"scenario {scenario.name} retires more tokens than circulate "
@@ -958,7 +1035,42 @@ def _discounted(
         raise CaseContractError(
             f"scenario {scenario.name} aggregate value must be finite and positive"
         )
-    return _Dcf(tuple(paths), terminal_pv, aggregate)
+    if config.dcf_dilution == "none":
+        by_basis = {basis: (aggregate, terminal_pv) for basis in _BASES}
+    else:
+        by_basis = {
+            basis: _diluted(config, paths, terminal_pv, basis, start)
+            for basis, start in (("circulating", circ0), ("fully_diluted", fd0))
+        }
+    return _Dcf(tuple(paths), terminal_pv, aggregate, by_basis)
+
+
+def _diluted(
+    config: TokenConfig,
+    paths: list[_Path],
+    terminal_pv: float,
+    basis: str,
+    start: float,
+) -> tuple[float, float]:
+    """Return (aggregate, terminal PV) attributable to today's tokens.
+
+    Each PV is scaled by S0 / (S0 + cumulative issuance through its period),
+    and the terminal PV by the last period's factor. Circulating issuance is
+    realized unlocks plus emissions; fully diluted issuance is minted emissions
+    only. Retirements stay out of the factor because their value is already
+    counted as tokenholder cash flow.
+    """
+    issued = 0.0
+    total = 0.0
+    factor = 1.0
+    for path in paths:
+        if basis == "circulating":
+            issued += path.unlocks + path.emissions
+        elif config.emissions_source == "mint":
+            issued += path.emissions
+        factor = start / (start + issued)
+        total += path.cash_flow / path.discount_factor * factor
+    return total + terminal_pv * factor, terminal_pv * factor
 
 
 def _quote_rate(config: TokenConfig, quote_asset: str) -> float:
@@ -1130,6 +1242,27 @@ def _peer_rows(
     return rows
 
 
+def _subject_revenue(config: TokenConfig, data: TokenData) -> float | None:
+    """Return the subject's trailing revenue in ``value_unit``, or None."""
+    entity = config.multiples.subject_entity_id
+    if config.multiples.subject_revenue != "trailing" or entity is None:
+        return None
+    revenue = _holders_revenue_window(
+        config, data.metrics, Peer(config.instrument_id, entity)
+    )
+    if revenue is None:
+        raise CaseContractError(
+            f"subject entity {entity} has an incomplete {config.multiples.metric} "
+            f"window ending {config.multiples.metric_window_end}"
+        )
+    if revenue <= 0:
+        raise CaseContractError(
+            f"subject entity {entity} has nonpositive trailing "
+            f"{config.multiples.metric}"
+        )
+    return revenue / _unit_scale(config.value_unit, config.currency)
+
+
 def _statistic(rows: list[dict[str, object]], basis: str, name: str) -> float:
     values = sorted(
         cast(float, r["multiple"])
@@ -1172,6 +1305,7 @@ def build_token_frames(
     price = data.price
     circ_raw = _selected(data, "circulating")
     circ0 = circ_raw / ts
+    subject_revenue = _subject_revenue(config, data)
     peers = _peer_rows(config, data, run_id)
     price_unit = f"{config.currency}/token"
     input_rows: list[dict[str, object]] = []
@@ -1360,7 +1494,19 @@ def build_token_frames(
                 }
             )
 
-        first_revenue = scenario.periods[0].holders_revenue.value
+        if subject_revenue is None:
+            applied_revenue = scenario.periods[0].holders_revenue.value
+        else:
+            applied_revenue = subject_revenue
+            resolved(
+                name,
+                "subject_revenue",
+                subject_revenue,
+                config.value_unit,
+                cast(str, data.subject_artifact_id),
+                True,
+                config.multiples.metric_window_end,
+            )
         dens = {
             "dcf": {"circulating": circ0, "fully_diluted": fd0},
             "multiple": {"circulating": circ0, "fully_diluted": fd_mult0},
@@ -1368,8 +1514,8 @@ def build_token_frames(
         multiples = {
             basis: _statistic(peers, basis, scenario.statistic) for basis in _BASES
         }
-        aggregates = {("dcf", basis): run.aggregate for basis in _BASES} | {
-            ("multiple", basis): multiples[basis] * first_revenue for basis in _BASES
+        aggregates = {("dcf", basis): run.by_basis[basis][0] for basis in _BASES} | {
+            ("multiple", basis): multiples[basis] * applied_revenue for basis in _BASES
         }
         for (method, basis), aggregate in aggregates.items():
             per_token = aggregate * vs / (dens[method][basis] * ts)
@@ -1386,7 +1532,9 @@ def build_token_frames(
                     "per_token_value": per_token,
                     "price": price,
                     "upside": per_token / price - 1,
-                    "terminal_share": run.terminal_pv / aggregate if dcf else None,
+                    "terminal_share": (
+                        run.by_basis[basis][1] / aggregate if dcf else None
+                    ),
                     "multiple_applied": None if dcf else multiples[basis],
                     "implied_cf_scale": (
                         price * fd_raw / (aggregate * vs)
@@ -1430,13 +1578,19 @@ def build_token_frames(
                 config.token_unit,
             )
         )
+        minted = (
+            sum(p.emissions for p in run.paths)
+            if config.emissions_source == "mint"
+            else 0.0
+        )
+        fd_aggregate = run.by_basis["fully_diluted"][0]
         check_rows.append(
             _check(
                 run_id,
                 name,
                 "supply_roll_forward_fully_diluted",
                 run.paths[-1].closing_fd,
-                fd0 - sum(p.retired for p in run.paths),
+                fd0 + minted - sum(p.retired for p in run.paths),
                 config.token_unit,
             )
         )
@@ -1445,7 +1599,7 @@ def build_token_frames(
                 run_id,
                 name,
                 "implied_cf_scale",
-                (price * fd_raw / (run.aggregate * vs)) * run.aggregate * vs,
+                (price * fd_raw / (fd_aggregate * vs)) * fd_aggregate * vs,
                 price * fd_raw,
                 config.currency,
             )
@@ -1481,7 +1635,9 @@ def build_token_frames(
                             "scenario": name,
                             "discount_rate": sens_rate,
                             "terminal_growth": sens_growth,
-                            "per_token_value_fd": altered.aggregate * vs / fd_raw,
+                            "per_token_value_fd": altered.by_basis["fully_diluted"][0]
+                            * vs
+                            / fd_raw,
                             "currency": config.currency,
                             "token_unit": config.token_unit,
                             "per_token_unit": price_unit,
