@@ -9,6 +9,7 @@ from pathlib import Path
 
 import polars as pl
 
+from finresearch.captures import CAPTURE_REFERENCE_PATTERN, declared_captures
 from finresearch.cases import (
     MANIFEST_V2,
     Artifact,
@@ -20,7 +21,11 @@ from finresearch.cases import (
     read_manifest,
     resolve_relative_path,
 )
-from finresearch.data_contracts import ASSET_CLASSES, provider_id_pairs
+from finresearch.data_contracts import (
+    ASSET_CLASSES,
+    PEG_UNIT_PATTERN,
+    provider_id_pairs,
+)
 from finresearch.data_validation import validate_artifact
 from finresearch.modeling import (
     AuthenticatedModelRun,
@@ -30,6 +35,11 @@ from finresearch.modeling import (
 )
 from finresearch.registers import capture_reference_issues, load_model_sources
 from finresearch.report_contract import authenticate_report_artifact
+from finresearch.token_model import load_token_input
+
+# Relative deviation of a stablecoin's close from its declared peg that audit
+# tolerates (50 bps).
+PEG_DEVIATION_LIMIT = 0.005
 
 
 @dataclass(frozen=True)
@@ -98,7 +108,9 @@ def audit_case(
             validate_artifact(workspace, case_id, verify_hashes=verify_hashes)
         )
 
-    frame_issues, facts = _artifact_audit_issues(case_dir, manifest.artifacts, as_of)
+    frame_issues, facts = _artifact_audit_issues(
+        case_dir, manifest.artifacts, as_of, frozenset(declared_captures(manifest))
+    )
     issues.extend(frame_issues)
     issues.extend(capture_reference_issues(workspace, case_id))
 
@@ -106,6 +118,7 @@ def audit_case(
         case_dir, manifest, verify_hashes=verify_hashes
     )
     issues.extend(authentication_issues)
+    issues.extend(_peg_deviation_issues(case_dir, manifest, authenticated_runs))
     for model_run in authenticated_runs:
         if model_run.as_of > as_of:
             issues.append(
@@ -187,8 +200,11 @@ def audit_model_run(
                     verify_hashes=verify_hashes,
                 )
             )
-    frame_issues, facts = _artifact_audit_issues(case_dir, artifacts, resolved.as_of)
+    frame_issues, facts = _artifact_audit_issues(
+        case_dir, artifacts, resolved.as_of, frozenset(declared_captures(manifest))
+    )
     issues.extend(frame_issues)
+    issues.extend(_peg_deviation_issues(case_dir, manifest, (resolved,)))
     issues.extend(
         _price_freshness_issues(
             facts,
@@ -221,6 +237,7 @@ def _artifact_audit_issues(
     case_dir: Path,
     artifacts: tuple[Artifact, ...],
     as_of: date,
+    known_captures: frozenset[str],
 ) -> tuple[list[ValidationIssue], _PriceFacts]:
     """Apply safe contract-dependent PIT checks to a declared artifact set."""
     issues: list[ValidationIssue] = []
@@ -230,7 +247,9 @@ def _artifact_audit_issues(
     by_id = {artifact.artifact_id: artifact for artifact in artifacts}
     # instrument -> (as_of, artifact id, conflicting metrics) of the latest
     # reconciliation dated on or before the cutoff.
-    reconciliations: dict[str, tuple[date, str, list[str]]] = {}
+    reconciliations: dict[str, _Reconciliation] = {}
+    # (artifact id, instrument, schedule, scheduled tokens)
+    unlock_totals: list[tuple[str, str, str, float]] = []
     for artifact in artifacts:
         path = resolve_relative_path(
             case_dir, artifact.path, f"artifact {artifact.artifact_id}"
@@ -290,16 +309,147 @@ def _artifact_audit_issues(
         issues.extend(_capture_issues(artifact, frame, by_id))
         if artifact.kind == "derived.token-supply-reconciliation":
             _track_reconciliation(artifact.artifact_id, frame, as_of, reconciliations)
-    for instrument, (_, artifact_id, metrics) in sorted(reconciliations.items()):
+        if artifact.kind == "normalized.token-unlocks":
+            issues.extend(
+                _unlock_issues(
+                    artifact.artifact_id, frame, known_captures, unlock_totals
+                )
+            )
+    for instrument, latest in sorted(reconciliations.items()):
         issues.extend(
             ValidationIssue(
                 "token_supply_conflict",
                 f"instrument {instrument} supply metric {metric} is in conflict "
-                f"in reconciliation {artifact_id}",
+                f"in reconciliation {latest.artifact_id}",
             )
-            for metric in metrics
+            for metric in latest.conflicts
         )
+    for artifact_id, instrument, schedule, scheduled in unlock_totals:
+        known = reconciliations.get(instrument)
+        if known is None or not {"circulating", "max"} <= set(known.selected):
+            continue
+        headroom = known.selected["max"] - known.selected["circulating"]
+        if scheduled > headroom + 1e-9 * max(1.0, abs(headroom)):
+            issues.append(
+                ValidationIssue(
+                    "token_unlocks_exceed_supply",
+                    f"unlock schedule {schedule} in {artifact_id} schedules "
+                    f"{scheduled:.6f} tokens for {instrument}, above the "
+                    f"max-minus-circulating {headroom:.6f} in reconciliation "
+                    f"{known.artifact_id}",
+                )
+            )
     return issues, facts
+
+
+def _unlock_issues(
+    artifact_id: str,
+    frame: pl.DataFrame,
+    known_captures: frozenset[str],
+    totals: list[tuple[str, str, str, float]],
+) -> list[ValidationIssue]:
+    """Check capture references and collect scheduled totals of one schedule."""
+    if not _has_schema(
+        frame,
+        instrument_id=pl.String,
+        schedule_id=pl.String,
+        event_id=pl.String,
+        status=pl.String,
+        amount=pl.Float64,
+        source_ref=pl.String,
+        capture_artifact_id=pl.String,
+    ):
+        return []
+    issues: list[ValidationIssue] = []
+    for row in frame.iter_rows(named=True):
+        cited = set(CAPTURE_REFERENCE_PATTERN.findall(row["source_ref"]))
+        if row["capture_artifact_id"] is not None:
+            cited.add(row["capture_artifact_id"])
+        for capture in sorted(cited - known_captures):
+            issues.append(
+                ValidationIssue(
+                    "token_unlocks_capture_missing",
+                    f"unlock event {row['event_id']} in {artifact_id} cites "
+                    f"undeclared capture {capture}",
+                )
+            )
+    scheduled = frame.filter(pl.col("status") == "scheduled")
+    for (instrument, schedule), group in sorted(
+        scheduled.group_by("instrument_id", "schedule_id", maintain_order=True)
+    ):
+        totals.append(
+            (artifact_id, str(instrument), str(schedule), float(group["amount"].sum()))
+        )
+    return issues
+
+
+def _peg_deviation_issues(
+    case_dir: Path,
+    manifest: CaseManifest,
+    runs: tuple[AuthenticatedModelRun, ...],
+) -> list[ValidationIssue]:
+    """Flag a stablecoin close that strays from a token run's declared peg.
+
+    A peg leaf ``<FIAT>/<COIN>`` is checked against every case
+    ``normalized.daily-prices.v2`` bar of provider symbol ``<COIN>-<FIAT>`` and
+    currency ``<FIAT>`` on the run's price session.
+    """
+    price_artifacts = [
+        artifact
+        for artifact in manifest.artifacts
+        if artifact.kind == "normalized.daily-prices" and artifact.schema_version == 2
+    ]
+    issues: list[ValidationIssue] = []
+    for run in runs:
+        if run.family != "token":
+            continue
+        inputs = next(
+            (a for a in run.artifacts if a.kind == "model.token-inputs"), None
+        )
+        record = next(
+            (
+                r
+                for r in (inputs.input_file_hashes if inputs else ())
+                if r.name == "file.token-inputs"
+            ),
+            None,
+        )
+        if record is None:
+            continue
+        try:
+            config, _, _ = load_token_input(case_dir, record.path)
+        except CaseContractError:
+            continue
+        for name, peg in sorted(config.pegs.items()):
+            match = PEG_UNIT_PATTERN.fullmatch(peg.unit)
+            if match is None:
+                continue
+            symbol = f"{match.group(2)}-{match.group(1)}"
+            for artifact in price_artifacts:
+                try:
+                    path = resolve_relative_path(
+                        case_dir, artifact.path, f"artifact {artifact.artifact_id}"
+                    )
+                    bars = pl.read_parquet(path).filter(
+                        (pl.col("provider_symbol") == symbol)
+                        & (pl.col("currency") == match.group(1))
+                        & (pl.col("session_date") == config.session_date)
+                    )
+                except Exception:
+                    continue
+                for close in sorted(set(bars["close"].to_list())):
+                    deviation = abs(close - peg.value) / peg.value
+                    if deviation > PEG_DEVIATION_LIMIT:
+                        issues.append(
+                            ValidationIssue(
+                                "stablecoin_peg_deviation",
+                                f"token run {run.run_id} peg {name} declares "
+                                f"{peg.value:g} {peg.unit}, but {symbol} closed at "
+                                f"{close:g} on {config.session_date.isoformat()} in "
+                                f"{artifact.artifact_id} ({deviation * 1e4:.1f} bps)",
+                            )
+                        )
+    return issues
 
 
 def _capture_issues(
@@ -338,11 +488,21 @@ def _capture_issues(
     return issues
 
 
+@dataclass(frozen=True)
+class _Reconciliation:
+    """Latest reconciliation at a cutoff: conflicts and selected amounts."""
+
+    as_of: date
+    artifact_id: str
+    conflicts: list[str]
+    selected: dict[str, float]
+
+
 def _track_reconciliation(
     artifact_id: str,
     frame: pl.DataFrame,
     as_of: date,
-    latest: dict[str, tuple[date, str, list[str]]],
+    latest: dict[str, _Reconciliation],
 ) -> None:
     if not _has_schema(
         frame,
@@ -359,7 +519,7 @@ def _track_reconciliation(
             if cutoff > as_of:
                 continue
             current = latest.get(instrument)
-            if current is not None and (current[0], current[1]) >= (
+            if current is not None and (current.as_of, current.artifact_id) >= (
                 cutoff,
                 artifact_id,
             ):
@@ -369,7 +529,17 @@ def _track_reconciliation(
                     (pl.col("as_of") == cutoff) & (pl.col("status") == "conflict")
                 )["supply_metric"].to_list()
             )
-            latest[instrument] = (cutoff, artifact_id, conflicts)
+            selected: dict[str, float] = {}
+            if _has_schema(frame, selected=pl.Boolean, amount=pl.Float64):
+                for row in frame.filter(
+                    (pl.col("instrument_id") == instrument)
+                    & (pl.col("as_of") == cutoff)
+                    & pl.col("selected")
+                ).iter_rows(named=True):
+                    selected[row["supply_metric"]] = row["amount"]
+            latest[instrument] = _Reconciliation(
+                cutoff, artifact_id, conflicts, selected
+            )
 
 
 def _price_asset_class(
