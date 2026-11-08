@@ -50,6 +50,7 @@ from finresearch.modeling import projection_assessment, run_comps, run_dcf
 from finresearch.normalization import (
     normalize_daily_prices,
     normalize_fundamental_facts,
+    normalize_fx_rates,
     reconcile_instrument_master,
 )
 from finresearch.protocol_normalization import normalize_protocol_metrics
@@ -873,6 +874,38 @@ def normalize_daily_prices_command(
     if receipt.price_gaps is not None:
         typer.echo("normalized price-gaps:")
         print_ingestion_receipt(receipt.price_gaps)
+
+
+@data_app.command("normalize-fx-rates")
+def normalize_fx_rates_command(
+    ctx: typer.Context,
+    case_id: CaseIdArgument,
+    symbol: SymbolArgument,
+    base: Annotated[str, typer.Option("--base", help="Base ISO currency code.")],
+    quote: Annotated[str, typer.Option("--quote", help="Quote ISO currency code.")],
+    raw_artifact_id: RawArtifactOption = None,
+) -> None:
+    """Derive close-only fx-rates and price-gaps artifacts from one raw snapshot."""
+    try:
+        receipt = normalize_fx_rates(
+            state_from_context(ctx).workspace,
+            case_id,
+            symbol,
+            base=base,
+            quote=quote,
+            raw_artifact_id=raw_artifact_id,
+        )
+    except (
+        CaseContractError,
+        DataContractError,
+        IngestionError,
+        OSError,
+    ) as exc:
+        fail(str(exc))
+    typer.echo("normalized fx-rates:")
+    print_ingestion_receipt(receipt.fx_rates)
+    typer.echo("normalized price-gaps:")
+    print_ingestion_receipt(receipt.price_gaps)
 
 
 @data_app.command("normalize-fundamental-facts")

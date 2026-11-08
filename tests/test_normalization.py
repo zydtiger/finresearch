@@ -19,6 +19,7 @@ from finresearch.cases import (
 from finresearch.cli import app
 from finresearch.data_contracts import (
     NORMALIZED_DAILY_PRICES_V2,
+    NORMALIZED_FX_RATES_V1,
     NORMALIZED_INSTRUMENT_MASTER_V2,
     NORMALIZED_PRICE_GAPS_V1,
     RAW_YFINANCE_DAILY_PRICES_V1,
@@ -30,9 +31,11 @@ from finresearch.ingestion import (
     ingest_yfinance_daily_prices,
     persist_snapshot,
     publish_snapshot,
+    symbol_key,
 )
 from finresearch.normalization import (
     normalize_daily_prices,
+    normalize_fx_rates,
     reconcile_instrument_master,
 )
 
@@ -862,3 +865,121 @@ def test_normalize_cli_null_bars_option(tmp_path: Path) -> None:
     )  # fmt: skip
     assert dropped.exit_code == 0, dropped.output
     assert "normalized price-gaps:" in dropped.output
+
+
+FX_SYMBOL = "EURUSD=X"
+
+
+def build_fx_case(
+    tmp_path: Path,
+    *,
+    rows: int = 3,
+    null_close: tuple[int, ...] = (),
+    close: float = 1.1,
+    quote_type: str | None = "CURRENCY",
+) -> Path:
+    """Register an FX snapshot whose OHLC is not internally consistent."""
+    frame = price_frame(symbol=FX_SYMBOL, rows=rows, quote_type=quote_type)
+    frame = frame.with_columns(
+        # yfinance FX bars may have low above open and close.
+        pl.lit(2.0).alias("low"),
+        pl.when(pl.int_range(pl.len()).is_in(list(null_close)))
+        .then(None)
+        .otherwise(close)
+        .alias("close"),
+    )
+    case_dir = initialize_case(tmp_path, "aapl")
+    if quote_type is None:
+        persist_snapshot(
+            case_dir=case_dir,
+            manifest=read_manifest(case_dir),
+            path_role="raw",
+            frame=frame,
+            contract=RAW_YFINANCE_DAILY_PRICES_V1,
+            provider="yfinance",
+            path_parts=("yfinance", "daily-prices", symbol_key(FX_SYMBOL)),
+            entity_key=symbol_key(FX_SYMBOL),
+            retrieved_at=RETRIEVED_AT,
+        )
+    else:
+        ingest_yfinance_daily_prices(
+            tmp_path,
+            "aapl",
+            FX_SYMBOL,
+            date(2026, 1, 1),
+            date(2026, 1, 8),
+            provider=FakePriceProvider(frame),
+            retrieved_at=RETRIEVED_AT,
+        )
+    return tmp_path
+
+
+@pytest.mark.parametrize("quote_type", ["CURRENCY", None])
+def test_normalize_fx_rates_close_only_with_gaps(
+    tmp_path: Path, quote_type: str | None
+) -> None:
+    workspace = build_fx_case(tmp_path, null_close=(1,), quote_type=quote_type)
+    receipt = normalize_fx_rates(
+        workspace,
+        "aapl",
+        FX_SYMBOL,
+        base="EUR",
+        quote="USD",
+        normalized_at=NORMALIZED_AT,
+    )
+    rates = pl.read_parquet(receipt.fx_rates.path)
+    NORMALIZED_FX_RATES_V1.validate(rates)
+    assert rates.select(
+        "base_currency", "quote_currency", "rate_kind"
+    ).unique().rows() == [("EUR", "USD", "close")]
+    assert rates["rate_date"].to_list() == [date(2026, 1, 2), date(2026, 1, 4)]
+    assert rates["rate"].to_list() == [1.1, 1.1]
+    gaps = pl.read_parquet(receipt.price_gaps.path)
+    NORMALIZED_PRICE_GAPS_V1.validate(gaps)
+    assert gaps.select("session_date", "null_fields").rows() == [
+        (date(2026, 1, 3), "close")
+    ]
+    assert invoke(workspace, "data", "validate", "aapl").exit_code == 0
+
+
+def test_normalize_fx_rates_publishes_empty_gaps_artifact(tmp_path: Path) -> None:
+    workspace = build_fx_case(tmp_path)
+    receipt = normalize_fx_rates(
+        workspace, "aapl", FX_SYMBOL, base="EUR", quote="USD",
+        normalized_at=NORMALIZED_AT,
+    )  # fmt: skip
+    assert pl.read_parquet(receipt.price_gaps.path).is_empty()
+    assert pl.read_parquet(receipt.fx_rates.path).height == 3
+
+
+@pytest.mark.parametrize(
+    ("base", "quote", "message"),
+    [
+        ("USD", "EUR", "symbol must be USDEUR=X"),
+        ("EUR", "XXX", "quote must be a controlled"),
+        ("EUR", "EUR", "symbol must be EUREUR=X"),
+    ],
+)
+def test_normalize_fx_rates_rejects_pair_mismatch(
+    tmp_path: Path, base: str, quote: str, message: str
+) -> None:
+    workspace = build_fx_case(tmp_path)
+    with pytest.raises(IngestionError, match=message):
+        normalize_fx_rates(workspace, "aapl", FX_SYMBOL, base=base, quote=quote)
+
+
+def test_normalize_fx_rates_rejects_nonpositive_close(tmp_path: Path) -> None:
+    workspace = build_fx_case(tmp_path, close=-1.0)
+    with pytest.raises(IngestionError, match="cannot be normalized"):
+        normalize_fx_rates(workspace, "aapl", FX_SYMBOL, base="EUR", quote="USD")
+
+
+def test_normalize_fx_rates_cli(tmp_path: Path) -> None:
+    workspace = build_fx_case(tmp_path, null_close=(0,))
+    result = invoke(
+        workspace, "data", "normalize-fx-rates", "aapl", FX_SYMBOL,
+        "--base", "EUR", "--quote", "USD",
+    )  # fmt: skip
+    assert result.exit_code == 0, result.output
+    assert "normalized fx-rates:" in result.output
+    assert "normalized price-gaps:" in result.output
