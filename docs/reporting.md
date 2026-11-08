@@ -63,7 +63,11 @@ values), HTML additionally includes one dependency-free inline SVG heatmap per
 scenario. Each figure has an accessible title and description, keeps the
 semantic sensitivity table, uses only finite authenticated frame values, and
 names the exact `model.dcf-sensitivity` artifact plus its canonical `model dcf`
-producing command in the caption. It has no external assets. One-dimensional
+producing command in the caption. It has no external assets. Heatmap cell
+labels (version 3) format by magnitude with thousands separators and never use
+scientific notation: `|v| >= 1e6` has 0 decimals, `1000 <= |v| < 1e6` has 2,
+values below 1000 have 2 unless nonzero with `|v| < 0.01`, which keep 4
+significant digits; axis percentages keep two percent decimals. One-dimensional
 or incomplete grids retain the table without a heatmap. Markdown deliberately
 keeps the portable table only.
 
@@ -86,10 +90,10 @@ same identity is an integrity error and is never overwritten.
 
 The Markdown renderer remains `finresearch.report` producer version `1`.
 HTML producer version `1` is frozen for reverse authentication of existing
-Phase 3 reports; current HTML publication uses producer version `2` for the
-heatmap/CSS contract. Producer version is part of the immutable identity and
-the v2 filename is explicitly prefixed with `v2.`, so it selects a distinct
-report path; audit rejects unknown renderer versions rather than interpreting
+Phase 3 reports, and version `2` is frozen with its scientific-notation heatmap
+labels; current HTML publication uses producer version `3`. Producer version is
+part of the immutable identity and the v2 and v3 filenames are prefixed with
+`v2.` and `v3.`, so each selects a distinct report path; audit rejects unknown renderer versions rather than interpreting
 them as either contract.
 
 ## Case audit

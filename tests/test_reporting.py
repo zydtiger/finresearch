@@ -31,7 +31,9 @@ from finresearch.registers import load_model_sources
 from finresearch.report_contract import (
     REPORT_HTML_LEGACY_PRODUCER_VERSION,
     REPORT_HTML_PRODUCER_VERSION,
+    REPORT_HTML_V2_PRODUCER_VERSION,
     REPORT_PRODUCER,
+    _value_label,
     build_report_publication,
 )
 from finresearch.reporting import (
@@ -358,7 +360,56 @@ def test_dcf_html_keeps_table_but_omits_one_dimensional_heatmap(tmp_path: Path) 
     assert b"<svg" not in content
 
 
-def test_legacy_html_v1_audits_and_current_html_v2_is_distinct(
+def _publish_report_version(
+    case_dir: Path, context: ReportContext, producer_version: str
+) -> tuple[Any, Any]:
+    """Publish one report under an older producer version, as past releases did."""
+    manifest = read_manifest(case_dir)
+    publication = build_report_publication(
+        manifest, context, "html", producer_version=producer_version
+    )
+    receipt = publish_artifact_bytes(
+        case_dir=case_dir,
+        manifest=manifest,
+        path_role="reports",
+        kind=publication.kind,
+        schema_version=1,
+        path_parts=(context.family, context.run_id),
+        filename=Path(publication.path).name,
+        entity_key=context.run_id,
+        identity=publication.identity,
+        content=publication.content,
+        producer=REPORT_PRODUCER,
+        producer_version=publication.producer_version,
+        parameters_sha256=publication.identity,
+        input_artifact_ids=publication.parents,
+        produced_at=publication.produced_at,
+    )
+    return publication, receipt
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (1.234e9, "1,234,000,000"),
+        (-2_500_000.4, "-2,500,000"),
+        (123456.789, "123,456.79"),
+        (1000.0, "1,000.00"),
+        (999.999, "1000.00"),
+        (12.3456, "12.35"),
+        (0.0, "0.00"),
+        (0.01, "0.01"),
+        (0.00123456, "0.001235"),
+        (-1.5e-7, "-0.0000001500"),
+    ],
+)
+def test_value_label_formats_by_magnitude_without_scientific_notation(
+    value: float, expected: str
+) -> None:
+    assert _value_label(value) == expected
+
+
+def test_legacy_html_v1_and_v2_audit_and_current_html_v3_is_distinct(
     tmp_path: Path,
 ) -> None:
     case_dir = initialize_case(tmp_path, "demo")
@@ -369,30 +420,9 @@ def test_legacy_html_v1_audits_and_current_html_v2_is_distinct(
         "demo",
         sensitivity=((0.08, 0.1), (0.01, 0.02)),
     )
-    manifest = read_manifest(case_dir)
     context = load_report_context(tmp_path, "demo", model.run_id)
-    legacy = build_report_publication(
-        manifest,
-        context,
-        "html",
-        producer_version=REPORT_HTML_LEGACY_PRODUCER_VERSION,
-    )
-    legacy_receipt = publish_artifact_bytes(
-        case_dir=case_dir,
-        manifest=manifest,
-        path_role="reports",
-        kind=legacy.kind,
-        schema_version=1,
-        path_parts=(context.family, context.run_id),
-        filename=Path(legacy.path).name,
-        entity_key=context.run_id,
-        identity=legacy.identity,
-        content=legacy.content,
-        producer=REPORT_PRODUCER,
-        producer_version=legacy.producer_version,
-        parameters_sha256=legacy.identity,
-        input_artifact_ids=legacy.parents,
-        produced_at=legacy.produced_at,
+    legacy, legacy_receipt = _publish_report_version(
+        case_dir, context, REPORT_HTML_LEGACY_PRODUCER_VERSION
     )
     legacy_artifact = next(
         item
@@ -426,9 +456,14 @@ def test_legacy_html_v1_audits_and_current_html_v2_is_distinct(
     assert current == repeated
     assert current.artifact_id != legacy_receipt.artifact_id
     assert current.path != legacy_receipt.path
-    assert current.path.name.startswith("v2.")
-    assert current_artifact.producer_version == REPORT_HTML_PRODUCER_VERSION
+    assert current.path.name.startswith("v3.")
+    assert current_artifact.producer_version == REPORT_HTML_PRODUCER_VERSION == "3"
     assert b"sensitivity-heatmap" in current.path.read_bytes()
+    v2, v2_receipt = _publish_report_version(
+        case_dir, context, REPORT_HTML_V2_PRODUCER_VERSION
+    )
+    assert v2.producer_version == "2"
+    assert v2_receipt.path.name.startswith("v2.")
     assert audit_case(
         tmp_path,
         "demo",
