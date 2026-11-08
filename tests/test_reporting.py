@@ -48,7 +48,7 @@ runner = CliRunner()
 
 def _write_sources(case_dir: Path) -> None:
     registers = case_dir / "registers"
-    registers.mkdir()
+    registers.mkdir(exist_ok=True)
     registers.joinpath("evidence.csv").write_text(
         "id,claim,source_type,source_ref,observed_at,notes\n"
         "e1,x,filing,x,2026-01-01,\n"
@@ -71,7 +71,7 @@ def _write_sources(case_dir: Path) -> None:
 
 def _write_dcf_input(case_dir: Path, *, as_of: str = "2026-06-30") -> None:
     analysis = case_dir / "analysis"
-    analysis.mkdir()
+    analysis.mkdir(exist_ok=True)
     analysis.joinpath("dcf-inputs.toml").write_text(
         """version = 1
 as_of = "{as_of}"

@@ -259,7 +259,7 @@ def test_empty_register_file_is_valid(tmp_path: Path) -> None:
     initialize_case(tmp_path, "aapl")
     case_dir = tmp_path / "cases" / "aapl"
     registers_dir = case_dir / "registers"
-    registers_dir.mkdir()
+    registers_dir.mkdir(exist_ok=True)
     for filename in REGISTER_FILES:
         header = ",".join(VALID_REGISTERS[filename][0])
         (registers_dir / filename).write_text(f"{header}\n", encoding="utf-8")
