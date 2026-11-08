@@ -32,7 +32,10 @@ from finresearch.report_contract import (
     REPORT_HTML_LEGACY_PRODUCER_VERSION,
     REPORT_HTML_PRODUCER_VERSION,
     REPORT_HTML_V2_PRODUCER_VERSION,
+    REPORT_MARKDOWN_LEGACY_PRODUCER_VERSION,
+    REPORT_MARKDOWN_PRODUCER_VERSION,
     REPORT_PRODUCER,
+    _table_cell,
     _value_label,
     build_report_publication,
 )
@@ -361,12 +364,15 @@ def test_dcf_html_keeps_table_but_omits_one_dimensional_heatmap(tmp_path: Path) 
 
 
 def _publish_report_version(
-    case_dir: Path, context: ReportContext, producer_version: str
+    case_dir: Path,
+    context: ReportContext,
+    producer_version: str,
+    format: Literal["markdown", "html"] = "html",
 ) -> tuple[Any, Any]:
     """Publish one report under an older producer version, as past releases did."""
     manifest = read_manifest(case_dir)
     publication = build_report_publication(
-        manifest, context, "html", producer_version=producer_version
+        manifest, context, format, producer_version=producer_version
     )
     receipt = publish_artifact_bytes(
         case_dir=case_dir,
@@ -407,6 +413,56 @@ def test_value_label_formats_by_magnitude_without_scientific_notation(
     value: float, expected: str
 ) -> None:
     assert _value_label(value) == expected
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (1.234e9, "1,234,000,000"),
+        (123456.789, "123,456.79"),
+        (3.4271234567891234, "3.42712"),
+        (0.0875, "0.0875"),
+        (0.000012345678, "0.0000123457"),
+        (12.0, "12"),
+        (-0.5, "-0.5"),
+        (0.0, "0"),
+        (float("nan"), "nan"),
+        (float("inf"), "inf"),
+        (7, "7"),
+        ("1e9", "1e9"),
+    ],
+)
+def test_table_cell_formats_floats_only(value: object, expected: str) -> None:
+    assert _table_cell(value) == expected
+
+
+def test_markdown_v1_still_audits_and_v2_tables_are_compact(tmp_path: Path) -> None:
+    case_dir = initialize_case(tmp_path, "demo")
+    _write_sources(case_dir)
+    _write_dcf_input(case_dir)
+    model = run_dcf(tmp_path, "demo")
+    context = load_report_context(tmp_path, "demo", model.run_id)
+
+    legacy, _ = _publish_report_version(
+        case_dir, context, REPORT_MARKDOWN_LEGACY_PRODUCER_VERSION, "markdown"
+    )
+    current = generate_report(
+        tmp_path, "demo", model_run_id=model.run_id, format="markdown"
+    )
+
+    assert REPORT_MARKDOWN_PRODUCER_VERSION == "2"
+    assert legacy.producer_version == "1"
+    assert legacy.path != current.path.relative_to(case_dir).as_posix()
+    assert b"0.08750000000000002" in legacy.content
+    assert b"0.08750000000000002" not in current.path.read_bytes()
+    assert b"| 0.0875 |" in current.path.read_bytes()
+    assert audit_case(
+        tmp_path,
+        "demo",
+        as_of=date(2026, 6, 30),
+        max_price_age_days=1,
+        verify_hashes=True,
+    ).valid
 
 
 def test_legacy_html_v1_and_v2_audit_and_current_html_v3_is_distinct(

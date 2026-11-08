@@ -63,8 +63,13 @@ values), HTML additionally includes one dependency-free inline SVG heatmap per
 scenario. Each figure has an accessible title and description, keeps the
 semantic sensitivity table, uses only finite authenticated frame values, and
 names the exact `model.dcf-sensitivity` artifact plus its canonical `model dcf`
-producing command in the caption. It has no external assets. Heatmap cell
-labels (version 3) format by magnitude with thousands separators and never use
+producing command in the caption. It has no external assets.
+
+Table cells (Markdown v2, HTML v3) format floats by magnitude: `|v| >= 1e6`
+is grouped with 0 decimals, `1000 <= |v| < 1e6` grouped with 2 decimals, and
+smaller values use 6 significant digits without scientific notation or
+trailing zeros (`0.0875`, `3.42712`); zero renders as `0`, non-finite values,
+integers, and strings are unchanged. Heatmap cell labels (version 3) format by magnitude with thousands separators and never use
 scientific notation: `|v| >= 1e6` has 0 decimals, `1000 <= |v| < 1e6` has 2,
 values below 1000 have 2 unless nonzero with `|v| < 0.01`, which keep 4
 significant digits; axis percentages keep two percent decimals. One-dimensional
@@ -88,12 +93,12 @@ artifact timestamp is the model `as_of` at UTC midnight. An identical rerun
 returns the existing receipt. A different byte sequence or declaration at the
 same identity is an integrity error and is never overwritten.
 
-The Markdown renderer remains `finresearch.report` producer version `1`.
-HTML producer version `1` is frozen for reverse authentication of existing
-Phase 3 reports, and version `2` is frozen with its scientific-notation heatmap
-labels; current HTML publication uses producer version `3`. Producer version is
-part of the immutable identity and the v2 and v3 filenames are prefixed with
-`v2.` and `v3.`, so each selects a distinct report path; audit rejects unknown renderer versions rather than interpreting
+Markdown producer version `1` and HTML producer versions `1` and `2` are
+frozen (floats rendered with Python `str`, v2 heatmap labels in scientific
+notation) for reverse authentication of existing reports. Current publication
+uses Markdown producer version `2` and HTML producer version `3`. Producer
+version is part of the immutable identity, so each selects a distinct report
+path (HTML v2 and v3 filenames are additionally prefixed `v2.` and `v3.`); audit rejects unknown renderer versions rather than interpreting
 them as either contract.
 
 ## Case audit

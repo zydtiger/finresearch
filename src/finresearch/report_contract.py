@@ -31,11 +31,12 @@ from finresearch.cases import (
 from finresearch.modeling import ModelFamily, model_run_is_declared, resolve_model_run
 
 REPORT_PRODUCER = "finresearch.report"
-REPORT_MARKDOWN_PRODUCER_VERSION = "1"
+REPORT_MARKDOWN_LEGACY_PRODUCER_VERSION = "1"
+REPORT_MARKDOWN_PRODUCER_VERSION = "2"
 REPORT_HTML_LEGACY_PRODUCER_VERSION = "1"
 REPORT_HTML_V2_PRODUCER_VERSION = "2"
 REPORT_HTML_PRODUCER_VERSION = "3"
-# Kept for callers that historically imported the v1 report producer constant.
+# Alias of the current Markdown producer version, kept for historical importers.
 REPORT_PRODUCER_VERSION = REPORT_MARKDOWN_PRODUCER_VERSION
 ReportFormat = Literal["markdown", "html"]
 SensitivityGrid = tuple[
@@ -349,7 +350,12 @@ def _context_for_family(
 
 
 def render_markdown(context: ReportContext) -> bytes:
-    """Render portable deterministic Markdown without wall-clock content."""
+    """Render current (v2) portable deterministic Markdown."""
+    return _render_markdown(context, _table_cell)
+
+
+def _render_markdown(context: ReportContext, cell: Callable[[object], str]) -> bytes:
+    """Render Markdown; v1 and v2 differ only in table cell formatting."""
     lines = [
         f"# {_markdown_text(context.family.upper())} report",
         "",
@@ -369,20 +375,24 @@ def render_markdown(context: ReportContext) -> bytes:
         "",
         "## Results",
         "",
-        *_markdown_table(context.results),
+        *_markdown_table(context.results, cell),
     ]
     if context.summary is not None:
-        lines.extend(["", "## Peer summary", "", *_markdown_table(context.summary)])
+        lines.extend(
+            ["", "## Peer summary", "", *_markdown_table(context.summary, cell)]
+        )
     if context.sensitivity is not None:
-        lines.extend(["", "## Sensitivity", "", *_markdown_table(context.sensitivity)])
+        lines.extend(
+            ["", "## Sensitivity", "", *_markdown_table(context.sensitivity, cell)]
+        )
     for title, table in context.extra_tables:
-        lines.extend(["", f"## {title}", "", *_markdown_table(table)])
+        lines.extend(["", f"## {title}", "", *_markdown_table(table, cell)])
     return ("\n".join(lines) + "\n").encode("utf-8")
 
 
 def render_html(context: ReportContext) -> bytes:
     """Render the current v3 self-contained semantic HTML report."""
-    return _render_html_heatmap_report(context, _value_label)
+    return _render_html_heatmap_report(context, _value_label, _table_cell)
 
 
 def _render_report_content(
@@ -392,11 +402,13 @@ def _render_report_content(
 ) -> bytes:
     """Select the frozen renderer matching one validated report declaration."""
     if format == "markdown":
+        if producer_version == REPORT_MARKDOWN_LEGACY_PRODUCER_VERSION:
+            return _render_markdown(context, str)
         return render_markdown(context)
     if producer_version == REPORT_HTML_LEGACY_PRODUCER_VERSION:
         return _render_html_v1(context)
     if producer_version == REPORT_HTML_V2_PRODUCER_VERSION:
-        return _render_html_heatmap_report(context, _value_label_v2)
+        return _render_html_heatmap_report(context, _value_label_v2, str)
     return render_html(context)
 
 
@@ -427,20 +439,22 @@ def _render_html_v1(context: ReportContext) -> bytes:
         f"{html.escape(', '.join(item.artifact_id for item in context.artifacts))}"
         "</dd></dl>",
         "<h2>Results</h2>",
-        _html_table(context.results),
+        _html_table(context.results, str),
     ]
     if context.summary is not None:
-        sections.extend(["<h2>Peer summary</h2>", _html_table(context.summary)])
+        sections.extend(["<h2>Peer summary</h2>", _html_table(context.summary, str)])
     if context.sensitivity is not None:
-        sections.extend(["<h2>Sensitivity</h2>", _html_table(context.sensitivity)])
+        sections.extend(["<h2>Sensitivity</h2>", _html_table(context.sensitivity, str)])
     sections.append("</body></html>\n")
     return "".join(sections).encode("utf-8")
 
 
 def _render_html_heatmap_report(
-    context: ReportContext, value_label: Callable[[float], str]
+    context: ReportContext,
+    value_label: Callable[[float], str],
+    cell: Callable[[object], str],
 ) -> bytes:
-    """Render HTML v2/v3, which differ only in heatmap value formatting."""
+    """Render HTML v2/v3, which differ only in value and table cell formatting."""
     sections = [
         "<!doctype html>",
         '<html lang="en"><head><meta charset="utf-8">',
@@ -468,20 +482,20 @@ def _render_html_heatmap_report(
         f"{html.escape(', '.join(item.artifact_id for item in context.artifacts))}"
         "</dd></dl>",
         "<h2>Results</h2>",
-        _html_table(context.results),
+        _html_table(context.results, cell),
     ]
     if context.summary is not None:
-        sections.extend(["<h2>Peer summary</h2>", _html_table(context.summary)])
+        sections.extend(["<h2>Peer summary</h2>", _html_table(context.summary, cell)])
     if context.sensitivity is not None:
         sections.extend(
             [
                 "<h2>Sensitivity</h2>",
                 *_html_sensitivity_heatmaps(context, value_label),
-                _html_table(context.sensitivity),
+                _html_table(context.sensitivity, cell),
             ]
         )
     for title, table in context.extra_tables:
-        sections.extend([f"<h2>{html.escape(title)}</h2>", _html_table(table)])
+        sections.extend([f"<h2>{html.escape(title)}</h2>", _html_table(table, cell)])
     sections.append("</body></html>\n")
     return "".join(sections).encode("utf-8")
 
@@ -498,7 +512,10 @@ def _report_producer_version(format: ReportFormat, producer_version: str | None)
     """Return a supported renderer version, defaulting to current generation."""
     if format == "markdown":
         version = producer_version or REPORT_MARKDOWN_PRODUCER_VERSION
-        if version == REPORT_MARKDOWN_PRODUCER_VERSION:
+        if version in {
+            REPORT_MARKDOWN_LEGACY_PRODUCER_VERSION,
+            REPORT_MARKDOWN_PRODUCER_VERSION,
+        }:
             return version
     else:
         version = producer_version or REPORT_HTML_PRODUCER_VERSION
@@ -511,7 +528,7 @@ def _report_producer_version(format: ReportFormat, producer_version: str | None)
     raise CaseContractError(f"unsupported {format} report producer version {version!r}")
 
 
-def _markdown_table(frame: pl.DataFrame) -> list[str]:
+def _markdown_table(frame: pl.DataFrame, cell: Callable[[object], str]) -> list[str]:
     columns = frame.columns
     rows = frame.sort(columns).iter_rows()
     output = [
@@ -520,19 +537,19 @@ def _markdown_table(frame: pl.DataFrame) -> list[str]:
     ]
     for row in rows:
         output.append(
-            "| " + " | ".join(_markdown_text(str(value)) for value in row) + " |"
+            "| " + " | ".join(_markdown_text(cell(value)) for value in row) + " |"
         )
     return output
 
 
-def _html_table(frame: pl.DataFrame) -> str:
+def _html_table(frame: pl.DataFrame, cell: Callable[[object], str]) -> str:
     columns = frame.columns
     pieces = ["<table><thead><tr>"]
     pieces.extend(f"<th>{html.escape(column)}</th>" for column in columns)
     pieces.append("</tr></thead><tbody>")
     for row in frame.sort(columns).iter_rows():
         pieces.append("<tr>")
-        pieces.extend(f"<td>{html.escape(str(value))}</td>" for value in row)
+        pieces.extend(f"<td>{html.escape(cell(value))}</td>" for value in row)
         pieces.append("</tr>")
     pieces.append("</tbody></table>")
     return "".join(pieces)
@@ -745,6 +762,21 @@ def _percent_label(value: float) -> str:
 
 def _number_label(value: float) -> str:
     return format(value, ".12g")
+
+
+def _table_cell(value: object) -> str:
+    """Render a table cell: floats by magnitude without scientific notation."""
+    if not isinstance(value, float) or not math.isfinite(value):
+        return str(value)
+    magnitude = abs(value)
+    if magnitude == 0:
+        return "0"
+    if magnitude >= 1_000_000:
+        return f"{value:,.0f}"
+    if magnitude >= 1000:
+        return f"{value:,.2f}"
+    text = f"{value:.{max(5 - math.floor(math.log10(magnitude)), 0)}f}"
+    return text.rstrip("0").rstrip(".") if "." in text else text
 
 
 def _value_label_v2(value: float) -> str:
