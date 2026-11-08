@@ -1831,6 +1831,21 @@ SUPPLY_ADDRESS_METRICS: Final = frozenset(
 OBSERVED_AT_BASES: Final = frozenset({"provider", "retrieval"})
 TOKEN_MARKET_METRICS: Final = frozenset({"fdv", "market_cap", "price", "volume_24h"})
 FDV_SUPPLY_BASES: Final = frozenset({"max", "total"})
+UNLOCK_CATEGORIES: Final = frozenset(
+    {
+        "airdrop",
+        "community",
+        "ecosystem",
+        "emissions",
+        "foundation",
+        "investors",
+        "other",
+        "team",
+        "treasury",
+    }
+)
+UNLOCK_TYPES: Final = frozenset({"cliff", "emission", "linear"})
+UNLOCK_STATUSES: Final = frozenset({"cancelled", "claimed", "scheduled", "unlocked"})
 RECONCILIATION_STATUSES: Final = frozenset(
     {"agree", "conflict", "resolved", "single-source"}
 )
@@ -1912,6 +1927,29 @@ def _validate_token_market_v1(frame: pl.DataFrame) -> None:
             raise _semantic_error(
                 contract, "fdv_supply_basis is required for, and only for, fdv"
             )
+
+
+def _validate_token_unlocks_v1(frame: pl.DataFrame) -> None:
+    contract = "normalized.token-unlocks.v1"
+    _validate_enum(frame, contract, "category", UNLOCK_CATEGORIES)
+    _validate_enum(frame, contract, "unlock_type", UNLOCK_TYPES)
+    _validate_enum(frame, contract, "status", UNLOCK_STATUSES)
+    _validate_finite_positive(frame, contract, "amount")
+    if frame.get_column("schedule_id").n_unique() > 1:
+        raise _semantic_error(contract, "one artifact must hold one schedule_id")
+    for row in frame.iter_rows(named=True):
+        end = row["unlock_end_date"]
+        kind = row["unlock_type"]
+        if kind == "linear" and end is None:
+            raise _semantic_error(contract, "linear unlocks require unlock_end_date")
+        if kind == "cliff" and end is not None:
+            raise _semantic_error(contract, "cliff unlocks forbid unlock_end_date")
+        if end is not None and end < row["unlock_date"]:
+            raise _semantic_error(
+                contract, "unlock_end_date must not precede unlock_date"
+            )
+        if not row["source_ref"].strip():
+            raise _semantic_error(contract, "source_ref must not be empty")
 
 
 def _validate_token_supply_reconciliation_v1(frame: pl.DataFrame) -> None:
@@ -2034,6 +2072,49 @@ NORMALIZED_TOKEN_MARKET_V1: Final = DatasetContract(
     unique_key=_TOKEN_MARKET_UNIQUE_KEY,
     sort_key=_TOKEN_MARKET_UNIQUE_KEY,
     semantic_validator=_validate_token_market_v1,
+)
+
+NORMALIZED_TOKEN_UNLOCKS_V1_FIELDS: Final[
+    dict[str, pl.DataType | type[pl.DataType]]
+] = {
+    "schema_version": pl.UInt16,
+    "provider": pl.String,
+    "instrument_id": pl.String,
+    "schedule_id": pl.String,
+    "event_id": pl.String,
+    "category": pl.String,
+    "recipient_label": pl.String,
+    "holder_address": pl.String,
+    "unlock_type": pl.String,
+    "unlock_date": pl.Date,
+    "unlock_end_date": pl.Date,
+    "amount": pl.Float64,
+    "status": pl.String,
+    "observed_at": pl.Datetime("us", "UTC"),
+    "source_ref": pl.String,
+    "capture_artifact_id": pl.String,
+    "source_artifact_id": pl.String,
+    "normalized_at": pl.Datetime("us", "UTC"),
+}
+_TOKEN_UNLOCKS_UNIQUE_KEY: Final = ("instrument_id", "schedule_id", "event_id")
+NORMALIZED_TOKEN_UNLOCKS_V1: Final = DatasetContract(
+    name="normalized.token-unlocks",
+    version=1,
+    schema=pl.Schema(NORMALIZED_TOKEN_UNLOCKS_V1_FIELDS),
+    non_nullable=tuple(
+        name
+        for name in NORMALIZED_TOKEN_UNLOCKS_V1_FIELDS
+        if name
+        not in {
+            "recipient_label",
+            "holder_address",
+            "unlock_end_date",
+            "capture_artifact_id",
+        }
+    ),
+    unique_key=_TOKEN_UNLOCKS_UNIQUE_KEY,
+    sort_key=_TOKEN_UNLOCKS_UNIQUE_KEY,
+    semantic_validator=_validate_token_unlocks_v1,
 )
 
 DERIVED_TOKEN_SUPPLY_RECONCILIATION_V1_FIELDS: Final[
@@ -2673,6 +2754,7 @@ CONTRACTS: Final = {
     ),
     NORMALIZED_TOKEN_SUPPLY_V1.identifier: NORMALIZED_TOKEN_SUPPLY_V1,
     NORMALIZED_TOKEN_MARKET_V1.identifier: NORMALIZED_TOKEN_MARKET_V1,
+    NORMALIZED_TOKEN_UNLOCKS_V1.identifier: NORMALIZED_TOKEN_UNLOCKS_V1,
     DERIVED_TOKEN_SUPPLY_RECONCILIATION_V1.identifier: (
         DERIVED_TOKEN_SUPPLY_RECONCILIATION_V1
     ),

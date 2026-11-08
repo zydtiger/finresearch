@@ -652,3 +652,358 @@ def test_metric_rows_observed_after_as_of_are_ignored(built: Path) -> None:
         pl.col("period_end") < date(2026, 11, 6)
     )
     assert _holders_revenue_window(config, short, peer) is None
+
+
+UNLOCK_HEADER = (
+    "instrument_id,schedule_id,event_id,category,recipient_label,holder_address,"
+    "unlock_type,unlock_date,unlock_end_date,amount,status,observed_at,source_ref,"
+    "capture_artifact_id"
+)
+SCHEDULE = "tokenomist-2026-11-07"
+UNLOCK_LEAF = 'unlocks = { value = 119.0, unit = "tokens_m", source_id = "a-unlock" }, '
+SUPPLY_LINE = 'fully_diluted_metric = "total"\n'
+BEAR_OVERRIDE = (
+    'fully_diluted = { metric = "total", provider = "hyperliquid", '
+    'source_id = "a-bear-gross"'
+)
+
+
+def unlock_row(
+    event: str,
+    kind: str = "cliff",
+    start: str = "2027-03-01",
+    end: str = "",
+    amount: float = 20e6,
+    status: str = "scheduled",
+    schedule: str = SCHEDULE,
+    ref: str = "https://tokenomist.example/hype",
+    capture: str = "",
+    observed: str = "2026-11-01T00:00:00Z",
+) -> str:
+    return (
+        f"{INSTRUMENT},{schedule},{event},team,,,{kind},{start},{end},{amount},"
+        f"{status},{observed},{ref},{capture}"
+    )
+
+
+def default_unlock_rows() -> list[str]:
+    return [
+        unlock_row("a-cliff"),
+        # 1M tokens a day: 365 days land in period one, 10 in the bear's second.
+        unlock_row("b-stream", "linear", "2026-11-08", "2027-11-17", 375e6),
+        unlock_row("c-cancelled", status="cancelled", amount=50e6),
+        unlock_row("d-done", status="unlocked", amount=60e6),
+        unlock_row("e-on-as-of", start="2026-11-07", amount=7e6),
+    ]
+
+
+def import_unlocks(workspace: Path, tmp_path: Path, rows: list[str]) -> None:
+    from token_support import import_csv_text
+
+    import_csv_text(
+        workspace,
+        tmp_path,
+        "unlocks.csv",
+        UNLOCK_HEADER + "\n" + "\n".join(rows) + "\n",
+        "token-unlocks.v1",
+        provider="tokenomist",
+    )
+
+
+def scheduled_toml(workspace: Path, schedule: str = SCHEDULE, **tweaks: str) -> str:
+    artifact = artifact_ids(workspace, "normalized.token-unlocks")[0]
+    supply = (
+        f'{SUPPLY_LINE}unlocks_artifact_id = "{artifact}"\nschedule_id = "{schedule}"\n'
+    )
+    return token_toml(
+        workspace,
+        **{
+            UNLOCK_LEAF.replace(" ", "__"): "",
+            SUPPLY_LINE.replace(" ", "__"): supply,
+        },
+        **tweaks,
+    )
+
+
+def table(workspace: Path, kind: str, run_id: str) -> pl.DataFrame:
+    manifest = read_manifest(workspace / "cases" / CASE)
+    artifact = next(
+        a
+        for a in manifest.artifacts
+        if a.artifact_id.endswith(run_id) and a.kind == kind
+    )
+    return pl.read_parquet(workspace / "cases" / CASE / artifact.path)
+
+
+def test_unlock_schedule_drives_supply_path(built: Path, tmp_path: Path) -> None:
+    import_unlocks(built, tmp_path, default_unlock_rows())
+    write_inputs(built, scheduled_toml(built))
+    run_id = run_id_of(ok(built, "model", "token", CASE))
+
+    path = table(built, "model.token-supply-path", run_id)
+
+    def realized(scenario: str) -> list[float]:
+        rows = path.filter(pl.col("scenario") == scenario).sort("period_end")
+        return rows["unlocks_realized"].to_list()
+
+    # (20M cliff + 365M of the stream) in tokens_m, times realization 0.2.
+    assert realized("base") == pytest.approx([77.0])
+    assert realized("bear") == pytest.approx([77.0, 2.0])
+
+    inputs = table(built, "model.token-inputs", run_id)
+    row = inputs.filter(
+        (pl.col("scenario") == "bear") & (pl.col("field") == "unlocks:2028-11-07")
+    ).row(0, named=True)
+    assert row["value"] == pytest.approx(10.0)
+    assert row["source_id"] is None
+    assert (
+        row["source_artifact_id"] == artifact_ids(built, "normalized.token-unlocks")[0]
+    )
+    assert not inputs.filter(pl.col("source_id") == "a-unlock").height
+
+    manifest = read_manifest(built / "cases" / CASE)
+    inputs_artifact = next(
+        a for a in manifest.artifacts if a.kind == "model.token-inputs"
+    )
+    assert (
+        artifact_ids(built, "normalized.token-unlocks")[0]
+        in inputs_artifact.input_artifact_ids
+    )
+    assert run_id_of(ok(built, "model", "token", CASE)) == run_id
+    assert audit(built, "--verify-hashes").exit_code == 0
+
+
+def test_unlock_schedule_is_part_of_run_identity(built: Path, tmp_path: Path) -> None:
+    import_unlocks(built, tmp_path, default_unlock_rows())
+    (first_id,) = artifact_ids(built, "normalized.token-unlocks")
+    text = scheduled_toml(built)
+    write_inputs(built, text)
+    first = run_id_of(ok(built, "model", "token", CASE, "--scenario", "base"))
+    revised = default_unlock_rows()
+    revised[0] = unlock_row("a-cliff", amount=21e6)
+    import_unlocks(built, tmp_path, revised)
+    (second_id,) = set(artifact_ids(built, "normalized.token-unlocks")) - {first_id}
+    write_inputs(built, text.replace(first_id, second_id))
+    second = run_id_of(ok(built, "model", "token", CASE, "--scenario", "base"))
+    assert first != second
+
+
+@pytest.mark.parametrize(
+    ("tweaks", "message"),
+    [
+        ({"": ""}, "declares unlocks"),
+        ({"__": ""}, "needs unlocks"),
+        ({"schedule_id": "tokenomist-other"}, "does not hold schedule_id"),
+    ],
+)
+def test_unlock_schedule_validation(
+    built: Path, tmp_path: Path, tweaks: dict[str, str], message: str
+) -> None:
+    import_unlocks(built, tmp_path, default_unlock_rows())
+    text = scheduled_toml(built)
+    if message == "declares unlocks":
+        text = text.replace(
+            'capture_ratio = { value = 0.9, unit = "ratio", source_id = "a-cap" }, ',
+            'capture_ratio = { value = 0.9, unit = "ratio", source_id = "a-cap" }, '
+            + UNLOCK_LEAF,
+        )
+    elif message == "needs unlocks":
+        text = token_toml(built).replace(UNLOCK_LEAF, "")
+    else:
+        text = scheduled_toml(built, schedule="tokenomist-other")
+    write_inputs(built, text)
+    with pytest.raises(CaseContractError, match=message):
+        run_token(built, CASE)
+
+
+def test_unlock_keys_are_declared_together(built: Path, tmp_path: Path) -> None:
+    import_unlocks(built, tmp_path, default_unlock_rows())
+    text = scheduled_toml(built).replace(f'schedule_id = "{SCHEDULE}"\n', "")
+    write_inputs(built, text)
+    with pytest.raises(CaseContractError, match="declared together"):
+        run_token(built, CASE)
+
+
+def test_unlocks_observed_after_as_of_are_rejected(built: Path, tmp_path: Path) -> None:
+    rows = default_unlock_rows()
+    rows[0] = unlock_row("a-cliff", observed="2026-11-09T00:00:00Z")
+    import_unlocks(built, tmp_path, rows)
+    write_inputs(built, scheduled_toml(built))
+    with pytest.raises(CaseContractError, match="observed after as_of"):
+        run_token(built, CASE)
+
+
+@pytest.mark.parametrize(
+    ("rows", "message"),
+    [
+        ([unlock_row("x", "linear")], "linear unlocks require"),
+        ([unlock_row("x", "cliff", end="2027-04-01")], "cliff unlocks forbid"),
+        (
+            [unlock_row("x", "linear", "2027-04-01", "2027-03-01")],
+            "must not precede",
+        ),
+        ([unlock_row("x", amount=0.0)], "amount"),
+        ([unlock_row("x"), unlock_row("x")], "duplicate rows"),
+        ([unlock_row("x"), unlock_row("y", schedule="other")], "one schedule_id"),
+        ([unlock_row("x", ref=" ")], "source_ref"),
+        ([unlock_row("x", capture="missing-capture")], "not a declared"),
+    ],
+)
+def test_unlock_import_rejects_invalid_schedules(
+    built: Path, tmp_path: Path, rows: list[str], message: str
+) -> None:
+    source = tmp_path / "bad.csv"
+    source.write_text(UNLOCK_HEADER + "\n" + "\n".join(rows) + "\n")
+    result = invoke(
+        built, "data", "import-csv", CASE, str(source), "--schema",
+        "token-unlocks.v1", "--provider", "tokenomist",
+        "--retrieved-at", "2026-11-07T00:00:00Z",
+    )  # fmt: skip
+    assert result.exit_code != 0
+    assert message in result.output
+
+
+def test_audit_reports_unlocks_above_remaining_supply(
+    built: Path, tmp_path: Path
+) -> None:
+    ok(built, "model", "token", CASE)
+    assert audit(built).exit_code == 0
+    # max 1.0B minus circulating 239.4M leaves about 760.6M.
+    import_unlocks(built, tmp_path, [unlock_row("big", amount=800e6)])
+    flagged = audit(built)
+    assert flagged.exit_code == 1
+    assert "[token_unlocks_exceed_supply]" in flagged.output
+
+
+def test_audit_checks_unlock_capture_references(built: Path, tmp_path: Path) -> None:
+    capture = register(
+        built, tmp_path, "unlocks.json", b'{"events": []}',
+        "https://tokenomist.example/hype", "web",
+    )  # fmt: skip
+    import_unlocks(
+        built,
+        tmp_path,
+        [unlock_row("cited", ref=f"capture:{capture}", capture=capture)],
+    )
+    assert audit(built).exit_code == 0
+    import_unlocks(
+        built,
+        tmp_path,
+        [unlock_row("uncited", ref="capture:not-registered", schedule="v2")],
+    )
+    flagged = audit(built)
+    assert flagged.exit_code == 1
+    assert "[token_unlocks_capture_missing]" in flagged.output
+    assert "not-registered" in flagged.output
+
+
+def bear_fd(workspace: Path, run_id: str) -> dict[tuple[str, str], float]:
+    frame = results(workspace, run_id).filter(
+        (pl.col("scenario") == "bear") & (pl.col("basis") == "fully_diluted")
+    )
+    return {
+        (r["method"], "den"): r["denominator_tokens"]
+        for r in frame.iter_rows(named=True)
+    }
+
+
+def test_fully_diluted_override_scope(built: Path) -> None:
+    both = run_id_of(ok(built, "model", "token", CASE))
+    assert bear_fd(built, both) == {
+        ("dcf", "den"): pytest.approx(998778474.0 / 1e6),
+        ("multiple", "den"): pytest.approx(998778474.0 / 1e6),
+    }
+    explicit = token_toml(
+        built,
+        **{
+            BEAR_OVERRIDE.replace(" ", "__"): BEAR_OVERRIDE
+            + ', applies_to = ["dcf", "multiple"]'
+        },
+    )
+    write_inputs(built, explicit)
+    same = run_id_of(ok(built, "model", "token", CASE))
+    assert bear_fd(built, same) == bear_fd(built, both)
+
+    scoped = token_toml(
+        built,
+        **{BEAR_OVERRIDE.replace(" ", "__"): BEAR_OVERRIDE + ', applies_to = ["dcf"]'},
+    )
+    write_inputs(built, scoped)
+    run_id = run_id_of(ok(built, "model", "token", CASE))
+    assert bear_fd(built, run_id) == {
+        ("dcf", "den"): pytest.approx(998778474.0 / 1e6),
+        ("multiple", "den"): pytest.approx(951538272.91 / 1e6),
+    }
+    inputs = table(built, "model.token-inputs", run_id).filter(
+        pl.col("scenario") == "bear"
+    )
+    fields = {
+        r["field"]: r
+        for r in inputs.iter_rows(named=True)
+        if r["field"].startswith("fully_diluted_0")
+    }
+    assert set(fields) == {"fully_diluted_0:dcf", "fully_diluted_0:multiple"}
+    assert fields["fully_diluted_0:dcf"]["source_id"] == "a-bear-gross"
+    assert fields["fully_diluted_0:multiple"]["source_artifact_id"] is not None
+    # Base and bull keep the selected denominator for both methods.
+    base = results(built, run_id).filter(
+        (pl.col("scenario") == "base") & (pl.col("basis") == "fully_diluted")
+    )
+    assert (
+        base["denominator_tokens"].to_list() == [pytest.approx(951538272.91 / 1e6)] * 2
+    )
+
+
+def test_scoped_override_run_authenticates(built: Path) -> None:
+    scoped = token_toml(
+        built,
+        **{
+            BEAR_OVERRIDE.replace(" ", "__"): BEAR_OVERRIDE
+            + ', applies_to = ["multiple"]'
+        },
+    )
+    write_inputs(built, scoped)
+    ok(built, "model", "token", CASE, "--sensitivity", "0.2,0.25;0.02,0.03")
+    result = audit(built, "--verify-hashes")
+    assert result.exit_code == 0, result.output
+
+
+@pytest.mark.parametrize(
+    "applies_to",
+    ["[]", '["multiple", "dcf"]', '["dcf", "dcf"]', '["dcf", "fd"]', '"dcf"'],
+)
+def test_fully_diluted_override_scope_validation(built: Path, applies_to: str) -> None:
+    write_inputs(
+        built,
+        token_toml(
+            built,
+            **{
+                BEAR_OVERRIDE.replace(" ", "__"): BEAR_OVERRIDE
+                + f", applies_to = {applies_to}"
+            },
+        ),
+    )
+    with pytest.raises(CaseContractError, match="applies_to"):
+        run_token(built, CASE)
+
+
+def test_audit_reports_stablecoin_peg_deviation(built: Path, tmp_path: Path) -> None:
+    write_inputs(built, token_toml(built).replace("[multiples]", PEG_USDT))
+    import_prices(
+        built, tmp_path, [("2026-11-06", 0.9990)], instrument_id="manual.usdt",
+        symbol="USDT-USD", name="usdt.csv",
+    )  # fmt: skip
+    ok(built, "model", "token", CASE, "--scenario", "base")
+    assert audit(built).exit_code == 0
+
+    write_inputs(
+        built,
+        token_toml(built).replace(
+            "[multiples]", PEG_USDT.replace("value = 1.0", "value = 1.01")
+        ),
+    )
+    ok(built, "model", "token", CASE, "--scenario", "base")
+    flagged = audit(built)
+    assert flagged.exit_code == 1
+    assert "[stablecoin_peg_deviation]" in flagged.output
+    assert "usdt_usd" in flagged.output

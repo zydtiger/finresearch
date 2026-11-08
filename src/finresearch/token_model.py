@@ -88,10 +88,10 @@ _FORECAST_KEYS: Final = {
     "period_end",
     "holders_revenue",
     "capture_ratio",
-    "unlocks",
     "unlock_realization",
     "emissions",
 }
+_VALUATION_METHODS: Final = ("dcf", "multiple")
 
 
 @dataclass(frozen=True)
@@ -99,7 +99,8 @@ class TokenPeriod:
     period_end: date
     holders_revenue: ValueInput
     capture_ratio: ValueInput
-    unlocks: ValueInput
+    # None when a token-unlocks schedule supplies the period's unlocks.
+    unlocks: ValueInput | None
     unlock_realization: ValueInput
     emissions: ValueInput
 
@@ -109,6 +110,7 @@ class FullyDilutedOverride:
     metric: str
     provider: str
     source_id: str
+    applies_to: tuple[str, ...] = _VALUATION_METHODS
 
 
 @dataclass(frozen=True)
@@ -155,10 +157,21 @@ class TokenConfig:
     master_artifact_id: str | None
     reconciliation_artifact_id: str
     fully_diluted_metric: str
+    unlocks_artifact_id: str | None
+    schedule_id: str | None
     anchors: tuple[str, str] | None
     pegs: dict[str, ValueInput]
     scenarios: dict[str, TokenScenario]
     multiples: Multiples
+
+
+@dataclass(frozen=True)
+class UnlockEvent:
+    """One scheduled unlock; ``amount`` is in tokens, dates are inclusive."""
+
+    start: date
+    end: date | None
+    amount: float
 
 
 @dataclass(frozen=True)
@@ -171,6 +184,7 @@ class TokenData:
     metrics: pl.DataFrame
     parents: tuple[str, ...]
     parent_bindings: tuple[tuple[str, str], ...]
+    unlock_events: tuple[UnlockEvent, ...] | None = None
 
 
 def _token_scale(unit: str) -> float:
@@ -240,9 +254,28 @@ def load_token_input(
     if master is not None:
         master = _controlled_text(master, "price.master_artifact_id")
     supply = _mapping(data["supply"], "supply")
-    _keys(supply, {"reconciliation_artifact_id", "fully_diluted_metric"}, "supply")
+    _keys(
+        supply,
+        {"reconciliation_artifact_id", "fully_diluted_metric"},
+        "supply",
+        {"unlocks_artifact_id", "schedule_id"},
+    )
     if supply["fully_diluted_metric"] not in {"total", "max"}:
         raise CaseContractError("supply.fully_diluted_metric must be total or max")
+    if ("unlocks_artifact_id" in supply) != ("schedule_id" in supply):
+        raise CaseContractError(
+            "supply.unlocks_artifact_id and supply.schedule_id are declared together"
+        )
+    unlocks_artifact_id = (
+        _controlled_text(supply["unlocks_artifact_id"], "supply.unlocks_artifact_id")
+        if "unlocks_artifact_id" in supply
+        else None
+    )
+    schedule_id = (
+        _controlled_text(supply["schedule_id"], "supply.schedule_id")
+        if "schedule_id" in supply
+        else None
+    )
     anchors: tuple[str, str] | None = None
     if "anchors" in data:
         anchor_table = _mapping(data["anchors"], "anchors")
@@ -275,6 +308,7 @@ def load_token_input(
             as_of,
             value_unit,
             token_unit,
+            scheduled=unlocks_artifact_id is not None,
         )
         for name in _SCENARIOS
     }
@@ -364,6 +398,8 @@ def load_token_input(
             supply["reconciliation_artifact_id"], "supply.reconciliation_artifact_id"
         ),
         fully_diluted_metric=supply["fully_diluted_metric"],
+        unlocks_artifact_id=unlocks_artifact_id,
+        schedule_id=schedule_id,
         anchors=anchors,
         pegs=pegs,
         scenarios=scenarios,
@@ -403,6 +439,8 @@ def _load_scenario(
     as_of: date,
     value_unit: str,
     token_unit: str,
+    *,
+    scheduled: bool,
 ) -> TokenScenario:
     _keys(
         raw,
@@ -441,7 +479,22 @@ def _load_scenario(
     previous = as_of
     for index, item in enumerate(forecast_raw):
         row = _mapping(item, f"scenario.{name}.forecast[{index}]")
-        _keys(row, _FORECAST_KEYS, f"scenario.{name}.forecast[{index}]")
+        _keys(
+            row,
+            _FORECAST_KEYS,
+            f"scenario.{name}.forecast[{index}]",
+            {"unlocks"},
+        )
+        if scheduled and "unlocks" in row:
+            raise CaseContractError(
+                f"scenario.{name}.forecast[{index}] declares unlocks while "
+                "supply.unlocks_artifact_id supplies the unlock schedule"
+            )
+        if not scheduled and "unlocks" not in row:
+            raise CaseContractError(
+                f"scenario.{name}.forecast[{index}] needs unlocks, or declare "
+                "supply.unlocks_artifact_id and supply.schedule_id"
+            )
         period_end = _parse_date(row["period_end"], "period_end")
         if period_end <= previous:
             raise CaseContractError(
@@ -452,7 +505,7 @@ def _load_scenario(
             period_end,
             _value(row["holders_revenue"], "holders_revenue", value_unit),
             _value(row["capture_ratio"], "capture_ratio", "ratio"),
-            _value(row["unlocks"], "unlocks", token_unit),
+            None if scheduled else _value(row["unlocks"], "unlocks", token_unit),
             _value(row["unlock_realization"], "unlock_realization", "ratio"),
             _value(row["emissions"], "emissions", token_unit),
         )
@@ -462,12 +515,12 @@ def _load_scenario(
         ):
             if not 0 <= leaf.value <= 1:
                 raise CaseContractError(f"{label} must be within [0, 1]")
-        for label, leaf in (
+        for label, amount in (
             ("holders_revenue", period.holders_revenue),
             ("unlocks", period.unlocks),
             ("emissions", period.emissions),
         ):
-            if leaf.value < 0:
+            if amount is not None and amount.value < 0:
                 raise CaseContractError(f"{label} must be nonnegative")
         periods.append(period)
     multiple_raw = _mapping(raw["multiple"], f"scenario.{name}.multiple")
@@ -477,13 +530,30 @@ def _load_scenario(
     override: FullyDilutedOverride | None = None
     if "fully_diluted" in raw:
         table = _mapping(raw["fully_diluted"], f"scenario.{name}.fully_diluted")
-        _keys(table, {"metric", "provider", "source_id"}, "fully_diluted")
+        _keys(
+            table,
+            {"metric", "provider", "source_id"},
+            "fully_diluted",
+            {"applies_to"},
+        )
         if table["metric"] not in {"total", "max"}:
             raise CaseContractError("fully_diluted.metric must be total or max")
+        applies_to = table.get("applies_to", list(_VALUATION_METHODS))
+        if (
+            not isinstance(applies_to, list)
+            or not applies_to
+            or applies_to != sorted(set(applies_to))
+            or not set(applies_to) <= set(_VALUATION_METHODS)
+        ):
+            raise CaseContractError(
+                "fully_diluted.applies_to must be a non-empty sorted list "
+                f"drawn from {list(_VALUATION_METHODS)}"
+            )
         override = FullyDilutedOverride(
             table["metric"],
             _controlled_text(table["provider"], "fully_diluted.provider"),
             _controlled_text(table["source_id"], "fully_diluted.source_id"),
+            tuple(applies_to),
         )
     return TokenScenario(
         name,
@@ -507,7 +577,7 @@ def _fingerprint(scenario: TokenScenario) -> dict[str, object]:
                 p.period_end.isoformat(),
                 p.holders_revenue.value,
                 p.capture_ratio.value,
-                p.unlocks.value,
+                None if p.unlocks is None else p.unlocks.value,
                 p.unlock_realization.value,
                 p.emissions.value,
             )
@@ -516,7 +586,11 @@ def _fingerprint(scenario: TokenScenario) -> dict[str, object]:
         "statistic": scenario.statistic,
         "override": None
         if scenario.override is None
-        else (scenario.override.metric, scenario.override.provider),
+        else (
+            scenario.override.metric,
+            scenario.override.provider,
+            scenario.override.applies_to,
+        ),
     }
 
 
@@ -530,10 +604,11 @@ def token_source_ids(config: TokenConfig) -> set[str]:
         if scenario.override is not None:
             ids.add(scenario.override.source_id)
         for period in scenario.periods:
+            if period.unlocks is not None:
+                ids.add(period.unlocks.source_id)
             ids |= {
                 period.holders_revenue.source_id,
                 period.capture_ratio.source_id,
-                period.unlocks.source_id,
                 period.unlock_realization.source_id,
                 period.emissions.source_id,
             }
@@ -564,6 +639,8 @@ def token_parent_ids(config: TokenConfig) -> tuple[str, ...]:
         ordered.append(config.anchors[0])
     if config.master_artifact_id is not None:
         ordered.append(config.master_artifact_id)
+    if config.unlocks_artifact_id is not None:
+        ordered.append(config.unlocks_artifact_id)
     return tuple(dict.fromkeys(ordered))
 
 
@@ -670,9 +747,90 @@ def load_token_data(
         anchor = frame(config.anchors[0], "normalized.protocol-metrics", 1)
         if config.anchors[1] not in set(anchor["metric"].to_list()):
             raise CaseContractError("anchors.metric is not in the anchor artifact")
+    unlock_events = None
+    if config.unlocks_artifact_id is not None:
+        unlock_events = _unlock_events(
+            frame(config.unlocks_artifact_id, "normalized.token-unlocks", 1), config
+        )
     parents = token_parent_ids(config)
     bindings = tuple((parent, by_id[parent].sha256 or "") for parent in parents)
-    return TokenData(price, reconciliation, market, metrics, parents, bindings)
+    return TokenData(
+        price, reconciliation, market, metrics, parents, bindings, unlock_events
+    )
+
+
+def _unlock_events(
+    unlocks: pl.DataFrame, config: TokenConfig
+) -> tuple[UnlockEvent, ...]:
+    """Return the schedule's still-scheduled events that end after ``as_of``."""
+    rows = unlocks.filter(pl.col("instrument_id") == config.instrument_id)
+    if rows.is_empty():
+        raise CaseContractError(
+            f"unlocks artifact holds no events for {config.instrument_id}"
+        )
+    if set(rows["schedule_id"].to_list()) != {config.schedule_id}:
+        raise CaseContractError(
+            f"unlocks artifact does not hold schedule_id {config.schedule_id}"
+        )
+    if rows.filter(pl.col("observed_at").dt.date() > config.as_of).height:
+        raise CaseContractError("unlocks artifact has events observed after as_of")
+    events = []
+    for row in (
+        rows.filter(pl.col("status") == "scheduled")
+        .sort("event_id")
+        .iter_rows(named=True)
+    ):
+        if (row["unlock_end_date"] or row["unlock_date"]) > config.as_of:
+            events.append(
+                UnlockEvent(row["unlock_date"], row["unlock_end_date"], row["amount"])
+            )
+    return tuple(events)
+
+
+def scheduled_unlocks(
+    events: tuple[UnlockEvent, ...], as_of: date, period_ends: tuple[date, ...]
+) -> tuple[float, ...]:
+    """Sum unlocks per model period (previous end, end], in tokens.
+
+    A cliff counts in the period holding its date. A stream spreads its amount
+    evenly over every day from start to end inclusive; only days after
+    ``as_of`` count.
+    """
+    totals: list[float] = []
+    previous = as_of
+    for end in period_ends:
+        total = 0.0
+        for event in events:
+            if event.end is None:
+                if previous < event.start <= end:
+                    total += event.amount
+                continue
+            first = max(event.start, previous + timedelta(days=1))
+            days = (min(event.end, end) - first).days + 1
+            if days > 0:
+                total += event.amount * days / ((event.end - event.start).days + 1)
+        totals.append(total)
+        previous = end
+    return tuple(totals)
+
+
+def _period_unlocks(
+    config: TokenConfig, data: TokenData, scenario: TokenScenario
+) -> tuple[float, ...]:
+    """Per-period unlocks in ``token_unit``: leaves, or the imported schedule."""
+    if data.unlock_events is None:
+        return tuple(
+            cast(ValueInput, period.unlocks).value for period in scenario.periods
+        )
+    scale = _token_scale(config.token_unit)
+    return tuple(
+        amount / scale
+        for amount in scheduled_unlocks(
+            data.unlock_events,
+            config.as_of,
+            tuple(period.period_end for period in scenario.periods),
+        )
+    )
 
 
 def _selected(data: TokenData, metric: str) -> float:
@@ -683,9 +841,9 @@ def _selected(data: TokenData, metric: str) -> float:
 
 
 def _fully_diluted_0(
-    data: TokenData, config: TokenConfig, scenario: TokenScenario
+    data: TokenData, config: TokenConfig, scenario: TokenScenario, method: str
 ) -> float:
-    if scenario.override is None:
+    if scenario.override is None or method not in scenario.override.applies_to:
         return _selected(data, config.fully_diluted_metric)
     override = scenario.override
     rows = data.reconciliation.filter(
@@ -731,6 +889,7 @@ def _discounted(
     price: float,
     circ0: float,
     fd0: float,
+    unlocks_by_period: tuple[float, ...],
     rate: float,
     growth: float,
 ) -> _Dcf:
@@ -741,7 +900,7 @@ def _discounted(
     mix = scenario.mix
     paths: list[_Path] = []
     circ, fd = circ0, fd0
-    for period in scenario.periods:
+    for period, period_unlocks in zip(scenario.periods, unlocks_by_period, strict=True):
         cash = period.holders_revenue.value * period.capture_ratio.value
         retired = cash * (mix["buyback_retire"] + mix["burn"]) * tokens_per_value
         if config.held_buyback_treatment == "exclude":
@@ -749,7 +908,7 @@ def _discounted(
         buyback = (
             cash * (mix["buyback_retire"] + mix["buyback_hold"]) * tokens_per_value
         )
-        unlocks = period.unlocks.value * period.unlock_realization.value
+        unlocks = period_unlocks * period.unlock_realization.value
         closing_circ = circ + unlocks + period.emissions.value - retired
         closing_fd = fd - retired
         if retired > circ * (1 + 1e-12) or closing_circ < -1e-9 * max(1.0, circ0):
@@ -1040,7 +1199,13 @@ def build_token_frames(
         )
 
     def resolved(
-        scenario: str, field: str, value: float, unit: str, source: str, artifact: bool
+        scenario: str,
+        field: str,
+        value: float,
+        unit: str,
+        source: str,
+        artifact: bool,
+        period_end: date | None = None,
     ) -> None:
         input_rows.append(
             {
@@ -1048,7 +1213,7 @@ def build_token_frames(
                 "run_id": run_id,
                 "scenario": scenario,
                 "field": field,
-                "period_end": None,
+                "period_end": period_end,
                 "value": value,
                 "unit": unit,
                 "source_id": None if artifact else source,
@@ -1058,15 +1223,20 @@ def build_token_frames(
 
     for name in selected:
         scenario = config.scenarios[name]
-        fd_raw = _fully_diluted_0(data, config, scenario)
+        fd_raw = _fully_diluted_0(data, config, scenario, "dcf")
+        fd_mult_raw = _fully_diluted_0(data, config, scenario, "multiple")
         fd0 = fd_raw / ts
-        if circ_raw > fd_raw:
+        fd_mult0 = fd_mult_raw / ts
+        if circ_raw > min(fd_raw, fd_mult_raw):
             raise CaseContractError(
                 f"scenario {name} opening circulating exceeds fully diluted supply"
             )
         rate = scenario.discount_rate.value
         growth = scenario.terminal_growth.value
-        run = _discounted(config, scenario, price, circ0, fd0, rate, growth)
+        unlocks_by_period = _period_unlocks(config, data, scenario)
+        run = _discounted(
+            config, scenario, price, circ0, fd0, unlocks_by_period, rate, growth
+        )
 
         resolved(name, "price", price, price_unit, config.price_artifact_id, True)
         resolved(
@@ -1077,7 +1247,8 @@ def build_token_frames(
             config.reconciliation_artifact_id,
             True,
         )
-        if scenario.override is None:
+        override = scenario.override
+        if override is None:
             resolved(
                 name,
                 "fully_diluted_0",
@@ -1086,15 +1257,26 @@ def build_token_frames(
                 config.reconciliation_artifact_id,
                 True,
             )
-        else:
+        elif override.applies_to == _VALUATION_METHODS:
             resolved(
                 name,
                 "fully_diluted_0",
                 fd0,
                 config.token_unit,
-                scenario.override.source_id,
+                override.source_id,
                 False,
             )
+        else:
+            for method, denominator in (("dcf", fd0), ("multiple", fd_mult0)):
+                scoped = method in override.applies_to
+                resolved(
+                    name,
+                    f"fully_diluted_0:{method}",
+                    denominator,
+                    config.token_unit,
+                    override.source_id if scoped else config.reconciliation_artifact_id,
+                    not scoped,
+                )
         leaf(name, "discount_rate", scenario.discount_rate)
         leaf(name, "terminal_growth", scenario.terminal_growth)
         for key in _MIX_KEYS:
@@ -1113,7 +1295,7 @@ def build_token_frames(
             )
         for peg_name, peg in sorted(config.pegs.items()):
             leaf(name, f"peg.{peg_name}", peg)
-        for path in run.paths:
+        for index, path in enumerate(run.paths):
             period = path.period
             day = period.period_end
             for field, item in (
@@ -1123,7 +1305,18 @@ def build_token_frames(
                 ("unlock_realization", period.unlock_realization),
                 ("emissions", period.emissions),
             ):
-                leaf(name, f"{field}:{day}", item, day)
+                if item is not None:
+                    leaf(name, f"{field}:{day}", item, day)
+            if period.unlocks is None:
+                resolved(
+                    name,
+                    f"unlocks:{day}",
+                    unlocks_by_period[index],
+                    config.token_unit,
+                    cast(str, config.unlocks_artifact_id),
+                    True,
+                    day,
+                )
             mix = scenario.mix
             cash_rows.append(
                 {
@@ -1168,7 +1361,10 @@ def build_token_frames(
             )
 
         first_revenue = scenario.periods[0].holders_revenue.value
-        dens = {"circulating": circ0, "fully_diluted": fd0}
+        dens = {
+            "dcf": {"circulating": circ0, "fully_diluted": fd0},
+            "multiple": {"circulating": circ0, "fully_diluted": fd_mult0},
+        }
         multiples = {
             basis: _statistic(peers, basis, scenario.statistic) for basis in _BASES
         }
@@ -1176,7 +1372,7 @@ def build_token_frames(
             ("multiple", basis): multiples[basis] * first_revenue for basis in _BASES
         }
         for (method, basis), aggregate in aggregates.items():
-            per_token = aggregate * vs / (dens[basis] * ts)
+            per_token = aggregate * vs / (dens[method][basis] * ts)
             dcf = method == "dcf"
             result_rows.append(
                 {
@@ -1186,7 +1382,7 @@ def build_token_frames(
                     "method": method,
                     "basis": basis,
                     "aggregate_value": aggregate,
-                    "denominator_tokens": dens[basis],
+                    "denominator_tokens": dens[method][basis],
                     "per_token_value": per_token,
                     "price": price,
                     "upside": per_token / price - 1,
@@ -1208,7 +1404,7 @@ def build_token_frames(
                     run_id,
                     name,
                     f"per_token_value:{method}:{basis}",
-                    per_token * dens[basis] * ts / vs,
+                    per_token * dens[method][basis] * ts / vs,
                     aggregate,
                     config.value_unit,
                 )
@@ -1269,7 +1465,14 @@ def build_token_frames(
             for sens_rate in sensitivity[0]:
                 for sens_growth in sensitivity[1]:
                     altered = _discounted(
-                        config, scenario, price, circ0, fd0, sens_rate, sens_growth
+                        config,
+                        scenario,
+                        price,
+                        circ0,
+                        fd0,
+                        unlocks_by_period,
+                        sens_rate,
+                        sens_growth,
                     )
                     sensitivity_rows.append(
                         {

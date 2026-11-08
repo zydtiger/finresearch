@@ -117,11 +117,23 @@ TOKEN_SUPPLY_OVERRIDES: dict[str, object] = {
     "capture_artifact_id": None,
 }
 
+TOKEN_UNLOCKS_OVERRIDES: dict[str, object] = {
+    "category": "team",
+    "unlock_type": "cliff",
+    "status": "scheduled",
+    "unlock_end_date": None,
+    "recipient_label": None,
+    "holder_address": None,
+    "capture_artifact_id": None,
+}
+
 
 def source_frame(spec: LocalImportSchema) -> pl.DataFrame:
     overrides: dict[str, object] = {}
     if spec.name == "token-supply.v1":
         overrides = TOKEN_SUPPLY_OVERRIDES
+    elif spec.name == "token-unlocks.v1":
+        overrides = TOKEN_UNLOCKS_OVERRIDES
     elif spec.name == "instrument-master.v3":
         overrides = {
             "chain": None,
