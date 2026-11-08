@@ -461,7 +461,7 @@ def test_peer_exclusions_are_explicit(built: Path) -> None:
             'fully_diluted_metric = "burned"',
             "total or max",
         ),
-        ('window = "annualized_30d"', 'window = "ttm"', "no complete"),
+        ('window = "annualized_30d"', 'window = "ttm"', "no valid peer remains"),
         ("version = 1", "version = 2", "version = 1"),
         (
             'holders_revenue = { value = 600.0, unit = "USDm"',
@@ -644,5 +644,11 @@ def test_metric_rows_observed_after_as_of_are_ignored(built: Path) -> None:
     assert _holders_revenue_window(
         config, frame(datetime(2026, 11, 7, tzinfo=UTC)), peer
     ) == pytest.approx(365.0)
-    with pytest.raises(CaseContractError, match="no complete"):
+    assert (
         _holders_revenue_window(config, frame(datetime(2026, 11, 8, tzinfo=UTC)), peer)
+        is None
+    )
+    short = frame(datetime(2026, 11, 7, tzinfo=UTC)).filter(
+        pl.col("period_end") < date(2026, 11, 6)
+    )
+    assert _holders_revenue_window(config, short, peer) is None
