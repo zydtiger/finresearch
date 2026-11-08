@@ -1019,6 +1019,9 @@ def _validate_finite_model_values(frame: pl.DataFrame, contract: str) -> None:
             raise _semantic_error(contract, f"{column} must be finite")
 
 
+_SHARE_UNITS: Final = frozenset({"shares", "shares_k", "shares_m", "shares_b"})
+
+
 def _amount_units(currency: str) -> set[str]:
     return {currency, f"{currency}k", f"{currency}m", f"{currency}b"}
 
@@ -1161,7 +1164,8 @@ def _validate_reconciliation_v1(
 
 
 def _validate_dcf_reconciliation_v1(frame: pl.DataFrame) -> None:
-    _validate_reconciliation_v1(frame)
+    # Share-count roll-forward checks report in the run's share unit.
+    _validate_reconciliation_v1(frame, _SHARE_UNITS)
     if any(value not in _DCF_SCENARIOS for value in frame["scenario"].to_list()):
         raise _semantic_error(
             "model.dcf-reconciliation.v1", "scenario is not controlled"
@@ -1240,6 +1244,83 @@ MODEL_DCF_RESULTS_V1: Final = DatasetContract(
     unique_key=("run_id", "scenario"),
     sort_key=("scenario",),
     semantic_validator=_validate_dcf_results_v1,
+)
+
+
+def _validate_dcf_results_v2(frame: pl.DataFrame) -> None:
+    contract = "model.dcf-results.v2"
+    _validate_finite_model_values(frame, contract)
+    _validate_dcf_results_v1(frame.select(list(MODEL_DCF_RESULTS_V1_FIELDS)))
+    for row in frame.iter_rows(named=True):
+        if row["opening_diluted_shares"] <= 0 or row["issued_shares"] < 0:
+            raise _semantic_error(
+                contract, "opening shares must be positive and issued nonnegative"
+            )
+        expected = row["opening_diluted_shares"] + row["issued_shares"]
+        if abs(row["ending_diluted_shares"] - expected) > 1e-9 * max(1.0, expected):
+            raise _semantic_error(
+                contract, "ending shares must equal opening plus issued shares"
+            )
+
+
+MODEL_DCF_RESULTS_V2_FIELDS: Final = {
+    **MODEL_DCF_RESULTS_V1_FIELDS,
+    "opening_diluted_shares": pl.Float64,
+    "issued_shares": pl.Float64,
+    "ending_diluted_shares": pl.Float64,
+    "issuance_pv": pl.Float64,
+}
+MODEL_DCF_RESULTS_V2: Final = DatasetContract(
+    name="model.dcf-results",
+    version=2,
+    schema=pl.Schema(MODEL_DCF_RESULTS_V2_FIELDS),
+    non_nullable=tuple(MODEL_DCF_RESULTS_V2_FIELDS),
+    unique_key=("run_id", "scenario"),
+    sort_key=("scenario",),
+    semantic_validator=_validate_dcf_results_v2,
+)
+
+
+def _validate_dcf_translation_v1(frame: pl.DataFrame) -> None:
+    contract = "model.dcf-translation.v1"
+    _validate_finite_model_values(frame, contract)
+    _validate_currency(frame, contract, "currency")
+    _validate_currency(frame, contract, "translated_currency")
+    for row in frame.iter_rows(named=True):
+        if row["scenario"] not in _DCF_SCENARIOS:
+            raise _semantic_error(contract, "scenario is not controlled")
+        if row["currency"] == row["translated_currency"]:
+            raise _semantic_error(contract, "currencies must differ")
+        if row["fx_rate"] <= 0:
+            raise _semantic_error(contract, "fx_rate must be positive")
+        expected = row["per_share_value"] * row["fx_rate"]
+        if abs(row["translated_per_share_value"] - expected) > 1e-9 * max(
+            1.0, abs(expected)
+        ):
+            raise _semantic_error(
+                contract, "translated value must equal per_share_value * fx_rate"
+            )
+
+
+MODEL_DCF_TRANSLATION_V1_FIELDS: Final = {
+    "schema_version": pl.UInt16,
+    "run_id": pl.String,
+    "scenario": pl.String,
+    "per_share_value": pl.Float64,
+    "currency": pl.String,
+    "fx_rate": pl.Float64,
+    "rate_date": pl.Date,
+    "translated_per_share_value": pl.Float64,
+    "translated_currency": pl.String,
+}
+MODEL_DCF_TRANSLATION_V1: Final = DatasetContract(
+    name="model.dcf-translation",
+    version=1,
+    schema=pl.Schema(MODEL_DCF_TRANSLATION_V1_FIELDS),
+    non_nullable=tuple(MODEL_DCF_TRANSLATION_V1_FIELDS),
+    unique_key=("run_id", "scenario"),
+    sort_key=("scenario",),
+    semantic_validator=_validate_dcf_translation_v1,
 )
 
 MODEL_DCF_SENSITIVITY_V1_FIELDS: Final = {
@@ -2616,6 +2697,8 @@ CONTRACTS: Final = {
     MODEL_DCF_INPUTS_V1.identifier: MODEL_DCF_INPUTS_V1,
     MODEL_DCF_CASHFLOWS_V1.identifier: MODEL_DCF_CASHFLOWS_V1,
     MODEL_DCF_RESULTS_V1.identifier: MODEL_DCF_RESULTS_V1,
+    MODEL_DCF_RESULTS_V2.identifier: MODEL_DCF_RESULTS_V2,
+    MODEL_DCF_TRANSLATION_V1.identifier: MODEL_DCF_TRANSLATION_V1,
     MODEL_DCF_SENSITIVITY_V1.identifier: MODEL_DCF_SENSITIVITY_V1,
     MODEL_DCF_RECONCILIATION_V1.identifier: MODEL_DCF_RECONCILIATION_V1,
     MODEL_COMPS_OBSERVATIONS_V1.identifier: MODEL_COMPS_OBSERVATIONS_V1,
