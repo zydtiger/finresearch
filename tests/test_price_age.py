@@ -161,3 +161,26 @@ def test_equity_class_uses_calendar_days_and_conflicts_are_reported(
     )
     conflict = audit(workspace, "2026-11-07")
     assert conflict.exit_code == 1 and "[asset_class_conflict]" in conflict.output
+
+
+def test_master_observed_after_cutoff_is_not_an_issue_and_not_resolved(
+    workspace: Path, tmp_path: Path
+) -> None:
+    import_master_v3(workspace, tmp_path)
+    import_prices(workspace, tmp_path, [("2026-11-05", 70.0), ("2026-11-06", 78.0)])
+    import_master_v3(
+        workspace,
+        tmp_path,
+        instrument_id="late.equity",
+        asset_class="equity",
+        name="late.csv",
+        observed_at="2026-11-09T08:00:00Z",
+    )
+
+    before = audit(workspace, "2026-11-07")
+    assert before.exit_code == 0, before.output
+    assert "master_observed_after_as_of" not in before.output
+    # The later equity observation is ignored, so the class is not in conflict.
+    assert "asset_class_conflict" not in before.output
+    after = audit(workspace, "2026-11-10")
+    assert after.exit_code == 1 and "[asset_class_conflict]" in after.output

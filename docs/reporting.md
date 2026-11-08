@@ -114,7 +114,9 @@ The audit then applies deterministic point-in-time checks:
 
 - facts cannot have `knowledge_date` after the cutoff;
 - estimates cannot have `estimate_as_of` or `availability_at` after it;
-- instrument-master observations cannot have `observed_at` after it;
+- instrument-master observations are identity metadata, not point-in-time
+  market data: one observed after the cutoff is not an issue and is ignored
+  by asset-class resolution;
 - price sessions cannot be after it, and each instrument's latest valid price
   (a session on or before the cutoff) must not exceed
   `--max-price-age-days`; a future-only instrument has no valid session and is
