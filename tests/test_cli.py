@@ -472,3 +472,74 @@ def test_json_flag_absent_keeps_human_output(tmp_path: Path) -> None:
     result = invoke(tmp_path, "case", "init", "aapl")
 
     assert result.stdout.startswith("created case: aapl\nmanifest: ")
+
+
+def test_json_normalize_prices_includes_price_gaps_only_when_present(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from finresearch.normalization import NormalizationReceipt
+
+    def fake(gaps: IngestionReceipt | None) -> None:
+        monkeypatch.setattr(
+            "finresearch.cli.normalize_daily_prices",
+            lambda *args, **kwargs: NormalizationReceipt(
+                _receipt(tmp_path, "master"),
+                _receipt(tmp_path, "prices"),
+                _receipt(tmp_path, "actions"),
+                gaps,
+            ),
+        )
+
+    fake(None)
+    _, without = invoke_json(tmp_path, "data", "normalize-daily-prices", "a", "X")
+    fake(_receipt(tmp_path, "gaps"))
+    _, with_gaps = invoke_json(tmp_path, "data", "normalize-daily-prices", "a", "X")
+
+    assert "price_gaps" not in without
+    assert isinstance(with_gaps["price_gaps"], dict)
+    assert with_gaps["price_gaps"]["artifact_id"] == "gaps"
+
+
+def test_json_normalize_fx_rates_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from finresearch.normalization import FxNormalizationReceipt
+
+    monkeypatch.setattr(
+        "finresearch.cli.normalize_fx_rates",
+        lambda *args, **kwargs: FxNormalizationReceipt(
+            _receipt(tmp_path, "fx"), _receipt(tmp_path, "gaps")
+        ),
+    )
+
+    result, payload = invoke_json(
+        tmp_path,
+        "data",
+        "normalize-fx-rates",
+        "a",
+        "EURUSD=X",
+        "--base",
+        "EUR",
+        "--quote",
+        "USD",
+    )
+
+    assert result.exit_code == 0
+    assert set(payload) == {"ok", "fx_rates", "price_gaps"}
+
+
+def test_json_case_status_lists_unused_raw_snapshots(tmp_path: Path) -> None:
+    from token_support import import_prices, new_case
+
+    from finresearch.cases import read_manifest
+
+    case_dir = new_case(tmp_path)
+    import_prices(tmp_path, tmp_path, [("2026-11-06", 78.0)])
+    manifest = read_manifest(case_dir)
+    kept = tuple(a for a in manifest.artifacts if a.kind == "raw.import")
+    write_manifest(case_dir, CaseManifest(**{**vars(manifest), "artifacts": kept}))
+
+    result, payload = invoke_json(tmp_path, "case", "status", "hype")
+
+    assert result.exit_code == 0
+    assert payload["unused_raw_snapshots"] == [kept[0].artifact_id]
