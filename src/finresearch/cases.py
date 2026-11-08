@@ -929,6 +929,7 @@ def inspect_case(workspace: Path, case_id: str) -> CaseStatus:
 
     declared = len(manifest.artifacts)
     consumed = {i for a in manifest.artifacts for i in a.input_artifact_ids}
+    consumed.update(a.source for a in manifest.artifacts if a.source is not None)
     unused = tuple(
         a.artifact_id
         for a in manifest.artifacts
