@@ -107,6 +107,13 @@ financial values, peers, evidence, assumptions, or source IDs.
   chose and why). Which definition is authoritative is your judgment; an
   unresolved `conflict` is reported by `case audit` as `token_supply_conflict`,
   so record a resolution instead of ignoring it.
+- Token unlocks: import a schedule version with `data import-csv --schema
+  token-unlocks.v1 --provider P --retrieved-at T` (one `schedule_id` per
+  file; cite a registered capture in `capture_artifact_id` or `source_ref`).
+  `model token` uses it through `[supply] unlocks_artifact_id` and
+  `schedule_id` instead of inline `unlocks` leaves (declaring both is an
+  error). `case audit` reports `token_unlocks_exceed_supply` and
+  `token_unlocks_capture_missing`.
 - Token identity: import `instrument-master.v3` rows (chain, contract address,
   `provider_ids` such as `coingecko:hyperliquid;yfinance:HYPE32196-USD`,
   `asset_class_source`). Audit resolves a price's asset class from master
@@ -276,7 +283,7 @@ run), token-market artifacts and protocol-metrics artifacts for the peers.
 Your judgments live in the TOML: `fully_diluted_metric` (`total` or `max`),
 per-scenario `fully_diluted` overrides naming a non-conflict observation (the
 override applies to every fully diluted result of that scenario, DCF and
-multiple alike),
+multiple alike, unless `applies_to = ["dcf"]` or `["multiple"]` narrows it),
 `held_buyback_treatment` (`exclude` removes held buyback tokens from
 circulating supply; `include` keeps them), the `capture_mix`, unlock
 realization, peers, and exclusions with a `reason_source_id`. Peer multiples
@@ -286,8 +293,11 @@ revenue is nonpositive, is excluded automatically with a recorded reason, and
 the run fails only when no peer remains for a basis. Write every register row
 the policy and TOML cite before running `reconcile-token-supply` and
 `model token`. A stablecoin-quoted market value needs a sourced `[pegs]`
-leaf. Bases that are equal across scenarios belong in the TOML; a
-`scenarios.csv` parameter equal across scenarios is one `scenario=all` row. Report and audit work as for DCF; token audit codes are
+leaf; audit reports `stablecoin_peg_deviation` when a case price series
+`<COIN>-<FIAT>` closed more than 50 bps from the declared peg. Bases that are
+equal across scenarios belong in the TOML; a `scenarios.csv` parameter equal
+across scenarios is one `scenario=all` row. Report and audit work as for DCF;
+token audit codes are
 prefixed `token_run_`.
 
 ## Report and close the audit loop

@@ -175,8 +175,8 @@ tables below, and optional `[anchors]` and `[pegs]`.
 | Table | Content |
 | --- | --- |
 | `[price]` | `artifact_id` of a `normalized.daily-prices.v2` table and the `session_date` bar whose `close` is `price_0`. The bar's instrument must equal `instrument_id` or be mapped to it by an `instrument-master.v3` row (`provider_ids` containing `yfinance:<provider_symbol>`) in the artifact named by the optional `master_artifact_id`, which is then required. The bar currency must equal `currency`, and `session_date` must be before `as_of` so the bar is complete |
-| `[supply]` | `reconciliation_artifact_id` and `fully_diluted_metric` (`total` or `max`). The reconciliation must match the instrument, have `as_of` on or before the model, and hold a `selected` row for `circulating` and the fully diluted metric; a `conflict` aborts the run |
-| `[scenario.bear\|base\|bull]` | `discount_rate`, `capture_mix` (`buyback_retire`, `buyback_hold`, `burn`, `distribution` summing to 1, one `source_id`), `terminal = { terminal_growth = ... }`, a strictly increasing `forecast` array, `[...multiple] statistic` (`min`, `p25`, `median`, `p75`, `max`), and an optional `fully_diluted = { metric, provider, source_id }` that replaces the fully diluted denominator with any non-conflict reconciliation observation |
+| `[supply]` | `reconciliation_artifact_id` and `fully_diluted_metric` (`total` or `max`). The reconciliation must match the instrument, have `as_of` on or before the model, and hold a `selected` row for `circulating` and the fully diluted metric; a `conflict` aborts the run. Optional `unlocks_artifact_id` (a `normalized.token-unlocks.v1`) and `schedule_id`, declared together, replace the inline `unlocks` leaves with the imported schedule |
+| `[scenario.bear\|base\|bull]` | `discount_rate`, `capture_mix` (`buyback_retire`, `buyback_hold`, `burn`, `distribution` summing to 1, one `source_id`), `terminal = { terminal_growth = ... }`, a strictly increasing `forecast` array, `[...multiple] statistic` (`min`, `p25`, `median`, `p75`, `max`), and an optional `fully_diluted = { metric, provider, source_id, applies_to }` that replaces the fully diluted denominator with any non-conflict reconciliation observation. `applies_to` is a non-empty sorted list drawn from `"dcf"` and `"multiple"` and defaults to both; with `["dcf"]` the multiple results keep the selected denominator, and with `["multiple"]` the DCF and its supply path do. A narrowed override records `fully_diluted_0:dcf` and `fully_diluted_0:multiple` input rows instead of `fully_diluted_0` |
 | `[multiples]` | `metric` (a revenue metric), `window` (`annualized_30d` or `ttm`), `metric_window_end`, `market_observed_on`, `market_artifact_ids`, `metric_artifact_ids`, `peers` (`instrument_id`, `entity_id`), optional `exclude` (`instrument_id`, `reason_source_id`) |
 | `[anchors]` | optional `protocol_metrics_artifact_id` and `metric`; validated and recorded as a parent, never used in a value |
 | `[pegs]` | optional named leaves with unit `<FIAT>/<USDC\|USDT\|USDH>`, used to convert stablecoin-quoted peer market values |
@@ -189,8 +189,21 @@ or assumption id dated on or before `as_of`. A forecast row has `period_end`,
 `[0, 1]`; `holders_revenue`, `unlocks`, `emissions` nonnegative; complete and
 pairwise-distinct bear/base/bull tables; for every period
 `0 <= circulating_t <= fully_diluted_t` and `retired_t <= circulating_{t-1}`.
-Inline `unlocks` leaves are the only unlock source until a `token-unlocks.v1`
-contract exists.
+
+Unlocks come from inline `unlocks` leaves, or, when `[supply]` declares
+`unlocks_artifact_id` and `schedule_id`, from the imported schedule. The two
+are exclusive: a forecast row that still declares `unlocks` next to a schedule,
+or omits it without one, is rejected, as is a schedule that does not hold
+`schedule_id` for the instrument or has an event observed after `as_of`. Only
+`scheduled` events whose date (a stream's end date) is after `as_of` count. A
+cliff, or an `emission` without an end date, lands in the period whose
+`(previous period_end, period_end]` window holds its `unlock_date`; a `linear`
+stream, or an `emission` with an end date, spreads its amount evenly over every
+day from start to end inclusive, and the days after `as_of` that fall in a
+period are summed into it. `unlock_realization` still applies to the schedule's
+per-period amount, and the artifact is a parent of the inputs table and covered
+by run authentication. The per-period amounts are recorded as `unlocks:DATE`
+input rows with `source_artifact_id`.
 
 Calculation, per scenario and period `t` (actual/365 from `as_of`, with the
 DCF's `mid_year` adjustment):

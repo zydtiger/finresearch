@@ -353,7 +353,7 @@ OHLC ordering, positive FX rates, valid action amounts, and PIT timestamp order.
 
 ```text
 finresearch --workspace PATH data import-csv CASE_ID FILE \
-  --schema instrument-master.v2|daily-prices.v2|fundamental-facts.v2|estimates.v1|corporate-actions.v1|fx-rates.v1|instrument-master.v3|token-supply.v1|instrument-master.v3|model.comps-observations.v1 \
+  --schema instrument-master.v2|daily-prices.v2|fundamental-facts.v2|estimates.v1|corporate-actions.v1|fx-rates.v1|instrument-master.v3|token-supply.v1|token-unlocks.v1|instrument-master.v3|model.comps-observations.v1 \
   --provider PROVIDER --retrieved-at RFC3339_UTC
 
 finresearch --workspace PATH data import-parquet CASE_ID FILE \
@@ -607,6 +607,34 @@ pages (for example CoinMarketCap) enter through
 the registered `tool-summary` or `web-page` capture; the CSV columns are the
 contract fields except `schema_version`, `provider`, `retrieved_at`,
 `source_artifact_id`, and `normalized_at`, which the import generates.
+
+### normalized.token-unlocks.v1
+
+One immutable artifact per unlock-schedule version, imported with
+`data import-csv --schema token-unlocks.v1 --provider P --retrieved-at T` (or
+`import-parquet`); the CLI generates `schema_version`, `provider`,
+`source_artifact_id`, and `normalized_at` (the retrieval time). Unlock schedules
+have no free authoritative API.
+
+| Field | Meaning |
+| --- | --- |
+| `instrument_id`, `schedule_id`, `event_id` | Case-declared token; agent-declared schedule version such as `tokenomist-2026-11-07`; unique event id within the schedule |
+| `category` | `team`, `investors`, `foundation`, `community`, `ecosystem`, `airdrop`, `treasury`, `emissions`, `other` |
+| `recipient_label`, `holder_address` | Optional labels |
+| `unlock_type` | `cliff`, `linear`, `emission` |
+| `unlock_date`, `unlock_end_date` | Cliff date or stream start; end date required for `linear`, forbidden for `cliff`, never before the start |
+| `amount` | Positive finite token count |
+| `status` | `scheduled`, `unlocked`, `claimed`, `cancelled` |
+| `observed_at`, `source_ref`, `capture_artifact_id` | When the source stated it; non-empty URL or `capture:<id>`; optional registered capture, which must be a declared `raw.capture.v1` at import |
+
+Unique key and sort key: `(instrument_id, schedule_id, event_id)`. One artifact
+holds one `schedule_id`. `model token` reads it through `[supply]
+unlocks_artifact_id` and `schedule_id` (see `modeling.md`). `case audit` reports
+`token_unlocks_exceed_supply` when the `scheduled` amounts of a schedule exceed
+the selected `max` minus selected `circulating` in the latest reconciliation
+with `as_of` on or before the cutoff, and `token_unlocks_capture_missing` for a
+`capture:<id>` in `source_ref`, or a `capture_artifact_id`, that is not a
+declared `raw.capture.v1`.
 
 ### Reconciliation
 
