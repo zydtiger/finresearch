@@ -300,6 +300,18 @@ def _context_for_family(
         if "source_artifact_id" in inputs.columns
         else ()
     )
+    if family == "dcf":
+        # A DCF translation binds its FX artifact as the inputs artifact's parent.
+        source_artifacts = tuple(
+            sorted(
+                {
+                    parent
+                    for artifact in resolved.artifacts
+                    if artifact.kind == "model.dcf-inputs"
+                    for parent in artifact.input_artifact_ids
+                }
+            )
+        )
     return ReportContext(
         case_id,
         run_id,
@@ -327,6 +339,8 @@ def _context_for_family(
                 else ()
             )
             if family == "token"
+            else (("Translation", resolved.table("model.dcf-translation")),)
+            if any(k == "model.dcf-translation" for k, _ in resolved.tables)
             else ()
         ),
     )

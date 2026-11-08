@@ -27,10 +27,18 @@ from finresearch.data_contracts import (
     MODEL_COMPS_RESULTS_V1,
     MODEL_COMPS_SUMMARY_V1,
     MODEL_DCF_RESULTS_V1,
+    MODEL_DCF_RESULTS_V2,
+    MODEL_DCF_TRANSLATION_V1,
+    RAW_YFINANCE_DAILY_PRICES_V1,
     DataContractError,
 )
 from finresearch.data_validation import validate_artifact
-from finresearch.ingestion import ArtifactIntegrityError, IngestionError
+from finresearch.ingestion import (
+    ArtifactIntegrityError,
+    IngestionError,
+    persist_snapshot,
+    symbol_key,
+)
 from finresearch.local_import import IMPORT_SCHEMAS, import_parquet
 from finresearch.model import (
     DCFInput,
@@ -48,6 +56,7 @@ from finresearch.model import (
     wacc_from_components,
 )
 from finresearch.modeling import projection_assessment, run_comps, run_dcf
+from finresearch.normalization import normalize_fx_rates
 from finresearch.reporting import ReportError, generate_report, load_report_context
 
 runner = CliRunner()
@@ -1421,3 +1430,348 @@ def test_model_cli_help_distinguishes_dcf_path_and_comps_artifact() -> None:
     assert comps_help.exit_code == 0
     assert "path to strict dcf-inputs.toml" in dcf_help.output
     assert "Artifact id for model.comps-observations.v1" in comps_help.output
+
+
+def _publish_fx(case_dir: Path, *, base: str = "USD", quote: str = "HKD") -> str:
+    """Normalize a synthetic raw FX snapshot; return the fx-rates artifact id."""
+    symbol = f"{base}{quote}=X"
+    stamp = datetime(2026, 6, 29, tzinfo=UTC)
+    frame = pl.DataFrame(
+        [
+            {
+                "schema_version": 1,
+                "provider": "yfinance",
+                "provider_symbol": symbol,
+                "currency": quote,
+                "retrieved_at": stamp,
+                "requested_start": date(2026, 6, 20),
+                "requested_end": date(2026, 6, 29),
+                "interval": "1d",
+                "provider_timezone": "Europe/London",
+                "session_date": date(2026, 6, 26 + offset),
+                "timestamp": datetime(2026, 6, 26 + offset, tzinfo=UTC),
+                "open": None,
+                "high": None,
+                "low": None,
+                "close": 7.8 + offset / 100,
+                "adj_close": None,
+                "volume": 0,
+                "dividends": None,
+                "stock_splits": None,
+                "capital_gains": None,
+            }
+            for offset in range(3)
+        ],
+        schema=RAW_YFINANCE_DAILY_PRICES_V1.schema,
+    )
+    persist_snapshot(
+        case_dir=case_dir,
+        manifest=read_manifest(case_dir),
+        path_role="raw",
+        frame=frame,
+        contract=RAW_YFINANCE_DAILY_PRICES_V1,
+        provider="yfinance",
+        path_parts=("yfinance", "daily-prices", symbol_key(symbol)),
+        entity_key=symbol_key(symbol),
+        retrieved_at=stamp,
+    )
+    receipt = normalize_fx_rates(
+        case_dir.parent.parent, case_dir.name, symbol, base=base, quote=quote
+    )
+    return receipt.fx_rates.artifact_id
+
+
+def _write_dcf_v2(case_dir: Path, extra: str = "") -> Path:
+    """Rewrite the v1 fixture as version 2 and append v2-only tables."""
+    _write_dcf_input(case_dir)
+    path = case_dir / "analysis" / "dcf-inputs.toml"
+    path.write_text(
+        path.read_text(encoding="utf-8").replace("version = 1", "version = 2", 1)
+        + extra,
+        encoding="utf-8",
+    )
+    return path
+
+
+_ISSUANCE = """
+[scenario.base.capitalization]
+diluted_shares = { value=110, unit="shares_m", source_id="e4" }
+[[scenario.base.issuance]]
+period_end = "2026-12-31"
+shares = { value=10, unit="shares_m", source_id="a5" }
+proceeds = { value=50, unit="USDm", source_id="e1" }
+"""
+
+
+def _dcf_tables(case_dir: Path, run_id: str) -> dict[str, pl.DataFrame]:
+    return {
+        item.kind: pl.read_parquet(case_dir / item.path)
+        for item in read_manifest(case_dir).artifacts
+        if item.kind.startswith("model.dcf-") and item.artifact_id.endswith(run_id)
+    }
+
+
+def _audit_valid(workspace: Path) -> bool:
+    return audit_case(
+        workspace,
+        "demo",
+        as_of=date(2026, 6, 30),
+        max_price_age_days=1,
+        verify_hashes=True,
+    ).valid
+
+
+def test_dcf_v1_input_still_writes_v1_results(tmp_path: Path) -> None:
+    case_dir = initialize_case(tmp_path, "demo")
+    _write_sources(case_dir)
+    _write_dcf_input(case_dir)
+    run = run_dcf(tmp_path, "demo")
+    tables = _dcf_tables(case_dir, run.run_id)
+    assert tables["model.dcf-results"].columns == list(MODEL_DCF_RESULTS_V1.schema)
+    assert set(tables) == {
+        "model.dcf-inputs",
+        "model.dcf-cashflows",
+        "model.dcf-results",
+        "model.dcf-reconciliation",
+    }
+    assert _audit_valid(tmp_path)
+
+
+def test_dcf_v2_without_extras_matches_v1_values(tmp_path: Path) -> None:
+    case_dir = initialize_case(tmp_path, "demo")
+    _write_sources(case_dir)
+    _write_dcf_input(case_dir)
+    v1 = _dcf_tables(case_dir, run_dcf(tmp_path, "demo").run_id)["model.dcf-results"]
+    _write_dcf_v2(case_dir)
+    run = run_dcf(tmp_path, "demo")
+    tables = _dcf_tables(case_dir, run.run_id)
+    v2 = tables["model.dcf-results"]
+    assert v2.columns == list(MODEL_DCF_RESULTS_V2.schema)
+    assert set(v2["schema_version"]) == {2}
+    for name in ("per_share_value", "equity_value", "enterprise_value"):
+        assert (
+            v2.sort("scenario")[name].to_list() == v1.sort("scenario")[name].to_list()
+        )
+    assert set(v2["issued_shares"]) == {0.0}
+    assert set(v2["issuance_pv"]) == {0.0}
+    assert set(v2["opening_diluted_shares"]) == {100.0}
+    checks = tables["model.dcf-reconciliation"]
+    assert set(checks.filter(pl.col("check") == "share_rollforward")["status"]) == {
+        "passed"
+    }
+
+
+def test_dcf_v2_scenario_shares_and_issuance(tmp_path: Path) -> None:
+    case_dir = initialize_case(tmp_path, "demo")
+    _write_sources(case_dir)
+    _write_dcf_v2(case_dir, _ISSUANCE)
+    run = run_dcf(tmp_path, "demo")
+    tables = _dcf_tables(case_dir, run.run_id)
+    results = tables["model.dcf-results"].sort("scenario")
+    base = results.filter(pl.col("scenario") == "base").row(0, named=True)
+    bear = results.filter(pl.col("scenario") == "bear").row(0, named=True)
+    assert (bear["opening_diluted_shares"], bear["issued_shares"]) == (100.0, 0.0)
+    assert (
+        base["opening_diluted_shares"],
+        base["issued_shares"],
+        base["ending_diluted_shares"],
+    ) == (110.0, 10.0, 120.0)
+    factor = (
+        tables["model.dcf-cashflows"]
+        .filter(pl.col("scenario") == "base")["discount_factor"]
+        .item()
+    )
+    assert base["issuance_pv"] == pytest.approx(50 / factor)
+    ev = base["enterprise_value"]
+    expected_equity = ev - 150 + 50 / factor
+    assert base["equity_value"] == pytest.approx(expected_equity)
+    assert base["per_share_value"] == pytest.approx(expected_equity / 120)
+    inputs = tables["model.dcf-inputs"].filter(pl.col("scenario") == "base")
+    assert inputs.filter(pl.col("field") == "diluted_shares")["value"].to_list() == [
+        110.0
+    ]
+    assert inputs.filter(pl.col("field").str.starts_with("issuance_")).height == 2
+    checks = tables["model.dcf-reconciliation"]
+    assert set(checks["status"]) == {"passed"}
+    assert checks.filter(pl.col("check") == "share_rollforward")[
+        "unit"
+    ].unique().to_list() == ["shares_m"]
+    assert _audit_valid(tmp_path)
+    assert generate_report(
+        tmp_path, "demo", model_run_id=run.run_id, format="html"
+    ).path.is_file()
+
+
+@pytest.mark.parametrize(
+    ("extra", "message"),
+    [
+        (
+            _ISSUANCE.replace("2026-12-31", "2026-11-30"),
+            "match a forecast period_end",
+        ),
+        (_ISSUANCE.replace("value=10,", "value=0,"), "shares must be positive"),
+        (
+            _ISSUANCE.replace(
+                'unit="shares_m", source_id="a5"', 'unit="shares_k", source_id="a5"'
+            ),
+            "unit",
+        ),
+        (
+            "[scenario.base.capitalization]\n"
+            'diluted_shares = { value=1, unit="shares_m", source_id="e4" }\n'
+            'cash = { value=1, unit="USDm", source_id="e4" }\n',
+            "only diluted_shares",
+        ),
+    ],
+)
+def test_dcf_v2_rejects_invalid_scenario_capitalization(
+    tmp_path: Path, extra: str, message: str
+) -> None:
+    case_dir = initialize_case(tmp_path, "demo")
+    _write_sources(case_dir)
+    _write_dcf_v2(case_dir, extra)
+    with pytest.raises(Exception, match=message):
+        run_dcf(tmp_path, "demo")
+    assert [
+        item
+        for item in read_manifest(case_dir).artifacts
+        if item.kind.startswith("model.")
+    ] == []
+
+
+def test_dcf_v1_rejects_v2_tables(tmp_path: Path) -> None:
+    case_dir = initialize_case(tmp_path, "demo")
+    _write_sources(case_dir)
+    _write_dcf_input(case_dir)
+    path = case_dir / "analysis" / "dcf-inputs.toml"
+    path.write_text(path.read_text(encoding="utf-8") + _ISSUANCE, encoding="utf-8")
+    with pytest.raises(Exception, match="must contain forecast and terminal"):
+        run_dcf(tmp_path, "demo")
+
+
+def _translation(fx_id: str, **overrides: str) -> str:
+    fields = {
+        "base": "USD",
+        "quote": "HKD",
+        "rate_date": "2026-06-27",
+        **overrides,
+    }
+    return (
+        '\n[translation]\ncurrency = "' + fields.get("currency", "HKD") + '"\n'
+        f'fx = {{ artifact_id = "{fx_id}", base = "{fields["base"]}", '
+        f'quote = "{fields["quote"]}", rate_date = "{fields["rate_date"]}" }}\n'
+    )
+
+
+def test_dcf_translation_publishes_authenticated_table(tmp_path: Path) -> None:
+    case_dir = initialize_case(tmp_path, "demo")
+    _write_sources(case_dir)
+    fx_id = _publish_fx(case_dir)
+    _write_dcf_v2(case_dir, _ISSUANCE + _translation(fx_id))
+    run = run_dcf(tmp_path, "demo")
+    tables = _dcf_tables(case_dir, run.run_id)
+    translation = tables["model.dcf-translation"].sort("scenario")
+    MODEL_DCF_TRANSLATION_V1.validate(translation)
+    assert translation.columns == list(MODEL_DCF_TRANSLATION_V1.schema)
+    assert translation["fx_rate"].to_list() == pytest.approx([7.81] * 3)
+    assert set(translation["rate_date"]) == {date(2026, 6, 27)}
+    assert set(translation["translated_currency"]) == {"HKD"}
+    results = tables["model.dcf-results"].sort("scenario")
+    assert translation["translated_per_share_value"].to_list() == pytest.approx(
+        [value * 7.81 for value in results["per_share_value"]]
+    )
+    checks = tables["model.dcf-reconciliation"]
+    assert checks.filter(pl.col("check") == "translation")[
+        "unit"
+    ].unique().to_list() == ["HKD/share"]
+    assert set(checks["status"]) == {"passed"}
+    manifest = read_manifest(case_dir)
+    inputs_artifact = next(
+        i for i in manifest.artifacts if i.kind == "model.dcf-inputs"
+    )
+    assert inputs_artifact.input_artifact_ids == (fx_id,)
+    assert _audit_valid(tmp_path)
+    report = generate_report(
+        tmp_path, "demo", model_run_id=run.run_id, format="markdown"
+    )
+    text = report.path.read_text(encoding="utf-8")
+    assert "## Translation" in text
+    assert fx_id.replace(".", "\\.") in text or fx_id in text
+    assert run_dcf(tmp_path, "demo").run_id == run.run_id
+
+
+def test_dcf_translation_rejects_wrong_pair_artifact(tmp_path: Path) -> None:
+    case_dir = initialize_case(tmp_path, "demo")
+    _write_sources(case_dir)
+    other_pair = _publish_fx(case_dir, base="USD", quote="CNY")
+    _write_dcf_v2(case_dir, _translation(other_pair))
+    with pytest.raises(Exception, match="no close rate for USD/HKD"):
+        run_dcf(tmp_path, "demo")
+
+
+def test_dcf_v2_contract_validators_reject_inconsistent_rows(tmp_path: Path) -> None:
+    case_dir = initialize_case(tmp_path, "demo")
+    _write_sources(case_dir)
+    fx_id = _publish_fx(case_dir)
+    _write_dcf_v2(case_dir, _ISSUANCE + _translation(fx_id))
+    tables = _dcf_tables(case_dir, run_dcf(tmp_path, "demo").run_id)
+    with pytest.raises(DataContractError, match="ending shares"):
+        MODEL_DCF_RESULTS_V2.validate(
+            tables["model.dcf-results"].with_columns(ending_diluted_shares=1.0)
+        )
+    with pytest.raises(DataContractError, match="per_share_value \\* fx_rate"):
+        MODEL_DCF_TRANSLATION_V1.validate(
+            tables["model.dcf-translation"].with_columns(fx_rate=1.0)
+        )
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"rate_date": "2026-07-01"}, "must not be after as_of"),
+        ({"rate_date": "2026-06-25"}, "no close rate"),
+        ({"base": "HKD", "quote": "USD"}, "inverse pair is not accepted"),
+        ({"currency": "USD", "quote": "USD"}, "other than the model currency"),
+    ],
+)
+def test_dcf_translation_rejects_invalid_declarations(
+    tmp_path: Path, overrides: dict[str, str], message: str
+) -> None:
+    case_dir = initialize_case(tmp_path, "demo")
+    _write_sources(case_dir)
+    fx_id = _publish_fx(case_dir)
+    _write_dcf_v2(case_dir, _translation(fx_id, **overrides))
+    with pytest.raises(Exception, match=message):
+        run_dcf(tmp_path, "demo")
+    assert not [
+        i for i in read_manifest(case_dir).artifacts if i.kind.startswith("model.")
+    ]
+
+
+def test_dcf_translation_rejects_non_fx_artifact(tmp_path: Path) -> None:
+    case_dir = initialize_case(tmp_path, "demo")
+    _write_sources(case_dir)
+    _publish_fx(case_dir)
+    _write_dcf_v2(case_dir, _translation("normalized.fx-rates.missing"))
+    with pytest.raises(Exception, match="normalized.fx-rates.v1"):
+        run_dcf(tmp_path, "demo")
+
+
+def test_dcf_translation_audit_detects_fx_tamper(tmp_path: Path) -> None:
+    case_dir = initialize_case(tmp_path, "demo")
+    _write_sources(case_dir)
+    fx_id = _publish_fx(case_dir)
+    _write_dcf_v2(case_dir, _translation(fx_id))
+    run_dcf(tmp_path, "demo")
+    assert _audit_valid(tmp_path)
+    fx = next(i for i in read_manifest(case_dir).artifacts if i.artifact_id == fx_id)
+    frame = pl.read_parquet(case_dir / fx.path).with_columns(rate=pl.col("rate") * 2)
+    frame.write_parquet(case_dir / fx.path)
+    audit = audit_case(
+        tmp_path,
+        "demo",
+        as_of=date(2026, 6, 30),
+        max_price_age_days=1,
+        verify_hashes=True,
+    )
+    assert not audit.valid

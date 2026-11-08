@@ -160,6 +160,15 @@ class DCFPeriod:
 
 
 @dataclass(frozen=True)
+class DCFIssuance:
+    """Shares issued at a forecast ``period_end`` for cash ``proceeds``."""
+
+    period_end: date
+    shares: float
+    proceeds: float
+
+
+@dataclass(frozen=True)
 class DCFSpecification:
     """Full dated DCF specification for auditable case-backed model runs."""
 
@@ -173,9 +182,12 @@ class DCFSpecification:
     terminal_growth: float | None = None
     exit_multiple: float | None = None
     terminal_metric: float | None = None
+    issuances: tuple[DCFIssuance, ...] = ()
 
     def __post_init__(self) -> None:
         _finite(self.wacc, self.net_debt_value, self.diluted_shares_value)
+        _finite(*(item.shares for item in self.issuances))
+        _finite(*(item.proceeds for item in self.issuances))
         _finite(*(period.free_cash_flow for period in self.periods))
         if self.terminal_growth is not None:
             _finite(self.terminal_growth)
@@ -200,6 +212,17 @@ class DCFSpecification:
                     "period_end rows must be strictly increasing after as_of"
                 )
             previous = period.period_end
+        forecast_ends = {period.period_end for period in self.periods}
+        previous = self.as_of
+        for item in self.issuances:
+            if item.period_end <= previous or item.period_end not in forecast_ends:
+                raise ModelError(
+                    "issuance period_end rows must strictly increase and match "
+                    "forecast periods"
+                )
+            if item.shares <= 0 or item.proceeds < 0:
+                raise ModelError("issuance shares must be positive, proceeds >= 0")
+            previous = item.period_end
         if self.terminal_method == "gordon_growth":
             if self.terminal_growth is None or self.exit_multiple is not None:
                 raise ModelError("gordon_growth terminal requires terminal_growth only")
@@ -244,6 +267,10 @@ class DetailedDCFResult:
     enterprise_value: float
     equity_value: float
     per_share_value: float
+    opening_shares: float = 0.0
+    issued_shares: float = 0.0
+    ending_shares: float = 0.0
+    issuance_pv: float = 0.0
 
 
 def dcf_valuation(input: DCFInput) -> DCFResult:
@@ -330,15 +357,34 @@ def dated_dcf_valuation(specification: DCFSpecification) -> DetailedDCFResult:
         "enterprise value",
     )
     equity = _finite_result(enterprise - specification.net_debt_value, "equity value")
+    ending_shares = specification.diluted_shares_value
+    issued_shares = 0.0
+    issuance_pv = 0.0
+    if specification.issuances:
+        factors = {period.period_end: period.discount_factor for period in periods}
+        issued_shares = sum(item.shares for item in specification.issuances)
+        issuance_pv = _finite_result(
+            sum(
+                item.proceeds / factors[item.period_end]
+                for item in specification.issuances
+            ),
+            "issuance present value",
+        )
+        equity = _finite_result(equity + issuance_pv, "equity value")
+        ending_shares = _finite_result(
+            specification.diluted_shares_value + issued_shares, "ending shares"
+        )
     return DetailedDCFResult(
         periods=tuple(periods),
         terminal_value=terminal_value,
         terminal_pv=terminal_pv,
         enterprise_value=enterprise,
         equity_value=equity,
-        per_share_value=_finite_result(
-            equity / specification.diluted_shares_value, "per-share value"
-        ),
+        per_share_value=_finite_result(equity / ending_shares, "per-share value"),
+        opening_shares=specification.diluted_shares_value,
+        issued_shares=issued_shares,
+        ending_shares=ending_shares,
+        issuance_pv=issuance_pv,
     )
 
 

@@ -36,14 +36,18 @@ from finresearch.data_contracts import (
     MODEL_DCF_INPUTS_V1,
     MODEL_DCF_RECONCILIATION_V1,
     MODEL_DCF_RESULTS_V1,
+    MODEL_DCF_RESULTS_V2,
     MODEL_DCF_SENSITIVITY_V1,
+    MODEL_DCF_TRANSLATION_V1,
     MODEL_PROJECTION_ASSESSMENT_V1,
+    NORMALIZED_FX_RATES_V1,
     DataContractError,
     DatasetContract,
     get_contract,
 )
 from finresearch.ingestion import IngestionError, IngestionReceipt, publish_snapshot
 from finresearch.model import (
+    DCFIssuance,
     DCFPeriod,
     DCFSpecification,
     ModelError,
@@ -77,11 +81,31 @@ class ValueInput:
 
 
 @dataclass(frozen=True)
+class Issuance:
+    period_end: date
+    shares: ValueInput
+    proceeds: ValueInput
+
+
+@dataclass(frozen=True)
 class DCFScenario:
     name: str
     forecasts: tuple[tuple[date, ValueInput], ...]
     terminal: ValueInput
     terminal_metric: ValueInput | None = None
+    diluted_shares: ValueInput | None = None
+    issuance: tuple[Issuance, ...] = ()
+
+
+@dataclass(frozen=True)
+class Translation:
+    """Declared per-share translation into another currency with one FX rate."""
+
+    currency: str
+    fx_artifact_id: str
+    base: str
+    quote: str
+    rate_date: date
 
 
 @dataclass(frozen=True)
@@ -96,6 +120,8 @@ class DCFCaseInput:
     capitalization: dict[str, ValueInput]
     scenarios: dict[str, DCFScenario]
     projection_needs: tuple[str, ...]
+    version: int = 1
+    translation: Translation | None = None
 
 
 @dataclass(frozen=True)
@@ -125,7 +151,7 @@ class AuthenticatedModelRun:
 def load_dcf_input(
     case_dir: Path, relative_input: str
 ) -> tuple[DCFCaseInput, bytes, Path]:
-    """Load and validate one strict, case-relative dcf-inputs.toml v1 file."""
+    """Load and validate one strict, case-relative dcf-inputs.toml v1 or v2 file."""
     if Path(relative_input).is_absolute():
         raise CaseContractError("DCF input must be a case-relative path")
     path = resolve_relative_path(case_dir, relative_input, "DCF input")
@@ -149,9 +175,14 @@ def load_dcf_input(
         "scenario",
         "projection_needs",
     }
-    if set(data) != expected or data.get("version") != 1:
+    version = data.get("version")
+    if version not in {1, 2} or isinstance(version, bool):
+        raise CaseContractError("DCF input version must be 1 or 2")
+    if version == 2:
+        expected = expected | ({"translation"} & set(data))
+    if set(data) != expected:
         raise CaseContractError(
-            "DCF input must use exactly the dcf-inputs.toml v1 keys"
+            f"DCF input must use exactly the dcf-inputs.toml v{version} keys"
         )
     as_of = _parse_date(data["as_of"], "as_of")
     currency = _controlled_text(data["currency"], "currency")
@@ -198,9 +229,14 @@ def load_dcf_input(
     scenarios: dict[str, DCFScenario] = {}
     for scenario in _SCENARIOS:
         scenario_raw = _mapping(scenarios_raw[scenario], f"scenario.{scenario}")
-        if set(scenario_raw) != {"forecast", "terminal"}:
+        optional = {"capitalization", "issuance"} if version == 2 else set()
+        if (
+            not {"forecast", "terminal"} <= set(scenario_raw)
+            or set(scenario_raw) - {"forecast", "terminal"} - optional
+        ):
             raise CaseContractError(
                 f"scenario.{scenario} must contain forecast and terminal"
+                + (" and only optional capitalization and issuance" if optional else "")
             )
         forecast_raw = scenario_raw["forecast"]
         if not isinstance(forecast_raw, list) or not forecast_raw:
@@ -252,11 +288,34 @@ def load_dcf_input(
             terminal_metric = _value(
                 terminal_raw["terminal_metric"], "terminal_metric", value_unit
             )
+        scenario_shares: ValueInput | None = None
+        if "capitalization" in scenario_raw:
+            scenario_cap = _mapping(
+                scenario_raw["capitalization"], f"scenario.{scenario}.capitalization"
+            )
+            if set(scenario_cap) != {"diluted_shares"}:
+                raise CaseContractError(
+                    f"scenario.{scenario}.capitalization must contain only "
+                    "diluted_shares"
+                )
+            scenario_shares = _value(
+                scenario_cap["diluted_shares"], "diluted_shares", share_unit
+            )
+        issuance = _load_issuance(
+            scenario_raw.get("issuance", []),
+            scenario,
+            as_of,
+            {day for day, _ in forecasts},
+            value_unit,
+            share_unit,
+        )
         scenarios[scenario] = DCFScenario(
             scenario,
             tuple(forecasts),
             terminal,
             terminal_metric,
+            scenario_shares,
+            issuance,
         )
     fingerprints = {
         json.dumps(_scenario_fingerprint(value), sort_keys=True)
@@ -271,6 +330,11 @@ def load_dcf_input(
         raise CaseContractError(
             "projection_needs contains an unsupported controlled reason"
         )
+    translation = (
+        _load_translation(data["translation"], as_of, currency)
+        if "translation" in data
+        else None
+    )
     return (
         DCFCaseInput(
             as_of,
@@ -283,10 +347,135 @@ def load_dcf_input(
             capitalization,
             scenarios,
             tuple(sorted(set(needs))),
+            cast(int, version),
+            translation,
         ),
         raw,
         path,
     )
+
+
+def _load_issuance(
+    raw: object,
+    scenario: str,
+    as_of: date,
+    forecast_ends: set[date],
+    value_unit: str,
+    share_unit: str,
+) -> tuple[Issuance, ...]:
+    label = f"scenario.{scenario}.issuance"
+    if not isinstance(raw, list):
+        raise CaseContractError(f"{label} must be an array of tables")
+    rows: list[Issuance] = []
+    previous = as_of
+    for index, row in enumerate(raw):
+        record = _mapping(row, f"{label}[{index}]")
+        if set(record) != {"period_end", "shares", "proceeds"}:
+            raise CaseContractError(
+                "issuance rows require period_end, shares, and proceeds"
+            )
+        period_end = _parse_date(record["period_end"], "period_end")
+        if period_end <= previous or period_end not in forecast_ends:
+            raise CaseContractError(
+                f"{label} period_end rows must strictly increase and match a "
+                "forecast period_end"
+            )
+        previous = period_end
+        shares = _value(record["shares"], "shares", share_unit)
+        proceeds = _value(record["proceeds"], "proceeds", value_unit)
+        if shares.value <= 0 or proceeds.value < 0:
+            raise CaseContractError(
+                f"{label} shares must be positive and proceeds nonnegative"
+            )
+        rows.append(Issuance(period_end, shares, proceeds))
+    return tuple(rows)
+
+
+def _load_translation(raw: object, as_of: date, currency: str) -> Translation:
+    table = _mapping(raw, "translation")
+    if set(table) != {"currency", "fx"}:
+        raise CaseContractError("translation must contain currency and fx")
+    target = _controlled_text(table["currency"], "translation.currency")
+    if target not in CURRENCY_CODES or target == currency:
+        raise CaseContractError(
+            "translation.currency must be a controlled currency other than the "
+            "model currency"
+        )
+    fx = _mapping(table["fx"], "translation.fx")
+    if set(fx) != {"artifact_id", "base", "quote", "rate_date"}:
+        raise CaseContractError(
+            "translation.fx must contain artifact_id, base, quote, rate_date"
+        )
+    base = _controlled_text(fx["base"], "translation.fx.base")
+    quote = _controlled_text(fx["quote"], "translation.fx.quote")
+    if (base, quote) != (currency, target):
+        raise CaseContractError(
+            f"translation.fx must be the {currency}/{target} pair "
+            "(base = model currency, quote = translation currency); the "
+            "inverse pair is not accepted"
+        )
+    rate_date = _parse_date(fx["rate_date"], "translation.fx.rate_date")
+    if rate_date > as_of:
+        raise CaseContractError("translation.fx.rate_date must not be after as_of")
+    return Translation(
+        target,
+        _controlled_text(fx["artifact_id"], "translation.fx.artifact_id"),
+        base,
+        quote,
+        rate_date,
+    )
+
+
+def _resolve_translation_rate(
+    case_dir: Path,
+    manifest: CaseManifest,
+    translation: Translation,
+    *,
+    verify_hashes: bool = True,
+) -> tuple[Artifact, float]:
+    """Return the declared FX artifact and its close rate on ``rate_date``."""
+    matches = [
+        item
+        for item in manifest.artifacts
+        if item.artifact_id == translation.fx_artifact_id
+    ]
+    if (
+        len(matches) != 1
+        or matches[0].kind != NORMALIZED_FX_RATES_V1.name
+        or matches[0].schema_version != NORMALIZED_FX_RATES_V1.version
+    ):
+        raise CaseContractError(
+            "translation.fx.artifact_id must name a normalized.fx-rates.v1 artifact"
+        )
+    artifact = matches[0]
+    path = resolve_relative_path(case_dir, artifact.path, "FX artifact")
+    if not path.is_file() or artifact.sha256 is None:
+        raise CaseContractError(
+            f"FX artifact is not verifiable: {artifact.artifact_id}"
+        )
+    if verify_hashes and _sha256(path) != artifact.sha256:
+        raise CaseContractError(
+            f"FX artifact sha256 does not match: {artifact.artifact_id}"
+        )
+    frame = _read_model_frame(case_dir, artifact)
+    try:
+        NORMALIZED_FX_RATES_V1.validate(frame)
+    except DataContractError as exc:
+        raise CaseContractError(
+            f"FX artifact fails its DatasetContract: {artifact.artifact_id}"
+        ) from exc
+    rows = frame.filter(
+        (pl.col("base_currency") == translation.base)
+        & (pl.col("quote_currency") == translation.quote)
+        & (pl.col("rate_date") == translation.rate_date)
+        & (pl.col("rate_kind") == "close")
+    )
+    if rows.height != 1:
+        raise CaseContractError(
+            f"FX artifact has no close rate for {translation.base}/"
+            f"{translation.quote} on {translation.rate_date}"
+        )
+    return artifact, float(rows["rate"][0])
 
 
 def run_dcf(
@@ -315,12 +504,19 @@ def run_dcf(
     if sensitivity is not None:
         sensitivity = _canonicalize_dcf_sensitivity(sensitivity, config.terminal_method)
     extra_hashes = _model_input_hashes(case_dir, actual_input, input_bytes)
+    fx_artifact: Artifact | None = None
+    fx_rate: float | None = None
+    if config.translation is not None:
+        fx_artifact, fx_rate = _resolve_translation_rate(
+            case_dir, manifest, config.translation
+        )
     run_id = _run_id(
         hashlib.sha256(input_bytes).hexdigest(),
         config.as_of,
         selected,
         sensitivity,
         extra_hashes,
+        fx_artifact.sha256 if fx_artifact is not None else None,
     )
     (
         input_frame,
@@ -328,7 +524,8 @@ def run_dcf(
         results_frame,
         reconciliation_frame,
         sensitivity_frame,
-    ) = _build_dcf_frames(config, sources, run_id, selected, sensitivity)
+        translation_frame,
+    ) = _build_dcf_frames(config, sources, run_id, selected, sensitivity, fx_rate)
     input_receipt = _publish(
         case_dir,
         manifest,
@@ -336,7 +533,7 @@ def run_dcf(
         run_id,
         "inputs",
         input_frame,
-        (),
+        (fx_artifact.artifact_id,) if fx_artifact is not None else (),
         config.as_of,
         extra_hashes,
     )
@@ -354,7 +551,7 @@ def run_dcf(
     results_receipt = _publish(
         case_dir,
         manifest,
-        MODEL_DCF_RESULTS_V1,
+        MODEL_DCF_RESULTS_V2 if config.version == 2 else MODEL_DCF_RESULTS_V1,
         run_id,
         "results",
         results_frame,
@@ -374,6 +571,20 @@ def run_dcf(
         extra_hashes,
     )
     receipts = [input_receipt, cash_receipt, results_receipt, reconciliation_receipt]
+    if translation_frame is not None:
+        receipts.append(
+            _publish(
+                case_dir,
+                manifest,
+                MODEL_DCF_TRANSLATION_V1,
+                run_id,
+                "translation",
+                translation_frame,
+                (results_receipt.artifact_id,),
+                config.as_of,
+                extra_hashes,
+            )
+        )
     if sensitivity_frame is not None:
         receipts.append(
             _publish(
@@ -397,14 +608,20 @@ def _build_dcf_frames(
     run_id: str,
     selected: tuple[str, ...],
     sensitivity: tuple[tuple[float, ...], tuple[float, ...]] | None,
+    fx_rate: float | None = None,
 ) -> tuple[
     pl.DataFrame,
     pl.DataFrame,
     pl.DataFrame,
     pl.DataFrame,
     pl.DataFrame | None,
+    pl.DataFrame | None,
 ]:
     """Build every deterministic DCF model table from authenticated inputs."""
+    results_contract = (
+        MODEL_DCF_RESULTS_V2 if config.version == 2 else MODEL_DCF_RESULTS_V1
+    )
+    translation_rows: list[dict[str, object]] = []
     wacc = wacc_from_components(
         **{name: item.value for name, item in config.wacc.items()}
     )
@@ -422,7 +639,14 @@ def _build_dcf_frames(
     sensitivity_rows: list[dict[str, object]] = []
     for name in selected:
         definition = config.scenarios[name]
-        for field, item in {**config.wacc, **config.capitalization}.items():
+        opening_leaf = (
+            definition.diluted_shares or config.capitalization["diluted_shares"]
+        )
+        for field, item in {
+            **config.wacc,
+            **config.capitalization,
+            "diluted_shares": opening_leaf,
+        }.items():
             source = sources[item.source_id]
             input_rows.append(
                 _input_row(run_id, name, field, item, config.currency, source)
@@ -463,6 +687,22 @@ def _build_dcf_frames(
                     metric_source,
                 )
             )
+        for row in definition.issuance:
+            for field, leaf in (
+                (f"issuance_shares:{row.period_end}", row.shares),
+                (f"issuance_proceeds:{row.period_end}", row.proceeds),
+            ):
+                input_rows.append(
+                    _input_row(
+                        run_id,
+                        name,
+                        field,
+                        leaf,
+                        config.currency,
+                        sources[leaf.source_id],
+                        row.period_end,
+                    )
+                )
         specification = DCFSpecification(
             as_of=config.as_of,
             periods=tuple(
@@ -470,7 +710,7 @@ def _build_dcf_frames(
             ),
             wacc=wacc,
             net_debt_value=nd,
-            diluted_shares_value=config.capitalization["diluted_shares"].value,
+            diluted_shares_value=opening_leaf.value,
             discount_convention=config.discount_convention,
             terminal_method=config.terminal_method,
             terminal_growth=(
@@ -487,6 +727,10 @@ def _build_dcf_frames(
                 definition.terminal_metric.value
                 if definition.terminal_metric is not None
                 else None
+            ),
+            issuances=tuple(
+                DCFIssuance(row.period_end, row.shares.value, row.proceeds.value)
+                for row in definition.issuance
             ),
         )
         detail = dated_dcf_valuation(specification)
@@ -512,37 +756,85 @@ def _build_dcf_frames(
             * _unit_scale(config.value_unit, config.currency)
             / _share_scale(config.share_unit)
         )
-        result_rows.append(
-            {
-                "schema_version": 1,
-                "run_id": run_id,
-                "scenario": name,
-                "terminal_value": detail.terminal_value,
-                "terminal_pv": detail.terminal_pv,
-                "enterprise_value": detail.enterprise_value,
-                "equity_value": detail.equity_value,
-                "per_share_value": published_per_share,
-                "currency": config.currency,
-                "value_unit": config.value_unit,
-                "share_unit": config.share_unit,
-                "per_share_unit": f"{config.currency}/share",
-                "wacc": wacc,
-                "discount_convention": config.discount_convention,
-                "terminal_method": config.terminal_method,
-                "terminal_ev_share": detail.terminal_pv / detail.enterprise_value,
-            }
-        )
+        result_row: dict[str, object] = {
+            "schema_version": results_contract.version,
+            "run_id": run_id,
+            "scenario": name,
+            "terminal_value": detail.terminal_value,
+            "terminal_pv": detail.terminal_pv,
+            "enterprise_value": detail.enterprise_value,
+            "equity_value": detail.equity_value,
+            "per_share_value": published_per_share,
+            "currency": config.currency,
+            "value_unit": config.value_unit,
+            "share_unit": config.share_unit,
+            "per_share_unit": f"{config.currency}/share",
+            "wacc": wacc,
+            "discount_convention": config.discount_convention,
+            "terminal_method": config.terminal_method,
+            "terminal_ev_share": detail.terminal_pv / detail.enterprise_value,
+        }
+        if config.version == 2:
+            result_row.update(
+                opening_diluted_shares=detail.opening_shares,
+                issued_shares=detail.issued_shares,
+                ending_diluted_shares=detail.ending_shares,
+                issuance_pv=detail.issuance_pv,
+            )
+        result_rows.append(result_row)
         reconciliation_rows.extend(
             _dcf_reconciliations(
                 run_id,
                 name,
                 detail,
-                config.capitalization["diluted_shares"].value,
+                detail.ending_shares,
                 config.value_unit,
                 config.currency,
                 config.share_unit,
             )
         )
+        if config.version == 2:
+            reconciliation_rows.append(
+                _check_row(
+                    run_id,
+                    name,
+                    "share_rollforward",
+                    detail.ending_shares,
+                    opening_leaf.value
+                    + sum(row.shares.value for row in definition.issuance),
+                    config.share_unit,
+                )
+            )
+        if config.translation is not None:
+            assert fx_rate is not None
+            translated = published_per_share * fx_rate
+            translation_rows.append(
+                {
+                    "schema_version": 1,
+                    "run_id": run_id,
+                    "scenario": name,
+                    "per_share_value": published_per_share,
+                    "currency": config.currency,
+                    "fx_rate": fx_rate,
+                    "rate_date": config.translation.rate_date,
+                    "translated_per_share_value": translated,
+                    "translated_currency": config.translation.currency,
+                }
+            )
+            reconciliation_rows.append(
+                _check_row(
+                    run_id,
+                    name,
+                    "translation",
+                    translated,
+                    detail.equity_value
+                    / detail.ending_shares
+                    * _unit_scale(config.value_unit, config.currency)
+                    / _share_scale(config.share_unit)
+                    * fx_rate,
+                    f"{config.translation.currency}/share",
+                )
+            )
         if sensitivity is not None:
             for rate in sensitivity[0]:
                 for terminal_growth in sensitivity[1]:
@@ -572,7 +864,12 @@ def _build_dcf_frames(
                     )
     input_frame = pl.DataFrame(input_rows, schema=MODEL_DCF_INPUTS_V1.schema)
     cash_frame = pl.DataFrame(cashflow_rows, schema=MODEL_DCF_CASHFLOWS_V1.schema)
-    results_frame = pl.DataFrame(result_rows, schema=MODEL_DCF_RESULTS_V1.schema)
+    results_frame = pl.DataFrame(result_rows, schema=results_contract.schema)
+    translation_frame = (
+        pl.DataFrame(translation_rows, schema=MODEL_DCF_TRANSLATION_V1.schema)
+        if translation_rows
+        else None
+    )
     reconciliation_frame = pl.DataFrame(
         reconciliation_rows, schema=MODEL_DCF_RECONCILIATION_V1.schema
     )
@@ -584,10 +881,12 @@ def _build_dcf_frames(
     for contract, frame in (
         (MODEL_DCF_INPUTS_V1, input_frame),
         (MODEL_DCF_CASHFLOWS_V1, cash_frame),
-        (MODEL_DCF_RESULTS_V1, results_frame),
+        (results_contract, results_frame),
         (MODEL_DCF_RECONCILIATION_V1, reconciliation_frame),
     ):
         contract.validate(frame)
+    if translation_frame is not None:
+        MODEL_DCF_TRANSLATION_V1.validate(translation_frame)
     if sensitivity_frame is not None:
         MODEL_DCF_SENSITIVITY_V1.validate(sensitivity_frame)
     return (
@@ -596,6 +895,7 @@ def _build_dcf_frames(
         results_frame,
         reconciliation_frame,
         sensitivity_frame,
+        translation_frame,
     )
 
 
@@ -894,6 +1194,10 @@ def _validate_dcf_sources(
         values.append(scenario.terminal)
         if scenario.terminal_metric is not None:
             values.append(scenario.terminal_metric)
+        if scenario.diluted_shares is not None:
+            values.append(scenario.diluted_shares)
+        for row in scenario.issuance:
+            values.extend((row.shares, row.proceeds))
     missing = sorted({value.source_id for value in values} - set(sources))
     if missing:
         raise CaseContractError(f"DCF inputs have dangling source ids: {missing}")
@@ -974,18 +1278,20 @@ def _run_id(
     selected: tuple[str, ...],
     sensitivity: tuple[tuple[float, ...], tuple[float, ...]] | None,
     hashes: tuple[InputFileHash, ...],
+    fx_sha256: str | None = None,
 ) -> str:
-    return canonical_parameters_sha256(
-        {
-            "input_sha256": input_sha256,
-            "as_of": as_of.isoformat(),
-            "scenario": list(selected),
-            "sensitivity": sensitivity,
-            "producer": MODEL_PRODUCER,
-            "producer_version": MODEL_PRODUCER_VERSION,
-            "input_hashes": [(item.path, item.sha256) for item in hashes],
-        }
-    )
+    identity: dict[str, Any] = {
+        "input_sha256": input_sha256,
+        "as_of": as_of.isoformat(),
+        "scenario": list(selected),
+        "sensitivity": sensitivity,
+        "producer": MODEL_PRODUCER,
+        "producer_version": MODEL_PRODUCER_VERSION,
+        "input_hashes": [(item.path, item.sha256) for item in hashes],
+    }
+    if fx_sha256 is not None:
+        identity["fx_sha256"] = fx_sha256
+    return canonical_parameters_sha256(identity)
 
 
 def _comps_run_id(
@@ -1019,13 +1325,15 @@ class _RunArtifactSpec:
     label: str
     schema_version: int
     optional: bool = False
+    also_schema_versions: tuple[int, ...] = ()
 
 
 _DCF_RUN_SPECS = (
     _RunArtifactSpec("model.dcf-inputs", "inputs", 1),
     _RunArtifactSpec("model.dcf-cashflows", "cashflows", 1),
-    _RunArtifactSpec("model.dcf-results", "results", 1),
+    _RunArtifactSpec("model.dcf-results", "results", 1, also_schema_versions=(2,)),
     _RunArtifactSpec("model.dcf-reconciliation", "reconciliation", 1),
+    _RunArtifactSpec("model.dcf-translation", "translation", 1, optional=True),
     _RunArtifactSpec("model.dcf-sensitivity", "sensitivity", 1, optional=True),
 )
 _TOKEN_RUN_SPECS = (
@@ -1236,7 +1544,10 @@ def _resolve_model_artifacts(
             raise CaseContractError(
                 f"{family} run {run_id} has noncanonical {spec.kind} identity or path"
             )
-        if artifact.schema_version != spec.schema_version:
+        if artifact.schema_version not in (
+            spec.schema_version,
+            *spec.also_schema_versions,
+        ):
             if (
                 family == "comps"
                 and spec.kind == "model.comps-inputs"
@@ -1339,6 +1650,13 @@ def _validate_model_run_graph(
         summary = by_kind["model.comps-summary"]
         if summary.input_artifact_ids != (results.artifact_id,):
             raise CaseContractError("comps summary lineage is incomplete or cross-run")
+    if (
+        family == "dcf"
+        and "model.dcf-translation" in by_kind
+        and by_kind["model.dcf-translation"].input_artifact_ids
+        != (results.artifact_id,)
+    ):
+        raise CaseContractError("DCF translation lineage is incomplete or cross-run")
     if family == "dcf" and "model.dcf-sensitivity" in by_kind:
         sensitivity = by_kind["model.dcf-sensitivity"]
         if sensitivity.input_artifact_ids != (results.artifact_id,):
@@ -1412,12 +1730,25 @@ def _authenticate_dcf_run(
     config, parsed_bytes, parsed_path = load_dcf_input(case_dir, record.path)
     if parsed_path != input_path or parsed_bytes != input_bytes:
         raise CaseContractError("DCF run input TOML bytes changed while authenticating")
+    fx_artifact: Artifact | None = None
+    fx_rate: float | None = None
+    fx_parents: tuple[str, ...] = ()
+    if config.translation is not None:
+        fx_artifact, fx_rate = _resolve_translation_rate(
+            case_dir, manifest, config.translation, verify_hashes=verify_hashes
+        )
+        fx_parents = (fx_artifact.artifact_id,)
+    file_records = tuple(
+        item
+        for item in inputs.input_file_hashes
+        if not item.name.startswith("artifact.")
+    )
     extra_hashes = _declared_dcf_input_hashes(
         case_dir,
-        inputs.input_file_hashes,
+        file_records,
         verify_hashes=verify_hashes,
     )
-    if inputs.input_file_hashes != extra_hashes:
+    if file_records != extra_hashes or inputs.input_artifact_ids != fx_parents:
         raise CaseContractError(
             "DCF input artifact hashes do not bind its TOML/registers"
         )
@@ -1425,7 +1756,14 @@ def _authenticate_dcf_run(
     scenarios = _selected_dcf_scenarios(input_frame)
     sensitivity = _dcf_sensitivity_parameters(tables)
     if (
-        _run_id(record.sha256, config.as_of, scenarios, sensitivity, extra_hashes)
+        _run_id(
+            record.sha256,
+            config.as_of,
+            scenarios,
+            sensitivity,
+            extra_hashes,
+            fx_artifact.sha256 if fx_artifact is not None else None,
+        )
         != run_id
     ):
         raise CaseContractError(
@@ -1436,7 +1774,7 @@ def _authenticate_dcf_run(
         manifest,
         artifacts,
         {
-            "model.dcf-inputs": (),
+            "model.dcf-inputs": fx_parents,
             "model.dcf-cashflows": (inputs.artifact_id,),
             "model.dcf-results": (
                 next(
@@ -1446,6 +1784,13 @@ def _authenticate_dcf_run(
                 ),
             ),
             "model.dcf-reconciliation": (
+                next(
+                    artifact.artifact_id
+                    for artifact in artifacts
+                    if artifact.kind == "model.dcf-results"
+                ),
+            ),
+            "model.dcf-translation": (
                 next(
                     artifact.artifact_id
                     for artifact in artifacts
@@ -1467,7 +1812,7 @@ def _authenticate_dcf_run(
     sources = load_model_sources(case_dir, as_of=config.as_of)
     _validate_dcf_sources(config, sources)
     expected_frames = _dcf_frame_map(
-        _build_dcf_frames(config, sources, run_id, scenarios, sensitivity)
+        _build_dcf_frames(config, sources, run_id, scenarios, sensitivity, fx_rate)
     )
     _require_rebuilt_tables(tables, expected_frames, "DCF")
     return config.as_of
@@ -1750,15 +2095,18 @@ def _dcf_frame_map(
         pl.DataFrame,
         pl.DataFrame,
         pl.DataFrame | None,
+        pl.DataFrame | None,
     ],
 ) -> dict[str, pl.DataFrame]:
-    inputs, cashflows, results, reconciliation, sensitivity = frames
+    inputs, cashflows, results, reconciliation, sensitivity, translation = frames
     output = {
         "model.dcf-inputs": inputs,
         "model.dcf-cashflows": cashflows,
         "model.dcf-results": results,
         "model.dcf-reconciliation": reconciliation,
     }
+    if translation is not None:
+        output["model.dcf-translation"] = translation
     if sensitivity is not None:
         output["model.dcf-sensitivity"] = sensitivity
     return output
@@ -1948,6 +2296,30 @@ def _dcf_reconciliations(
             "unit": f"{currency}/share",
         },
     ]
+
+
+def _check_row(
+    run_id: str,
+    scenario: str,
+    check: str,
+    actual: float,
+    expected: float,
+    unit: str,
+) -> dict[str, object]:
+    difference = actual - expected
+    passed = _within_reconciliation_tolerance(difference, expected)
+    return {
+        "schema_version": 1,
+        "run_id": run_id,
+        "scenario": scenario,
+        "check": check,
+        "actual": actual,
+        "expected": expected,
+        "difference": difference,
+        "passed": passed,
+        "status": "passed" if passed else "failed",
+        "unit": unit,
+    }
 
 
 def _within_reconciliation_tolerance(difference: float, expected: float) -> bool:
@@ -2240,6 +2612,13 @@ def _scenario_fingerprint(value: DCFScenario) -> dict[str, object]:
             if value.terminal_metric is None
             else (value.terminal_metric.value, value.terminal_metric.unit)
         ),
+        "diluted_shares": (
+            None if value.diluted_shares is None else value.diluted_shares.value
+        ),
+        "issuance": [
+            (row.period_end.isoformat(), row.shares.value, row.proceeds.value)
+            for row in value.issuance
+        ],
     }
 
 
