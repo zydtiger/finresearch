@@ -871,7 +871,7 @@ declarations.
 ### Null provider bars in `normalize-daily-prices`
 
 > **Implemented (phase 5)**: see `data-ingestion.md`, "Null provider bars and
-> normalized.price-gaps.v1". The FX use of price gaps remains proposed.
+> normalized.price-gaps.v1". The FX use of price gaps is implemented in phase 7.
 
 ```text
 finresearch --workspace PATH data normalize-daily-prices CASE_ID SYMBOL \
@@ -936,6 +936,10 @@ same cutoff needs `--max-price-age-days 1`.
 
 ### FX normalization and conversion
 
+> **Implemented (phase 7)**: see `data-ingestion.md`, "FX rates", and
+> `modeling.md`, "DCF inputs version 2". The translation rejects the inverse
+> pair instead of dividing, and `fx_rate` is the rate as stored.
+
 Equity cases priced in one currency and reporting in another could not
 normalize `CNYHKD=X` and `EURUSD=X`:
 yfinance FX rows have NULL OHLC on holidays and low values above open or
@@ -969,6 +973,10 @@ before `as_of`; audit authenticates the FX artifact like any model input.
 `model comps` keeps its rule of one common currency.
 
 ### Scenario-specific share counts and issuance in the DCF
+
+> **Implemented (phase 7)**: see `modeling.md`, "DCF inputs version 2". The
+> share roll-forward is a small loop in `dated_dcf_valuation`; it is not shared
+> with the token supply path, which retires tokens rather than adding shares.
 
 `dcf-inputs.toml` version 2, accepted alongside version 1:
 

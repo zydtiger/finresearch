@@ -52,6 +52,55 @@ Gordon terminal value is `final_fcf * (1 + g) / (WACC - g)`. An
 `multiple`), and uses `terminal_metric * exit_multiple`; it never assumes the
 final FCF is the terminal metric.
 
+### DCF inputs version 2
+
+`version = 2` is accepted alongside `version = 1`; version 1 inputs, runs, and
+outputs are unchanged and keep writing `model.dcf-results.v1`. Version 2 keeps
+every version 1 key and adds three optional parts. A version 2 input always
+writes `model.dcf-results.v2`.
+
+```toml
+[scenario.base.capitalization]
+diluted_shares = { value = 110, unit = "shares_m", source_id = "evidence-shares" }
+
+[[scenario.base.issuance]]
+period_end = "2027-12-31"
+shares = { value = 10, unit = "shares_m", source_id = "assumption-atm" }
+proceeds = { value = 50, unit = "USDm", source_id = "assumption-atm-proceeds" }
+
+[translation]
+currency = "HKD"
+fx = { artifact_id = "normalized.fx-rates....", base = "USD", quote = "HKD", rate_date = "2026-06-26" }
+```
+
+- A scenario `capitalization.diluted_shares` replaces the global leaf for that
+  scenario (the global leaf stays required). Its `[scenario.<name>.capitalization]`
+  table holds no other key.
+- `issuance` rows need strictly increasing `period_end` values that each equal a
+  forecast `period_end` of that scenario, positive `shares` (share unit), and
+  nonnegative `proceeds` (value unit). Proceeds are discounted with that
+  period's cash-flow discount factor and added to equity value:
+  `equity = EV - net_debt + issuance_pv`. Per-share value divides by opening
+  diluted shares plus cumulative issued shares. Terminal value is unchanged.
+- `model.dcf-results.v2` adds `opening_diluted_shares`, `issued_shares`,
+  `ending_diluted_shares` (share unit), and `issuance_pv` (value unit). The
+  reconciliation table gains `share_rollforward` (ending equals opening plus the
+  sum of issuance leaves, in the share unit). Issuance leaves appear in
+  `model.dcf-inputs` as `issuance_shares:<date>` and `issuance_proceeds:<date>`.
+- `[translation]` converts each scenario's per-share value into another currency.
+  `fx.base` must be the model currency and `fx.quote` the translation currency;
+  the inverse pair is rejected rather than inverted. `rate_date` must be on or
+  before `as_of`. The run reads the `close` rate for that exact date from the
+  named `normalized.fx-rates.v1` artifact (no earlier-date fallback). The FX
+  artifact is the `model.dcf-inputs` parent, its checksum is part of the run
+  identity, and audit re-reads it. `model.dcf-translation.v1` has `run_id`,
+  `scenario`, `per_share_value`, `currency`, `fx_rate` (as stored),
+  `rate_date`, `translated_per_share_value` (`per_share_value * fx_rate`), and
+  `translated_currency`, and descends from results. A `translation` check in the
+  reconciliation table recomputes the translated value from equity value and
+  ending shares. Reports render the table as "Translation" and list the FX
+  artifact among source artifact IDs. `model comps` keeps its one-currency rule.
+
 ```text
 finresearch --workspace PATH model dcf CASE_ID --input analysis/dcf-inputs.toml \
   --scenario bear|base|bull|all [--sensitivity WACCS;GROWTHS]
