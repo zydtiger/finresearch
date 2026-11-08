@@ -63,7 +63,14 @@ financial values, peers, evidence, assumptions, or source IDs.
   deriving numbers from it, and cite it in `evidence.csv` `source_ref` as
   `capture:<capture_id>`. Never hand-edit CLI-owned files. URLs must be https
   and carry no credentials: userinfo or query names containing `key`,
-  `token`, or `secret` are rejected.
+  `token`, or `secret` are rejected. Set `--provider` from the URL host
+  (`api.coingecko.com` is `coingecko`, `api.hyperliquid.xyz` is
+  `hyperliquid`, `*.llama.fi` is `defillama`, anything else is `web`); the CLI
+  rejects a mismatch, and a registered capture cannot be changed or removed.
+- Retrieval time is point-in-time evidence: `case audit` reports any ingest or
+  capture retrieved after its `--as-of` date. Ingest prices and provider data
+  on or before the valuation cutoff's UTC date, or set the cutoff to the
+  retrieval date.
 - Token supply: `data ingest-coingecko-token`, `ingest-coingecko-markets`, and
   `ingest-hyperliquid-info` write CLI captures from keyless endpoints (no API
   keys; CoinGecko requests are throttled to one per 6 seconds). Normalize with
@@ -233,19 +240,25 @@ when the price instrument id differs from the token's), a
 selected row for `fully_diluted_metric` (an unresolved `conflict` aborts the
 run), token-market artifacts and protocol-metrics artifacts for the peers.
 Your judgments live in the TOML: `fully_diluted_metric` (`total` or `max`),
-per-scenario `fully_diluted` overrides naming a non-conflict observation,
+per-scenario `fully_diluted` overrides naming a non-conflict observation (the
+override applies to every fully diluted result of that scenario, DCF and
+multiple alike),
 `held_buyback_treatment` (`exclude` removes held buyback tokens from
 circulating supply; `include` keeps them), the `capture_mix`, unlock
 realization, peers, and exclusions with a `reason_source_id`. Peer multiples
 use only aggregate rows over a complete window ending before
-`market_observed_on`; a stablecoin-quoted market value needs a sourced `[pegs]`
+`market_observed_on`; a peer whose series misses any window day, or whose
+revenue is nonpositive, is excluded automatically with a recorded reason, and
+the run fails only when no peer remains for a basis. Write every register row
+the policy and TOML cite before running `reconcile-token-supply` and
+`model token`. A stablecoin-quoted market value needs a sourced `[pegs]`
 leaf. Bases that are equal across scenarios belong in the TOML, not in
 `scenarios.csv`. Report and audit work as for DCF; token audit codes are
 prefixed `token_run_`.
 
 ## Report and close the audit loop
 
-Render a report only from a complete registered DCF or comps `run_id`:
+Render a report only from a complete registered DCF, comps, or token `run_id`:
 
 ```text
 finresearch --workspace WORKSPACE report markdown CASE_ID --model-run-id RUN_ID
