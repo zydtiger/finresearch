@@ -1,6 +1,6 @@
 [project]
 name = "finresearch"
-version = "0.3.0"
+version = "0.3.1"
 description = "Programmatic investment-research workflows"
 readme = "README.md"
 requires-python = ">=3.12"
